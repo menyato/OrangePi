@@ -1,16 +1,40 @@
-# ── OrangePi only — no YOLO, no GPU ──────────────────
-# VAD: detects speech start/stop
-silero-vad
+# requirements_orangepi.txt
+# OrangePi 2W Zero — voice client only (STT + TTS)
+# ──────────────────────────────────────────────────
+# Install command:
+#   pip3 install --break-system-packages -r requirements_orangepi.txt
+#
+# System packages needed first (run with sudo):
+#   sudo apt update
+#   sudo apt install -y \
+#       espeak-ng \
+#       portaudio19-dev \
+#       libsndfile1 \
+#       python3-pip \
+#       python3-dev \
+#       build-essential
+#
+# ── WHY NO TORCH ──────────────────────────────────────────────────────────────
+# The original script used torch ONLY to run silero-vad.
+# torch for ARM CPU (aarch64) is ~700 MB installed + ~300 MB RAM at runtime.
+# OrangePi 2W Zero has 512 MB total RAM — torch alone would OOM the board.
+#
+# Replacement: webrtcvad — a tiny C extension (~200 KB) that implements
+# Google's WebRTC Voice Activity Detection. Same purpose, 1000× lighter.
+#
+# faster-whisper uses ctranslate2 (C++ inference engine), NOT torch.
+# It runs fine on CPU with int8 quantisation using ~60–80 MB RAM for tiny model.
+# ──────────────────────────────────────────────────────────────────────────────
 
-# STT: speech to text (CPU, tiny model)
-faster-whisper
+# Voice activity detection — replaces silero-vad + torch entirely
+webrtcvad==2.0.10
 
-# Audio I/O
-sounddevice
-numpy
+# STT — faster-whisper tiny int8 uses ~60-80 MB RAM on CPU
+# ctranslate2 is pulled in automatically as a dependency
+faster-whisper==1.1.1
 
-# Camera frame encoding (lightweight, no CUDA)
-opencv-python-headless
+# Audio I/O — PortAudio Python bindings
+sounddevice==0.5.1
 
-# Serial port for ATmega glove
-pyserial
+# Numerics — usually pre-installed on Pi images, but pin it
+numpy>=1.24,<3.0
