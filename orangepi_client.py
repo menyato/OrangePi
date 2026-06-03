@@ -6,7 +6,7 @@ Flow:
   mic → webrtcvad → faster-whisper → print transcript clearly
   → send text over TCP to Windows PC
   ← receive TTS string back
-  → espeak-ng speaks it
+  → espeak-ng | aplay plughw:3,0 speaks it through Logi headset
 
 No torch, no silero, no YOLO, no camera.
 
@@ -37,14 +37,14 @@ SERVER_HOST = "10.254.249.159"   # ← your Windows PC IP
 SERVER_PORT = 9000
 
 SAMPLE_RATE        = 16000
-FRAME_DURATION     = 30                                        # ms — must be 10/20/30
-FRAME_SIZE         = int(SAMPLE_RATE * FRAME_DURATION / 1000) # 480 samples
-VAD_AGGRESSIVENESS = 2          # 0–3, higher = stricter
+FRAME_DURATION     = 30
+FRAME_SIZE         = int(SAMPLE_RATE * FRAME_DURATION / 1000)  # 480 samples
+VAD_AGGRESSIVENESS = 2
 
-VOICED_THRESHOLD   = 0.7        # fraction of ring buffer voiced → start recording
-UNVOICED_THRESHOLD = 0.4        # fraction unvoiced → stop recording
+VOICED_THRESHOLD   = 0.7
+UNVOICED_THRESHOLD = 0.4
 RING_BUFFER_MS     = 400
-RING_BUFFER_FRAMES = int(RING_BUFFER_MS / FRAME_DURATION)     # 13 frames
+RING_BUFFER_FRAMES = int(RING_BUFFER_MS / FRAME_DURATION)
 MAX_RECORD_SEC     = 15
 MIN_SPEECH_SEC     = 0.3
 
@@ -54,56 +54,70 @@ WHISPER_LANGUAGE = "en"
 
 ESPEAK_SPEED       = 145
 ESPEAK_VOICE       = "en"
-ESPEAK_ALSA_DEVICE = "hw:3,0"   # find yours: aplay -l
+# plughw handles: mono→stereo upmix + 22050→48000 Hz resampling automatically
+ESPEAK_ALSA_DEVICE = "plughw:3,0"
 
 # ── GLOBALS ───────────────────────────────────────────────────────────────────
 whisper_model: WhisperModel | None = None
 vad: webrtcvad.Vad | None          = None
 AUDIO_DEVICE: int | str | None     = None
 
-_tts_lock = threading.Lock()
-_tts_proc: subprocess.Popen | None = None
+_tts_lock   = threading.Lock()
+_aplay_proc: subprocess.Popen | None = None   # track aplay, not espeak
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
 def speak(text: str) -> None:
-    global _tts_proc
+    """
+    Speak text through Logi headset via espeak-ng → aplay plughw:3,0.
+    plughw automatically converts mono 22050 Hz → stereo 48000 Hz.
+    Non-blocking — returns immediately while audio plays.
+    """
+    global _aplay_proc
     print(f"\n[TTS] >> {text}\n")
     with _tts_lock:
-        if _tts_proc and _tts_proc.poll() is None:
-            _tts_proc.terminate()
-            _tts_proc.wait()
+        # Kill any currently playing audio
+        if _aplay_proc and _aplay_proc.poll() is None:
+            _aplay_proc.terminate()
+            _aplay_proc.wait()
+
         espeak = subprocess.Popen(
-            ["espeak-ng", "-s", str(ESPEAK_SPEED), "-v", ESPEAK_VOICE, "--stdout", text],
+            ["espeak-ng",
+             "-s", str(ESPEAK_SPEED),
+             "-v", ESPEAK_VOICE,
+             "--stdout",            # raw WAV to stdout
+             text],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        subprocess.Popen(
-            ["aplay", "-D", ESPEAK_ALSA_DEVICE, "-f", "S16_LE", "-r", "22050", "-c", "1"],
+        aplay = subprocess.Popen(
+            ["aplay",
+             "-D", ESPEAK_ALSA_DEVICE,   # plughw:3,0 — auto format conversion
+             "-q"],                       # quiet — suppress "Playing WAVE..." line
             stdin=espeak.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        espeak.stdout.close()
-        _tts_proc = espeak
+        espeak.stdout.close()  # let espeak get SIGPIPE if aplay exits early
+        _aplay_proc = aplay    # track aplay — it finishes when audio is done
 
 def is_speaking() -> bool:
     with _tts_lock:
-        return _tts_proc is not None and _tts_proc.poll() is None
+        return _aplay_proc is not None and _aplay_proc.poll() is None
 
 def stop_speaking() -> None:
-    global _tts_proc
+    global _aplay_proc
     with _tts_lock:
-        if _tts_proc and _tts_proc.poll() is None:
-            _tts_proc.terminate()
-            _tts_proc.wait()
+        if _aplay_proc and _aplay_proc.poll() is None:
+            _aplay_proc.terminate()
+            _aplay_proc.wait()
 
 def wait_speaking() -> None:
+    """Block until audio finishes, then pause so mic doesn't catch reverb."""
     with _tts_lock:
-        proc = _tts_proc
+        proc = _aplay_proc
     if proc:
         proc.wait()
-    # Pause so mic doesn't pick up speaker reverb and trigger a false listen
-    time.sleep(0.5)
+    time.sleep(0.4)   # short silence — prevents mic from catching speaker tail
 
 # ── MODEL LOADING ─────────────────────────────────────────────────────────────
 def load_models() -> None:
@@ -192,7 +206,6 @@ def listen(retries: int = 5) -> str:
         audio = record_with_vad()
         text  = transcribe(audio)
         if text.strip():
-            # ── Print transcript clearly so operator can read it ──────────
             print("\n" + "─" * 50)
             print(f"  YOU SAID  →  {text}")
             print("─" * 50 + "\n")
@@ -250,13 +263,13 @@ def main() -> None:
     ap.add_argument("--port",   default=SERVER_PORT, type=int)
     ap.add_argument("--model",  default=WHISPER_MODEL, choices=["tiny", "base"])
     ap.add_argument("--device", default=None,
-                    help="Mic device index or hw string. Run: python3 -c \"import sounddevice; print(sounddevice.query_devices())\"")
+                    help="Mic index or hw string. List with: python3 -c 'import sounddevice; print(sounddevice.query_devices())'")
     args = ap.parse_args()
 
     SERVER_HOST = args.host
     SERVER_PORT = args.port
 
-    # Resolve audio device
+    # Resolve audio input device
     if args.device is not None:
         try:
             AUDIO_DEVICE = int(args.device)
@@ -264,36 +277,39 @@ def main() -> None:
             AUDIO_DEVICE = args.device
         print(f"[AUDIO] Using device: {AUDIO_DEVICE}")
     else:
-        # Auto-detect USB/Logi mic
         for i, dev in enumerate(sd.query_devices()):
             name = dev["name"].lower()
             if dev["max_input_channels"] > 0 and ("logi" in name or "usb" in name):
                 AUDIO_DEVICE = i
-                print(f"[AUDIO] Auto-detected: [{i}] {dev['name']}")
+                print(f"[AUDIO] Auto-detected mic: [{i}] {dev['name']}")
                 break
         if AUDIO_DEVICE is None:
             print("[AUDIO] No USB mic found — using system default.")
 
     load_models()
-    speak("Orange Pi ready. Connecting to server.")
 
-    # ── One persistent TCP connection for the whole session ───────────────────
+    # ── Startup message through headset ───────────────────────────────────────
+    speak("Orange Pi ready. Connecting to server.")
+    wait_speaking()
+
+    # ── One persistent TCP connection — server ties session state to it ───────
     sock = connect_to_server()
     if sock is None:
         speak("Cannot reach server. Check network and IP address.")
+        wait_speaking()
         return
 
     resp = _send(sock, {"type": "hello"})
     if resp is None:
         speak("Server did not respond.")
+        wait_speaking()
         sock.close()
         return
 
-    tts = resp.get("tts", "Connected.")
-    speak(tts)
+    speak(resp.get("tts", "Connected."))
     wait_speaking()
 
-    # ── Voice loop ────────────────────────────────────────────────────────────
+    # ── Main voice loop ───────────────────────────────────────────────────────
     while True:
         text = listen()
         if not text:
@@ -304,13 +320,16 @@ def main() -> None:
 
         if resp is None:
             speak("Connection lost. Reconnecting.")
+            wait_speaking()
             sock.close()
             time.sleep(2)
             sock = connect_to_server()
             if sock is None:
                 speak("Could not reconnect. Exiting.")
+                wait_speaking()
                 break
             speak("Reconnected. Session was reset. Please start again.")
+            wait_speaking()
             resp = _send(sock, {"type": "hello"})
             if resp:
                 speak(resp.get("tts", ""))
@@ -327,6 +346,7 @@ def main() -> None:
 
     sock.close()
     speak("Goodbye.")
+    wait_speaking()
 
 if __name__ == "__main__":
     main()
