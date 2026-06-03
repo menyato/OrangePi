@@ -52,10 +52,10 @@ WHISPER_MODEL    = "tiny"
 WHISPER_COMPUTE  = "int8"
 WHISPER_LANGUAGE = "en"
 
-ESPEAK_SPEED       = 150
-ESPEAK_VOICE       = "mb-us1"      # cleaner American English voice
-ESPEAK_PITCH       = 45           # slightly lower = more natural
-# plughw handles: mono→stereo upmix + 22050→48000 Hz resampling automatically
+ESPEAK_SPEED       = 130          # slower = clearer
+ESPEAK_VOICE       = "en"         # standard English
+ESPEAK_PITCH       = 30           # lower = deeper, less robotic
+ESPEAK_AMPLITUDE   = 180          # louder (0-200)
 ESPEAK_ALSA_DEVICE = "plughw:3,0"
 
 # ── GLOBALS ───────────────────────────────────────────────────────────────────
@@ -67,40 +67,57 @@ _tts_lock   = threading.Lock()
 _aplay_proc: subprocess.Popen | None = None   # track aplay, not espeak
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
-def speak(text: str) -> None:
+def _play_wav_bytes(wav_bytes: bytes) -> subprocess.Popen:
+    """Feed raw WAV bytes directly into aplay. Returns the aplay process."""
+    proc = subprocess.Popen(
+        ["aplay", "-D", ESPEAK_ALSA_DEVICE, "-q"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.stdin.write(wav_bytes)
+    proc.stdin.close()
+    return proc
+
+def speak(text: str, wav_bytes: bytes | None = None) -> None:
     """
-    Speak text through Logi headset via espeak-ng → aplay plughw:3,0.
-    plughw automatically converts mono 22050 Hz → stereo 48000 Hz.
-    Non-blocking — returns immediately while audio plays.
+    Play audio through Logi headset.
+    - If wav_bytes given (SAPI WAV from PC server) → play that directly.
+      This gives the exact same Windows voice as the server.
+    - Otherwise fall back to local espeak-ng.
+    Non-blocking — returns immediately while audio plays in background.
     """
     global _aplay_proc
     print(f"\n[TTS] >> {text}\n")
     with _tts_lock:
-        # Kill any currently playing audio
         if _aplay_proc and _aplay_proc.poll() is None:
             _aplay_proc.terminate()
             _aplay_proc.wait()
 
-        espeak = subprocess.Popen(
-            ["espeak-ng",
-             "-s", str(ESPEAK_SPEED),
-             "-v", ESPEAK_VOICE,
-             "-p", str(ESPEAK_PITCH),
-             "--stdout",
-             text],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        aplay = subprocess.Popen(
-            ["aplay",
-             "-D", ESPEAK_ALSA_DEVICE,   # plughw:3,0 — auto format conversion
-             "-q"],                       # quiet — suppress "Playing WAVE..." line
-            stdin=espeak.stdout,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        espeak.stdout.close()  # let espeak get SIGPIPE if aplay exits early
-        _aplay_proc = aplay    # track aplay — it finishes when audio is done
+        if wav_bytes:
+            _aplay_proc = _play_wav_bytes(wav_bytes)
+        else:
+            # Fallback: local espeak-ng when no server audio available
+            espeak = subprocess.Popen(
+                ["espeak-ng",
+                 "-s", str(ESPEAK_SPEED),
+                 "-v", ESPEAK_VOICE,
+                 "-p", str(ESPEAK_PITCH),
+                 "-a", str(ESPEAK_AMPLITUDE),
+                 "--stdout",
+                 text],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            aplay = subprocess.Popen(
+                ["aplay", "-D", ESPEAK_ALSA_DEVICE, "-q"],
+                stdin=espeak.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            espeak.stdout.close()
+            _aplay_proc = aplay
+
 
 def is_speaking() -> bool:
     with _tts_lock:
@@ -256,6 +273,20 @@ def connect_to_server() -> socket.socket | None:
         print(f"[NET] OS error: {e}")
     return None
 
+def _speak_resp(resp: dict) -> None:
+    """
+    Extract TTS text and optional SAPI WAV audio from a server response
+    and play it. If the server sent audio, play that (Windows voice).
+    Otherwise fall back to local espeak-ng.
+    """
+    import base64
+    tts  = resp.get("tts", "")
+    if not tts:
+        return
+    audio_b64 = resp.get("audio")
+    wav_bytes  = base64.b64decode(audio_b64) if audio_b64 else None
+    speak(tts, wav_bytes)
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     global SERVER_HOST, SERVER_PORT, AUDIO_DEVICE
@@ -290,7 +321,7 @@ def main() -> None:
 
     load_models()
 
-    # ── Startup message through headset ───────────────────────────────────────
+    # ── Startup message — no server yet so use local espeak ───────────────────
     speak("Orange Pi ready. Connecting to server.")
     wait_speaking()
 
@@ -308,7 +339,7 @@ def main() -> None:
         sock.close()
         return
 
-    speak(resp.get("tts", "Connected."))
+    _speak_resp(resp)
     wait_speaking()
 
     # ── Main voice loop ───────────────────────────────────────────────────────
@@ -334,14 +365,12 @@ def main() -> None:
             wait_speaking()
             resp = _send(sock, {"type": "hello"})
             if resp:
-                speak(resp.get("tts", ""))
+                _speak_resp(resp)
                 wait_speaking()
             continue
 
-        tts = resp.get("tts", "")
-        if tts:
-            speak(tts)
-            wait_speaking()
+        _speak_resp(resp)
+        wait_speaking()
 
         if resp.get("quit"):
             break
