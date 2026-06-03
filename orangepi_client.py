@@ -112,7 +112,7 @@ def speak(text: str) -> None:
         )
         # Pipe espeak stdout → aplay on the USB headset
         _aplay_proc = subprocess.Popen(
-            ["aplay", "-D", ESPEAK_ALSA_DEVICE, "-f", "S16_LE", "-r", "22050", "-c", "1"],
+            ["aplay", "-D", ESPEAK_ALSA_DEVICE, "-f", "S16_LE", "-r", "22050", "-c", "2"],
             stdin=_tts_proc.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
