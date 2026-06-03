@@ -1,7 +1,16 @@
+# ── OrangePi only — no YOLO, no GPU ──────────────────
+# VAD: detects speech start/stop
+silero-vad
+
+# STT: speech to text (CPU, tiny model)
 faster-whisper
+
+# Audio I/O
 sounddevice
 numpy
-torch
-silero-vad
-opencv-python
+
+# Camera frame encoding (lightweight, no CUDA)
+opencv-python-headless
+
+# Serial port for ATmega glove
 pyserial
