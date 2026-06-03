@@ -83,6 +83,7 @@ ESPEAK_VOICE = "en"
 # ── GLOBALS ───────────────────────────────────────────────────────────────────
 whisper_model: WhisperModel | None = None
 vad: webrtcvad.Vad | None = None
+AUDIO_DEVICE: str | None = None  # set via --device arg or auto-detected
 
 _tts_lock = threading.Lock()
 _tts_proc: subprocess.Popen | None = None
@@ -169,6 +170,7 @@ def record_with_vad() -> np.ndarray | None:
         channels=1,
         dtype="float32",
         blocksize=FRAME_SIZE,
+        device=AUDIO_DEVICE,
     ) as stream:
 
         while frame_count < max_frames:
@@ -313,17 +315,38 @@ def main() -> None:
     ap.add_argument("--model", default=WHISPER_MODEL,
                     choices=["tiny", "base"],
                     help="Whisper model size — 'tiny' recommended for 512 MB RAM")
-    ap.add_argument("--device", default=None, type=int,
-                    help="Input device index — run: python3 -c \"import sounddevice; print(sounddevice.query_devices())\"")
+    ap.add_argument("--device", default=None,
+                    help="Input device: index number OR hw string e.g. hw:3,0 (Logi USB Headset default)")
     args = ap.parse_args()
 
     SERVER_HOST = args.host
     SERVER_PORT = args.port
 
-    # Set default input device if specified
+    # Resolve audio device — prefer CLI arg, fall back to auto-detect Logi headset
+    global AUDIO_DEVICE
     if args.device is not None:
-        sd.default.device[0] = args.device
-        print(f"[AUDIO] Using input device index {args.device}: {sd.query_devices(args.device)['name']}")
+        # Accept either integer index or hw:X,Y string
+        try:
+            AUDIO_DEVICE = int(args.device)
+        except ValueError:
+            AUDIO_DEVICE = args.device
+        print(f"[AUDIO] Using device: {AUDIO_DEVICE}")
+    else:
+        # Auto-detect: find first device with 'Logi' or 'USB' in name that has inputs
+        for i, dev in enumerate(sd.query_devices()):
+            if dev['max_input_channels'] > 0 and ('logi' in dev['name'].lower() or 'usb' in dev['name'].lower()):
+                AUDIO_DEVICE = i
+                print(f"[AUDIO] Auto-detected USB mic: [{i}] {dev['name']}")
+                break
+        if AUDIO_DEVICE is None:
+            # Last resort: find any device with input channels
+            for i, dev in enumerate(sd.query_devices()):
+                if dev['max_input_channels'] > 0 and 'hw:' in dev.get('name','').lower():
+                    AUDIO_DEVICE = i
+                    print(f"[AUDIO] Fallback mic: [{i}] {dev['name']}")
+                    break
+        if AUDIO_DEVICE is None:
+            print("[AUDIO] WARNING: Could not auto-detect mic. Using system default.")
 
     load_models()
 
