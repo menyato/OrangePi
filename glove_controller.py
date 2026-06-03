@@ -339,74 +339,113 @@ class GloveController:
                     "bent": self.cal.bent_vals,
                 })
 
-# ── INTERACTIVE CLI ───────────────────────────────────────────────────────────
-def interactive_cli(ctrl: GloveController):
-    print("\nGlove CLI — commands:")
-    print("  cal          start calibration")
-    print("  <enter>      confirm calibration step")
-    print("  thresh <n>   set threshold percent (10-90)")
-    print("  status       query ATmega config")
-    print("  mt<1-3> <ms> fire motor  e.g. mt1 200")
-    print("  q            quit\n")
+
+
+# ── MOTOR TEST CLI ────────────────────────────────────────────────────────────
+_frame_count = 0
+_last_print  = 0.0
+
+def _on_frame(f: SensorFrame):
+    global _frame_count, _last_print
+    _frame_count += 1
+    now = time.time()
+    if now - _last_print >= 1.0:
+        bent  = [str(i) for i, v in enumerate(f.finger_bent) if v]
+        flags = [k for k, v in f.imu_flags.items() if v]
+        print(
+            f"\r[{_frame_count:5d} frames] "
+            f"aX={f.imu.aX:+.1f} aY={f.imu.aY:+.1f} aZ={f.imu.aZ:+.1f} | "
+            f"flex={f.raw_flex} | "
+            f"bent={''.join(bent) or '-'} imu={flags or '-'}   ",
+            end="", flush=True
+        )
+        _last_print = now
+
+def motor_test_cli(ctrl: GloveController):
+    print("\nMotor test — commands:")
+    print("  1 / 2 / 3          fire motor for 300 ms")
+    print("  1 <ms>             fire motor 1 for custom duration")
+    print("  all                fire motors 1→2→3 in sequence")
+    print("  all <ms>           same with custom duration")
+    print("  cal                start finger calibration")
+    print("  <enter>            confirm calibration step")
+    print("  thresh <n>         set threshold percent (10-90)")
+    print("  status             query ATmega config")
+    print("  q                  quit\n")
 
     while True:
         try:
-            cmd = input("> ").strip()
+            raw = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
             break
 
-        if cmd.lower() in ("q", "quit", "exit"):
-            break
-        elif cmd == "":
+        if not raw:
             ctrl.cal_confirm()
+            continue
+
+        if raw.lower() in ("q", "quit", "exit"):
+            break
+
+        parts = raw.split()
+        cmd   = parts[0].lower()
+
+        if cmd == "all":
+            ms = int(parts[1]) if len(parts) > 1 else 300
+            for motor in (1, 2, 3):
+                print(f"  → motor {motor} for {ms} ms")
+                ctrl.vibrate(motor, ms)
+                time.sleep((ms / 1000) + 0.1)
+
+        elif cmd in ("1", "2", "3"):
+            motor = int(cmd)
+            ms    = int(parts[1]) if len(parts) > 1 else 300
+            print(f"  → motor {motor} for {ms} ms")
+            ctrl.vibrate(motor, ms)
+
         elif cmd == "cal":
             ctrl.calibrate()
-        elif cmd.startswith("thresh"):
-            try:
-                ctrl.set_threshold(int(cmd.split()[1]))
-            except (IndexError, ValueError) as e:
-                print(f"  Error: {e}")
+
         elif cmd == "status":
             ctrl.status()
-        elif cmd.startswith("mt"):
+
+        elif cmd.startswith("thresh"):
             try:
-                parts = cmd.split()
-                motor = int(parts[0][2])
-                ms    = int(parts[1])
-                ctrl.vibrate(motor, ms)
+                ctrl.set_threshold(int(parts[1]))
             except (IndexError, ValueError) as e:
                 print(f"  Error: {e}")
+
         else:
-            print(f"  Unknown command: {cmd!r}")
+            print(f"  Unknown: {raw!r}")
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="OrangePi glove controller driver")
+    ap = argparse.ArgumentParser(description="OrangePi glove controller")
     ap.add_argument("--port",    default=UART_DEV, help="Serial device (default: %(default)s)")
     ap.add_argument("--baud",    default=BAUD, type=int, help="Baud rate (default: %(default)s)")
-    ap.add_argument("--verbose", action="store_true", help="Show all raw frames")
+    ap.add_argument("--verbose", action="store_true", help="Show raw debug lines")
     args = ap.parse_args()
 
     if args.verbose:
         logging.getLogger("GloveCtrl").setLevel(logging.DEBUG)
 
-    def on_frame(f: SensorFrame):
-        if f.flex_bits or f.imu_bits:
-            print(f"  ★ {f}")
+    _last_print = time.time()
 
     ctrl = GloveController(
         port=args.port,
         baud=args.baud,
-        on_frame=on_frame,
+        on_frame=_on_frame,
     )
 
-    if not ctrl.start(wait_ready=True, timeout=5.0):
-        print(f"Failed to open {args.port}. Check wiring and device path.")
+    if not ctrl.start(wait_ready=False):
+        print(f"Cannot open {args.port}. Check wiring and device path.")
         exit(1)
 
+    print(f"Connected to {args.port} — frames streaming in background")
+
     try:
-        interactive_cli(ctrl)
+        motor_test_cli(ctrl)
     finally:
+        print("\nStopping...")
         ctrl.stop()
