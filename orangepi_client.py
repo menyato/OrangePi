@@ -54,7 +54,7 @@ from faster_whisper import WhisperModel
 warnings.filterwarnings("ignore")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-SERVER_HOST = "10.80.64.159"   # ← Windows PC IP — change this
+SERVER_HOST = "10.254.249.159"   # ← Windows PC IP — change this
 SERVER_PORT = 9000
 
 # Audio
