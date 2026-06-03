@@ -38,3 +38,5 @@ sounddevice==0.5.1
 
 # Numerics — usually pre-installed on Pi images, but pin it
 numpy>=1.24,<3.0
+
+requests

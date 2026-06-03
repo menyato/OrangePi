@@ -313,10 +313,17 @@ def main() -> None:
     ap.add_argument("--model", default=WHISPER_MODEL,
                     choices=["tiny", "base"],
                     help="Whisper model size — 'tiny' recommended for 512 MB RAM")
+    ap.add_argument("--device", default=None, type=int,
+                    help="Input device index — run: python3 -c \"import sounddevice; print(sounddevice.query_devices())\"")
     args = ap.parse_args()
 
     SERVER_HOST = args.host
     SERVER_PORT = args.port
+
+    # Set default input device if specified
+    if args.device is not None:
+        sd.default.device[0] = args.device
+        print(f"[AUDIO] Using input device index {args.device}: {sd.query_devices(args.device)['name']}")
 
     load_models()
 
