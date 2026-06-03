@@ -78,7 +78,7 @@ def speak(text: str) -> None:
             stderr=subprocess.DEVNULL,
         )
         subprocess.Popen(
-            ["aplay", "-D", ESPEAK_ALSA_DEVICE, "-f", "S16_LE", "-r", "22050", "-c", "2"],
+            ["aplay", "-D", ESPEAK_ALSA_DEVICE, "-f", "S16_LE", "-r", "22050", "-c", "1"],
             stdin=espeak.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -102,6 +102,8 @@ def wait_speaking() -> None:
         proc = _tts_proc
     if proc:
         proc.wait()
+    # Pause so mic doesn't pick up speaker reverb and trigger a false listen
+    time.sleep(0.5)
 
 # ── MODEL LOADING ─────────────────────────────────────────────────────────────
 def load_models() -> None:
