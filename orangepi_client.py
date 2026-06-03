@@ -79,6 +79,9 @@ WHISPER_LANGUAGE = "en"         # force English — saves beam-search time
 # espeak-ng settings
 ESPEAK_SPEED = 145              # words per minute
 ESPEAK_VOICE = "en"
+# ALSA device for espeak-ng output — hw:3,0 = Logi USB Headset (card 3, device 0)
+# Find yours with: aplay -l
+ESPEAK_ALSA_DEVICE = "hw:3,0"
 
 # ── GLOBALS ───────────────────────────────────────────────────────────────────
 whisper_model: WhisperModel | None = None
@@ -98,10 +101,23 @@ def speak(text: str) -> None:
             _tts_proc.terminate()
             _tts_proc.wait()
         _tts_proc = subprocess.Popen(
-            ["espeak-ng", "-s", str(ESPEAK_SPEED), "-v", ESPEAK_VOICE, text],
+            [
+                "espeak-ng",
+                "-s", str(ESPEAK_SPEED),
+                "-v", ESPEAK_VOICE,
+                "--stdout",          # output raw audio to stdout
+            ] + [text],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        # Pipe espeak stdout → aplay on the USB headset
+        _aplay_proc = subprocess.Popen(
+            ["aplay", "-D", ESPEAK_ALSA_DEVICE, "-f", "S16_LE", "-r", "22050", "-c", "1"],
+            stdin=_tts_proc.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        _tts_proc.stdout.close()  # allow espeak to receive SIGPIPE if aplay exits
 
 def is_speaking() -> bool:
     with _tts_lock:
