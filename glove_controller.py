@@ -1,4 +1,4 @@
-import serial
+import glove_controller
 import threading
 import queue
 import time
@@ -113,7 +113,7 @@ class GloveController:
         self.on_frame    = on_frame     # called from reader thread
         self.on_cal_event = on_cal_event
 
-        self._ser:   Optional[serial.Serial] = None
+        self._ser:   Optional[glove_controller.Serial] = None
         self._tx_q:  queue.Queue = queue.Queue()
         self._stop   = threading.Event()
         self._ready  = threading.Event()
@@ -136,12 +136,12 @@ class GloveController:
     def start(self, wait_ready: bool = True, timeout: float = 5.0) -> bool:
         """Open the serial port and start background threads."""
         try:
-            self._ser = serial.Serial(
+            self._ser = glove_controller.Serial(
                 self.port, self.baud,
                 timeout=TIMEOUT_S,
                 write_timeout=1.0,
             )
-        except serial.SerialException as e:
+        except glove_controller.SerialException as e:
             self.log.error(f"Cannot open {self.port}: {e}")
             return False
 
@@ -215,7 +215,7 @@ class GloveController:
         while not self._stop.is_set():
             try:
                 chunk = self._ser.read(256)
-            except serial.SerialException as e:
+            except glove_controller.SerialException as e:
                 self.log.error(f"RX error: {e}")
                 break
 
@@ -241,7 +241,7 @@ class GloveController:
                 self._ser.write(cmd.encode("ascii"))
                 self._ser.flush()
                 self.log.debug(f"TX → {cmd.strip()!r}")
-            except serial.SerialException as e:
+            except glove_controller.SerialException as e:
                 self.log.error(f"TX error: {e}")
 
     def _dispatch(self, line: str):
