@@ -52,8 +52,9 @@ WHISPER_MODEL    = "tiny"
 WHISPER_COMPUTE  = "int8"
 WHISPER_LANGUAGE = "en"
 
-ESPEAK_SPEED       = 145
-ESPEAK_VOICE       = "en"
+ESPEAK_SPEED       = 150
+ESPEAK_VOICE       = "en-us"      # cleaner American English voice
+ESPEAK_PITCH       = 45           # slightly lower = more natural
 # plughw handles: mono→stereo upmix + 22050→48000 Hz resampling automatically
 ESPEAK_ALSA_DEVICE = "plughw:3,0"
 
@@ -84,7 +85,8 @@ def speak(text: str) -> None:
             ["espeak-ng",
              "-s", str(ESPEAK_SPEED),
              "-v", ESPEAK_VOICE,
-             "--stdout",            # raw WAV to stdout
+             "-p", str(ESPEAK_PITCH),
+             "--stdout",
              text],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
