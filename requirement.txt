@@ -1,0 +1,7 @@
+faster-whisper
+sounddevice
+numpy
+torch
+silero-vad
+opencv-python
+pyserial
