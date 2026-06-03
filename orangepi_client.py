@@ -260,6 +260,10 @@ def listen(retries: int = 5) -> str:
     return ""
 
 # ── NETWORK ───────────────────────────────────────────────────────────────────
+# IMPORTANT: one persistent connection per session.
+# The server creates a Session() object per connection — if we reconnect,
+# the server resets to ASK_CURRENCY and loses all state.
+
 def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
     """Receive exactly n bytes from socket, returning None on connection drop."""
     buf = b""
@@ -270,35 +274,40 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
         buf += chunk
     return buf
 
-def send_message(payload: dict) -> dict | None:
-    """
-    Send a JSON payload to the PC server and return the JSON response.
-    Each message is prefixed with a 4-byte big-endian length header.
-    Returns None on any network error.
-    """
+def _send(sock: socket.socket, payload: dict) -> dict | None:
+    """Send one message and receive one response over an existing socket."""
     try:
-        with socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=20) as sock:
-            data = json.dumps(payload).encode("utf-8")
-            # Length-prefixed framing: [4 bytes big-endian length][data]
-            sock.sendall(struct.pack(">I", len(data)) + data)
+        data = json.dumps(payload).encode("utf-8")
+        sock.sendall(struct.pack(">I", len(data)) + data)
 
-            raw_len = _recv_exact(sock, 4)
-            if raw_len is None:
-                print("[NET] Server closed connection before response.")
-                return None
-            resp_len = struct.unpack(">I", raw_len)[0]
+        raw_len = _recv_exact(sock, 4)
+        if raw_len is None:
+            print("[NET] Server closed connection.")
+            return None
+        resp_len = struct.unpack(">I", raw_len)[0]
 
-            raw_resp = _recv_exact(sock, resp_len)
-            if raw_resp is None:
-                print("[NET] Incomplete response from server.")
-                return None
+        raw_resp = _recv_exact(sock, resp_len)
+        if raw_resp is None:
+            print("[NET] Incomplete response from server.")
+            return None
 
-            return json.loads(raw_resp.decode("utf-8"))
+        return json.loads(raw_resp.decode("utf-8"))
 
+    except (OSError, TimeoutError) as e:
+        print(f"[NET] Socket error: {e}")
+        return None
+
+def connect_to_server() -> socket.socket | None:
+    """Open and return a persistent TCP connection to the PC server."""
+    try:
+        sock = socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=20)
+        sock.settimeout(60)  # generous timeout for YOLO scan responses
+        print(f"[NET] Connected to {SERVER_HOST}:{SERVER_PORT}")
+        return sock
     except ConnectionRefusedError:
         print(f"[NET] Connection refused — is pc_server.py running on {SERVER_HOST}:{SERVER_PORT}?")
     except TimeoutError:
-        print(f"[NET] Timeout — PC not responding.")
+        print(f"[NET] Timeout connecting to server.")
     except OSError as e:
         print(f"[NET] OS error: {e}")
     return None
@@ -352,27 +361,46 @@ def main() -> None:
 
     speak("Orange Pi ready. Connecting to server.")
 
-    # Handshake
-    resp = send_message({"type": "hello"})
-    if resp is None:
+    # ── Connect once — keep socket alive for the whole session ────────────────
+    # The server ties Session state (currency, amount, scan count) to the
+    # TCP connection. A new connection = new Session = reset to ASK_CURRENCY.
+    sock = connect_to_server()
+    if sock is None:
         speak("Cannot reach server. Check network and PC IP address.")
+        return
+
+    # Handshake
+    resp = _send(sock, {"type": "hello"})
+    if resp is None:
+        speak("Server did not respond to hello.")
+        sock.close()
         return
 
     tts = resp.get("tts", "Connected.")
     speak(tts)
     wait_speaking()
 
-    # Main voice loop
+    # ── Main voice loop — reuse same socket ───────────────────────────────────
     while True:
         text = listen()
         if not text:
-            # Listening timed out with no speech — just keep going
             continue
 
-        resp = send_message({"type": "voice", "text": text})
+        resp = _send(sock, {"type": "voice", "text": text})
         if resp is None:
-            speak("Server not responding. Please check connection.")
+            speak("Connection lost. Reconnecting.")
+            sock.close()
             time.sleep(2)
+            sock = connect_to_server()
+            if sock is None:
+                speak("Could not reconnect. Exiting.")
+                break
+            # After reconnect the server resets — warn user
+            speak("Reconnected. Session was reset. Please start again.")
+            resp = _send(sock, {"type": "hello"})
+            if resp:
+                speak(resp.get("tts", ""))
+                wait_speaking()
             continue
 
         tts = resp.get("tts", "")
@@ -383,6 +411,7 @@ def main() -> None:
         if resp.get("quit"):
             break
 
+    sock.close()
     speak("Goodbye.")
 
 
