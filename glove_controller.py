@@ -1,4 +1,29 @@
-import glove_controller
+#!/usr/bin/env python3
+"""
+glove_controller.py
+OrangePi ↔ ATmega Glove Controller — UART-B driver
+
+Wire:   OrangePi UART-B TX → ATmega RX
+        OrangePi UART-B RX → ATmega TX
+        Shared GND
+
+Protocol (ATmega → OrangePi):
+  RDY                          – boot ready
+  V:<aX>,<aY>,<aZ>,<r0>...<r4>|<fb_hex><ib_hex>  – 10 Hz sensor frame
+  CAL:START / CAL:OPEN:<n> / CAL:BENT:<n>
+  CAL:R:<n>:<val> / CAL:B:<n>:<val> / CAL:DONE
+  CFG:<r0>,<b0>,<t0>|...       – status reply
+  MOT:<n>:<ms>                 – motor confirmation
+
+Protocol (OrangePi → ATmega):
+  cal\n          – start calibration
+  thresh <10-90>\n
+  status\n
+  mt<1-3> <ms>\n
+  <enter>\n      – advance calibration step
+"""
+
+import serial
 import threading
 import queue
 import time
@@ -8,12 +33,11 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-UART_DEV   = "/dev/ttyS5"   # UART-B on most OrangePi variants; change if needed
+UART_DEV   = "/dev/ttyS5"   # UART-B on OrangePi Zero 2W
 BAUD       = 115200
-TIMEOUT_S  = 0.1            # serial read timeout
+TIMEOUT_S  = 0.1
 LOG_LEVEL  = logging.INFO
 
-# Finger index names for human-readable output
 FINGER_NAMES = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
 
 # ── DATA CLASSES ──────────────────────────────────────────────────────────────
@@ -25,15 +49,14 @@ class IMUData:
 
 @dataclass
 class SensorFrame:
-    imu:        IMUData        = field(default_factory=IMUData)
-    raw_flex:   list           = field(default_factory=lambda: [0]*5)
-    flex_bits:  int            = 0   # 0x00–0x1F, bit i set → finger i bent
-    imu_bits:   int            = 0   # see ATmega comments for bit mapping
-    timestamp:  float          = field(default_factory=time.time)
+    imu:       IMUData = field(default_factory=IMUData)
+    raw_flex:  list    = field(default_factory=lambda: [0]*5)
+    flex_bits: int     = 0
+    imu_bits:  int     = 0
+    timestamp: float   = field(default_factory=time.time)
 
     @property
     def finger_bent(self) -> list:
-        """Return list of booleans, one per finger."""
         return [(self.flex_bits >> i) & 1 == 1 for i in range(5)]
 
     @property
@@ -49,7 +72,7 @@ class SensorFrame:
         }
 
     def __str__(self):
-        bent = [FINGER_NAMES[i] for i, v in enumerate(self.finger_bent) if v]
+        bent  = [FINGER_NAMES[i] for i, v in enumerate(self.finger_bent) if v]
         flags = [k for k, v in self.imu_flags.items() if v]
         return (
             f"IMU aX={self.imu.aX:+.1f} aY={self.imu.aY:+.1f} aZ={self.imu.aZ:+.1f} | "
@@ -66,13 +89,9 @@ class CalibrationState:
     bent_vals: list = field(default_factory=lambda: [None]*5)
 
 # ── PARSER ────────────────────────────────────────────────────────────────────
-_V_RE   = re.compile(
+_V_RE = re.compile(
     r"V:([+-]?\d+\.?\d*),([+-]?\d+\.?\d*),([+-]?\d+\.?\d*),"
     r"(\d+),(\d+),(\d+),(\d+),(\d+)\|([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})"
-)
-_CFG_RE = re.compile(
-    r"CFG:(\d+),(\d+),(\d+)\|(\d+),(\d+),(\d+)\|(\d+),(\d+),(\d+)"
-    r"\|(\d+),(\d+),(\d+)\|(\d+),(\d+),(\d+)"
 )
 
 def parse_frame(line: str) -> Optional[SensorFrame]:
@@ -80,13 +99,12 @@ def parse_frame(line: str) -> Optional[SensorFrame]:
     if not m:
         return None
     g = m.groups()
-    frame = SensorFrame(
+    return SensorFrame(
         imu       = IMUData(float(g[0]), float(g[1]), float(g[2])),
         raw_flex  = [int(g[i]) for i in range(3, 8)],
         flex_bits = int(g[8], 16),
         imu_bits  = int(g[9], 16),
     )
-    return frame
 
 # ── CONTROLLER ────────────────────────────────────────────────────────────────
 class GloveController:
@@ -97,31 +115,29 @@ class GloveController:
         ctrl = GloveController()
         ctrl.on_frame = lambda f: print(f)
         ctrl.start()
-        ...
         ctrl.calibrate()
         ctrl.stop()
     """
 
     def __init__(self,
-                 port:    str = UART_DEV,
-                 baud:    int = BAUD,
-                 on_frame:    Optional[Callable[[SensorFrame], None]] = None,
-                 on_cal_event: Optional[Callable[[str, dict], None]]  = None):
+                 port:         str  = UART_DEV,
+                 baud:         int  = BAUD,
+                 on_frame:     Optional[Callable[[SensorFrame], None]] = None,
+                 on_cal_event: Optional[Callable[[str, dict],   None]] = None):
 
-        self.port        = port
-        self.baud        = baud
-        self.on_frame    = on_frame     # called from reader thread
+        self.port         = port
+        self.baud         = baud
+        self.on_frame     = on_frame
         self.on_cal_event = on_cal_event
 
-        self._ser:   Optional[glove_controller.Serial] = None
-        self._tx_q:  queue.Queue = queue.Queue()
-        self._stop   = threading.Event()
-        self._ready  = threading.Event()
-
+        self._ser:       Optional[serial.Serial] = None
+        self._tx_q:      queue.Queue             = queue.Queue()
+        self._stop       = threading.Event()
+        self._ready      = threading.Event()
         self._rx_thread: Optional[threading.Thread] = None
         self._tx_thread: Optional[threading.Thread] = None
 
-        self.cal     = CalibrationState()
+        self.cal        = CalibrationState()
         self.last_frame: Optional[SensorFrame] = None
 
         logging.basicConfig(
@@ -134,14 +150,14 @@ class GloveController:
     # ── public API ────────────────────────────────────────────────────────────
 
     def start(self, wait_ready: bool = True, timeout: float = 5.0) -> bool:
-        """Open the serial port and start background threads."""
+        """Open serial port and start background threads."""
         try:
-            self._ser = glove_controller.Serial(
+            self._ser = serial.Serial(
                 self.port, self.baud,
                 timeout=TIMEOUT_S,
                 write_timeout=1.0,
             )
-        except glove_controller.SerialException as e:
+        except serial.SerialException as e:
             self.log.error(f"Cannot open {self.port}: {e}")
             return False
 
@@ -165,7 +181,7 @@ class GloveController:
     def stop(self):
         """Gracefully shut down threads and close port."""
         self._stop.set()
-        self._tx_q.put(None)   # unblock TX thread
+        self._tx_q.put(None)
         if self._rx_thread:
             self._rx_thread.join(timeout=2)
         if self._tx_thread:
@@ -197,11 +213,7 @@ class GloveController:
         self.send("status")
 
     def vibrate(self, motor: int, ms: int):
-        """
-        Trigger a vibration motor.
-        motor: 1, 2, or 3
-        ms:    duration in milliseconds
-        """
+        """Trigger a vibration motor (motor 1-3, ms > 0)."""
         if motor not in (1, 2, 3):
             raise ValueError("motor must be 1, 2, or 3")
         if ms <= 0:
@@ -215,13 +227,11 @@ class GloveController:
         while not self._stop.is_set():
             try:
                 chunk = self._ser.read(256)
-            except glove_controller.SerialException as e:
+            except serial.SerialException as e:
                 self.log.error(f"RX error: {e}")
                 break
-
             if not chunk:
                 continue
-
             buf += chunk
             while b"\n" in buf:
                 line_b, buf = buf.split(b"\n", 1)
@@ -241,19 +251,17 @@ class GloveController:
                 self._ser.write(cmd.encode("ascii"))
                 self._ser.flush()
                 self.log.debug(f"TX → {cmd.strip()!r}")
-            except glove_controller.SerialException as e:
+            except serial.SerialException as e:
                 self.log.error(f"TX error: {e}")
 
     def _dispatch(self, line: str):
         self.log.debug(f"RX ← {line!r}")
 
-        # ── ready ──
         if line == "RDY":
             self.log.info("ATmega ready")
             self._ready.set()
             return
 
-        # ── sensor frame ──
         if line.startswith("V:"):
             frame = parse_frame(line)
             if frame:
@@ -264,12 +272,10 @@ class GloveController:
                 self.log.warning(f"Bad V frame: {line!r}")
             return
 
-        # ── calibration ──
         if line.startswith("CAL:"):
             self._handle_cal(line)
             return
 
-        # ── config / motor confirmations ──
         if line.startswith("CFG:"):
             self.log.info(f"Config: {line}")
             if self.on_cal_event:
@@ -284,7 +290,7 @@ class GloveController:
         self.log.warning(f"Unknown line: {line!r}")
 
     def _handle_cal(self, line: str):
-        tag = line[4:]   # strip "CAL:"
+        tag = line[4:]
 
         if tag == "START":
             self.cal = CalibrationState(active=True)
@@ -296,16 +302,14 @@ class GloveController:
             n = int(tag[5:])
             self.cal.finger    = n
             self.cal.wait_bent = False
-            msg = f"Hold {FINGER_NAMES[n]} OPEN then press Enter"
-            self.log.info(msg)
+            self.log.info(f"Hold {FINGER_NAMES[n]} OPEN then press Enter")
             if self.on_cal_event:
                 self.on_cal_event("OPEN", {"finger": n, "name": FINGER_NAMES[n]})
 
         elif tag.startswith("BENT:"):
             n = int(tag[5:])
             self.cal.wait_bent = True
-            msg = f"Bend {FINGER_NAMES[n]} fully then press Enter"
-            self.log.info(msg)
+            self.log.info(f"Bend {FINGER_NAMES[n]} fully then press Enter")
             if self.on_cal_event:
                 self.on_cal_event("BENT", {"finger": n, "name": FINGER_NAMES[n]})
 
@@ -336,19 +340,14 @@ class GloveController:
                     "bent": self.cal.bent_vals,
                 })
 
-
 # ── INTERACTIVE CLI ───────────────────────────────────────────────────────────
 def interactive_cli(ctrl: GloveController):
-    """
-    Minimal interactive shell so you can control the glove by hand
-    while frames stream in the background.
-    """
     print("\nGlove CLI — commands:")
     print("  cal          start calibration")
     print("  <enter>      confirm calibration step")
     print("  thresh <n>   set threshold percent (10-90)")
     print("  status       query ATmega config")
-    print("  mt<1-3> <ms> fire motor")
+    print("  mt<1-3> <ms> fire motor  e.g. mt1 200")
     print("  q            quit\n")
 
     while True:
@@ -381,22 +380,20 @@ def interactive_cli(ctrl: GloveController):
         else:
             print(f"  Unknown command: {cmd!r}")
 
-
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description="OrangePi glove controller driver")
-    ap.add_argument("--port",    default=UART_DEV,  help="Serial device (default: %(default)s)")
+    ap.add_argument("--port",    default=UART_DEV, help="Serial device (default: %(default)s)")
     ap.add_argument("--baud",    default=BAUD, type=int, help="Baud rate (default: %(default)s)")
-    ap.add_argument("--verbose", action="store_true",    help="Show all raw frames")
+    ap.add_argument("--verbose", action="store_true", help="Show all raw frames")
     args = ap.parse_args()
 
     if args.verbose:
         logging.getLogger("GloveCtrl").setLevel(logging.DEBUG)
 
     def on_frame(f: SensorFrame):
-        # Print only when something is actually happening to avoid spam
         if f.flex_bits or f.imu_bits:
             print(f"  ★ {f}")
 
