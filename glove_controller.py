@@ -175,7 +175,6 @@ class GloveController:
             ok = self._ready.wait(timeout)
             if not ok:
                 self.log.warning("ATmega RDY not received within timeout — continuing anyway")
-            return ok
         return True
 
     def stop(self):
