@@ -103,11 +103,23 @@ def detect_mic() -> int | None:
 
 def detect_speaker() -> str:
     """
-    Return an ALSA device string (e.g. 'plughw:3,0') for the Logitech speaker.
-    Strategy:
-      1. Parse 'aplay -l' for a card whose name matches LOGI_KEYWORDS
-      2. Fall back to card 0 device 0
+    Return an ALSA plughw string for the Logitech *speaker/headset*.
+
+    Key insight from probe output:
+      • card 3 = C270 HD WEBCAM  → capture only, NOT a playback device
+      • card 4 = Logi USB Headset → has playback (and capture)
+    So we MUST read from 'aplay -l' (playback list), not 'arecord -l',
+    and we prefer cards whose short name contains "headset" or "logi"
+    OVER cards that look like webcams.
+
+    Priority order:
+      1. Any playback card whose bracket-name contains "headset"
+      2. Any playback card matching LOGI_KEYWORDS but NOT "webcam"/"c270"
+      3. First USB playback card
+      4. Hard fallback plughw:0,0
     """
+    WEBCAM_WORDS = {"webcam", "c270", "c920", "c310", "c525", "c922"}
+
     try:
         out = subprocess.check_output(["aplay", "-l"], stderr=subprocess.DEVNULL,
                                       text=True)
@@ -115,27 +127,33 @@ def detect_speaker() -> str:
         print("[DETECT] Speaker → aplay not found; defaulting to plughw:0,0")
         return "plughw:0,0"
 
-    # aplay -l lines look like:
-    #   card 3: C270 [C270 HD WEBCAM], device 0: USB Audio [USB Audio]
+    # aplay -l lines:  card 4: Headset [Logi USB Headset], device 0: USB Audio
     card_pattern = re.compile(
         r"^card\s+(\d+):\s+\S+\s+\[([^\]]+)\].*device\s+(\d+):", re.IGNORECASE
     )
-    for line in out.splitlines():
-        m = card_pattern.match(line.strip())
-        if m:
-            card_num, card_name, dev_num = m.group(1), m.group(2), m.group(3)
-            if _is_logi(card_name):
-                alsa = f"plughw:{card_num},{dev_num}"
-                print(f"[DETECT] Speaker → {alsa}  ({card_name})")
-                return alsa
 
-    # fallback: first playback card
+    headset_cards = []   # priority 1
+    logi_cards    = []   # priority 2
+    usb_cards     = []   # priority 3
+
     for line in out.splitlines():
         m = card_pattern.match(line.strip())
-        if m:
-            alsa = f"plughw:{m.group(1)},{m.group(3)}"
-            print(f"[DETECT] Speaker → {alsa}  (first available, fallback)")
-            return alsa
+        if not m:
+            continue
+        card_num, card_name, dev_num = m.group(1), m.group(2), m.group(3)
+        n = card_name.lower()
+        alsa = f"plughw:{card_num},{dev_num}"
+
+        if "headset" in n:
+            headset_cards.append((alsa, card_name))
+        elif _is_logi(n) and not any(w in n for w in WEBCAM_WORDS):
+            logi_cards.append((alsa, card_name))
+        elif "usb" in n:
+            usb_cards.append((alsa, card_name))
+
+    for alsa, name in (headset_cards or logi_cards or usb_cards):
+        print(f"[DETECT] Speaker → {alsa}  ({name})")
+        return alsa
 
     print("[DETECT] Speaker → plughw:0,0  (hard fallback)")
     return "plughw:0,0"
@@ -143,33 +161,52 @@ def detect_speaker() -> str:
 
 def detect_camera() -> int:
     """
-    Scan /dev/videoN nodes and return the index of the first one that:
-      a) v4l2-ctl reports as a Logitech capture device, OR
-      b) OpenCV can actually open and read a frame from.
-    Returns 0 if nothing better is found.
+    Return the /dev/videoN *index* for the C270 webcam.
+
+    Key insight from probe output:
+      • /dev/video0 = 'cedrus' (hardware video codec — NOT a webcam, can't stream)
+      • /dev/video1 = C270 HD WEBCAM  ← correct capture node
+      • /dev/video2 = C270 HD WEBCAM  ← metadata/secondary node (also uvcvideo)
+
+    Strategy:
+      1. v4l2-ctl pass: find nodes whose Card type is Logi AND driver is uvcvideo.
+         Among those, take the lowest-numbered node (video1 before video2).
+      2. OpenCV open-test: skip index 0, try each remaining node for a real frame.
+      3. Hard fallback: 1  (never 0 — cedrus always sits there on OrangePi).
     """
     video_nodes = sorted(glob.glob("/dev/video*"),
                          key=lambda p: int(re.search(r"\d+", p).group()))
 
-    # ── Pass 1: use v4l2-ctl to find Logitech by name ────────────────────────
+    # ── Pass 1: v4l2-ctl — must be uvcvideo AND match Logi keywords ──────────
+    uvc_logi_nodes = []
     for node in video_nodes:
         idx = int(re.search(r"\d+", node).group())
+        if idx == 0:
+            continue   # cedrus is always video0 on OrangePi — skip unconditionally
         try:
             info = subprocess.check_output(
                 ["v4l2-ctl", "--device", node, "--info"],
                 stderr=subprocess.DEVNULL, text=True, timeout=2
             )
-            # Look for "Card type" or "Driver name" lines
-            if any(_is_logi(line) for line in info.splitlines()):
-                print(f"[DETECT] Camera → /dev/video{idx}  (v4l2 name match)")
-                return idx
+            lines = info.splitlines()
+            is_uvc  = any("uvcvideo" in l.lower() for l in lines)
+            is_logi = any(_is_logi(l) for l in lines)
+            if is_uvc and is_logi:
+                uvc_logi_nodes.append(idx)
         except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
             pass
 
-    # ── Pass 2: try opening each node with OpenCV and grab one frame ──────────
-    print("[DETECT] v4l2-ctl scan found no Logi cam — trying OpenCV open test...")
+    if uvc_logi_nodes:
+        idx = min(uvc_logi_nodes)   # lowest node = primary capture node
+        print(f"[DETECT] Camera → /dev/video{idx}  (uvcvideo + Logi name)")
+        return idx
+
+    # ── Pass 2: OpenCV open-test — skip 0, take first that yields a frame ────
+    print("[DETECT] v4l2-ctl found nothing — trying OpenCV open test (skipping video0)...")
     for node in video_nodes:
         idx = int(re.search(r"\d+", node).group())
+        if idx == 0:
+            continue
         cap = cv2.VideoCapture(idx)
         if cap.isOpened():
             ret, frame = cap.read()
@@ -180,8 +217,8 @@ def detect_camera() -> int:
         else:
             cap.release()
 
-    print("[DETECT] Camera → /dev/video0  (hard fallback)")
-    return 0
+    print("[DETECT] Camera → /dev/video1  (hard fallback, skipping cedrus)")
+    return 1
 
 
 def auto_detect_all() -> None:
@@ -293,23 +330,61 @@ def _to_pcm(frame: np.ndarray) -> bytes:
 
 
 def record_with_vad() -> np.ndarray | None:
+    """
+    Capture audio with VAD gating.
+
+    ALSA xrun fix for C270 on OrangePi:
+    ─────────────────────────────────────
+    The C270 USB mic on OrangePi triggers PortAudio xrun errors
+    ("Broken pipe", ALSA error -32) when blocksize is too small or
+    latency is unspecified.  Two fixes applied here:
+      1. latency="high"  — tells PortAudio to use a large ALSA buffer
+         (≈100 ms) which absorbs scheduling jitter on the ARM CPU.
+      2. stream.read() wrapped in try/except — if a transient xrun still
+         occurs we discard that frame and continue rather than crashing.
+    """
     ring_buffer   = collections.deque(maxlen=RING_BUFFER_FRAMES)
     triggered     = False
     voiced_frames: list[np.ndarray] = []
     pre_roll:     list[np.ndarray]  = []
     max_frames    = int(MAX_RECORD_SEC * 1000 / FRAME_DURATION)
     frame_count   = 0
+    xrun_count    = 0
+    MAX_XRUNS     = 10   # abort and retry if stream is totally broken
 
     print("[MIC] Listening... speak now")
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-        blocksize=FRAME_SIZE, device=AUDIO_INPUT_DEVICE,
-    ) as stream:
+    try:
+        stream_ctx = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=FRAME_SIZE,
+            device=AUDIO_INPUT_DEVICE,
+            latency="high",          # ← key fix: large ALSA buffer avoids xruns
+        )
+    except Exception as e:
+        print(f"[MIC] Could not open input stream: {e}")
+        return None
+
+    with stream_ctx as stream:
         while frame_count < max_frames:
-            chunk, _ = stream.read(FRAME_SIZE)
-            chunk    = chunk.flatten()
-            pcm      = _to_pcm(chunk)
+            try:
+                chunk, overflowed = stream.read(FRAME_SIZE)
+                if overflowed:
+                    # Buffer overflowed — data may be stale; skip this frame
+                    continue
+            except sd.PortAudioError as e:
+                xrun_count += 1
+                print(f"[MIC] xrun #{xrun_count}: {e} — skipping frame")
+                if xrun_count >= MAX_XRUNS:
+                    print("[MIC] Too many xruns — aborting this listen attempt.")
+                    break
+                time.sleep(0.02)
+                continue
+
+            chunk     = chunk.flatten()
+            pcm       = _to_pcm(chunk)
             if len(pcm) != FRAME_SIZE * 2:
                 continue
             is_speech = vad.is_speech(pcm, SAMPLE_RATE)
