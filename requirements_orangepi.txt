@@ -1,0 +1,41 @@
+# requirements_orangepi.txt
+# OrangePi 2W Zero — glove hub + voice client (gesture engine, STT, TTS, camera)
+# ──────────────────────────────────────────────────────────────────────────────
+# Install:
+#   sudo apt update
+#   sudo apt install -y espeak-ng portaudio19-dev libsndfile1 \
+#                       python3-pip python3-dev build-essential python3-opencv
+#   pip3 install --break-system-packages -r requirements_orangepi.txt
+#
+# NOTE on OpenCV: install it with apt (python3-opencv) as shown above, NOT pip —
+# building opencv-python from source on a 512 MB ARM board is painfully slow and
+# usually OOMs. If you must use pip, use the headless wheel: opencv-python-headless
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Glove UART driver (glove_controller.py)
+pyserial==3.5
+
+# Voice activity detection — tiny C ext, replaces silero-vad + torch
+webrtcvad==2.0.10
+
+# STT — faster-whisper 'base' int8 on CPU (pulls ctranslate2, NOT torch)
+faster-whisper==1.1.1
+
+# Audio I/O — PortAudio bindings (mic capture + earcons)
+sounddevice==0.5.1
+
+# Numerics (often pre-installed on Pi images, pinned anyway)
+numpy>=1.24,<3.0
+
+# HTTP (kept from the original environment)
+requests
+
+# ── OPTIONAL ──────────────────────────────────────────────────────────────────
+# Software noise cancellation before STT. Improves accuracy in noisy rooms.
+#   pip3 install --break-system-packages noisereduce
+# noisereduce
+
+# Camera frames: provided by OpenCV. Prefer apt 'python3-opencv' (see header).
+# If installing via pip instead, uncomment ONE of:
+# opencv-python-headless==4.10.0.84
+# opencv-python==4.10.0.84
