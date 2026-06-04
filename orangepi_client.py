@@ -1,23 +1,6 @@
-#!/usr/bin/env python3
-"""
-orangepi_client.py  —  runs ON the OrangePi 2W Zero
-─────────────────────────────────────────────────────
-Auto-detects Logitech mic, speaker (ALSA), and webcam by scanning
-system devices at startup — no manual config needed.
-
-Flow:
-  mic → webrtcvad → faster-whisper → print transcript
-  → send text (or JPEG frame) over TCP to Windows PC
-  ← receive TTS WAV back
-  → aplay through auto-detected Logi speaker
-
-Install:
-    sudo apt install -y espeak-ng portaudio19-dev libsndfile1 v4l-utils
-    pip install faster-whisper sounddevice numpy webrtcvad opencv-python-headless
-"""
-
 import socket, json, threading, subprocess, collections
 import argparse, warnings, time, struct, base64, glob, re, os
+import difflib, inspect
 
 import cv2
 import numpy as np
@@ -35,25 +18,33 @@ SERVER_PORT = 9000
 SAMPLE_RATE        = 16000
 FRAME_DURATION     = 30
 FRAME_SIZE         = int(SAMPLE_RATE * FRAME_DURATION / 1000)   # 480 samples
-VAD_AGGRESSIVENESS = 3           # ↑ was 2: stricter filtering of non-speech noise
-VOICED_THRESHOLD   = 0.6        # ↓ was 0.7: trigger speech sooner (less clipping)
-UNVOICED_THRESHOLD = 0.6        # ↑ was 0.4: require more silence before cutting off
-RING_BUFFER_MS     = 500        # ↑ was 400: longer context window for VAD decisions
+VAD_AGGRESSIVENESS = 3
+VOICED_THRESHOLD   = 0.6
+UNVOICED_THRESHOLD = 0.6
+RING_BUFFER_MS     = 500
 RING_BUFFER_FRAMES = int(RING_BUFFER_MS / FRAME_DURATION)
 MAX_RECORD_SEC     = 15
-MIN_SPEECH_SEC     = 0.4        # ↑ was 0.3: discard very short noise bursts
-NOISE_GATE_RMS     = 0.004      # RMS floor — frames quieter than this are skipped
-WHISPER_MODEL      = "base"     # ↑ was "tiny": much better accuracy, ~2× slower
+MIN_SPEECH_SEC     = 0.4
+NOISE_GATE_RMS     = 0.004
+WHISPER_MODEL      = "base"
 WHISPER_COMPUTE    = "int8"
 WHISPER_LANGUAGE   = "en"
+WHISPER_BEAM       = 5
+WHISPER_CPU_THREADS = os.cpu_count() or 4   # use all 4 A53 cores on the Zero 2W
 
-# ── ESPEAK DEFAULTS (tunable via CLI) ─────────────────────────────────────────
-# en-us+m3 uses a male voice variant with more inflection than plain "en"
-# Speed 145 feels conversational; pitch 38 is warm without sounding shrill
-ESPEAK_SPEED     = 145          # ↑ was 130: slightly faster feels less robotic
-ESPEAK_VOICE     = "en-us+m3"  # was "en": variant with natural pitch variation
-ESPEAK_PITCH     = 38           # ↑ was 30: warmer, less monotone
-ESPEAK_AMPLITUDE = 170          # ↓ was 180: slightly softer to reduce harshness
+# Domain prompt: biases Whisper's decoder toward the words this app actually uses.
+# This is the single most effective upstream fix for "Lebanese"→"Japanese" etc.
+WHISPER_INITIAL_PROMPT = (
+    "Currency scanner voice commands. Words used: scan, check, ready, again, "
+    "next, done, quit. Currencies: Lebanese pounds, lira, dollars, USD, LBP. "
+    "Numbers: twenty, fifty, one hundred, two hundred, one thousand."
+)
+
+# ── ESPEAK DEFAULTS (LAST-RESORT fallback only — PC voice is preferred) ────────
+ESPEAK_SPEED     = 145
+ESPEAK_VOICE     = "en-us+m3"
+ESPEAK_PITCH     = 38
+ESPEAK_AMPLITUDE = 170
 
 # ── CAMERA ────────────────────────────────────────────────────────────────────
 CAM_WARMUP_FRAMES = 10
@@ -63,18 +54,82 @@ CAM_JPEG_QUALITY  = 80
 MIN_SHARPNESS     = 10
 
 # ── RUNTIME GLOBALS (filled by auto-detect) ───────────────────────────────────
-AUDIO_INPUT_DEVICE: int | None  = None   # sounddevice index for mic
-ALSA_OUTPUT_DEVICE: str | None  = None   # e.g. "plughw:3,0" for speaker
-CAM_DEVICE:         int         = 0      # OpenCV /dev/videoN index
+AUDIO_INPUT_DEVICE: int | None  = None
+ALSA_OUTPUT_DEVICE: str | None  = None
+CAM_DEVICE:         int         = 0
 
 whisper_model: WhisperModel | None = None
 vad:           webrtcvad.Vad | None = None
+_supports_hotwords = False   # detected at model-load time
 
 _tts_lock   = threading.Lock()
 _aplay_proc: subprocess.Popen | None = None
 
+metrics: "Metrics | None" = None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# AUTO-DETECT HELPERS
+# METRICS / AUDITING
+# ─────────────────────────────────────────────────────────────────────────────
+class Metrics:
+    """
+    Lightweight auditing. Appends one JSON object per utterance to a JSONL file
+    and keeps running aggregates so we can print a session summary at exit.
+    Use this to compare 'before' and 'after' tuning runs quantitatively.
+    """
+    def __init__(self, path: str):
+        self.path = path
+        self.records: list[dict] = []
+        self.session_start = time.time()
+        try:
+            # touch the file so we fail fast if the path is bad
+            with open(self.path, "a"):
+                pass
+            print(f"[METRICS] Logging to {self.path}")
+        except OSError as e:
+            print(f"[METRICS] Could not open log file ({e}); in-memory only.")
+            self.path = None
+
+    def log(self, rec: dict) -> None:
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), **rec}
+        self.records.append(rec)
+        if self.path:
+            try:
+                with open(self.path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except OSError:
+                pass
+
+    def summary(self) -> None:
+        utts = [r for r in self.records if r.get("event") == "utterance"]
+        if not utts:
+            print("[METRICS] No utterances recorded.")
+            return
+
+        def avg(key):
+            vals = [r[key] for r in utts if isinstance(r.get(key), (int, float))]
+            return sum(vals) / len(vals) if vals else 0.0
+
+        corrected = sum(1 for r in utts if r.get("corrections"))
+        n = len(utts)
+        dur = time.time() - self.session_start
+
+        print("\n" + "═" * 60)
+        print("  SESSION METRICS SUMMARY")
+        print("═" * 60)
+        print(f"  Utterances        : {n}  over {dur/60:.1f} min")
+        print(f"  Avg record time   : {avg('t_record'):.2f} s")
+        print(f"  Avg transcribe    : {avg('t_transcribe'):.2f} s")
+        print(f"  Avg network RTT   : {avg('t_network'):.2f} s")
+        print(f"  Avg total latency : {avg('t_total'):.2f} s  (speech end → reply)")
+        print(f"  Avg Whisper logp  : {avg('avg_logprob'):.3f}  (closer to 0 = more confident)")
+        print(f"  Avg no-speech prob: {avg('no_speech_prob'):.3f}  (lower = better)")
+        print(f"  Utterances corrected by fuzzy layer: {corrected}/{n}")
+        print("═" * 60 + "\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-DETECT HELPERS  (unchanged logic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 LOGI_KEYWORDS = ["logi", "c270", "c920", "c310", "c525", "c922",
@@ -86,16 +141,11 @@ def _is_logi(name: str) -> bool:
 
 
 def detect_mic() -> int | None:
-    """
-    Return the sounddevice input-device index for the Logitech mic.
-    Falls back to the system default (None) if not found.
-    """
     devices = sd.query_devices()
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0 and _is_logi(dev["name"]):
             print(f"[DETECT] Mic  → [{i}] {dev['name']}")
             return i
-    # second pass: any USB input
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0 and "usb" in dev["name"].lower():
             print(f"[DETECT] Mic  → [{i}] {dev['name']}  (USB fallback)")
@@ -105,24 +155,7 @@ def detect_mic() -> int | None:
 
 
 def detect_speaker() -> str:
-    """
-    Return an ALSA plughw string for the Logitech *speaker/headset*.
-
-    Key insight from probe output:
-      • card 3 = C270 HD WEBCAM  → capture only, NOT a playback device
-      • card 4 = Logi USB Headset → has playback (and capture)
-    So we MUST read from 'aplay -l' (playback list), not 'arecord -l',
-    and we prefer cards whose short name contains "headset" or "logi"
-    OVER cards that look like webcams.
-
-    Priority order:
-      1. Any playback card whose bracket-name contains "headset"
-      2. Any playback card matching LOGI_KEYWORDS but NOT "webcam"/"c270"
-      3. First USB playback card
-      4. Hard fallback plughw:0,0
-    """
     WEBCAM_WORDS = {"webcam", "c270", "c920", "c310", "c525", "c922"}
-
     try:
         out = subprocess.check_output(["aplay", "-l"], stderr=subprocess.DEVNULL,
                                       text=True)
@@ -130,14 +163,10 @@ def detect_speaker() -> str:
         print("[DETECT] Speaker → aplay not found; defaulting to plughw:0,0")
         return "plughw:0,0"
 
-    # aplay -l lines:  card 4: Headset [Logi USB Headset], device 0: USB Audio
     card_pattern = re.compile(
         r"^card\s+(\d+):\s+\S+\s+\[([^\]]+)\].*device\s+(\d+):", re.IGNORECASE
     )
-
-    headset_cards = []   # priority 1
-    logi_cards    = []   # priority 2
-    usb_cards     = []   # priority 3
+    headset_cards, logi_cards, usb_cards = [], [], []
 
     for line in out.splitlines():
         m = card_pattern.match(line.strip())
@@ -146,7 +175,6 @@ def detect_speaker() -> str:
         card_num, card_name, dev_num = m.group(1), m.group(2), m.group(3)
         n = card_name.lower()
         alsa = f"plughw:{card_num},{dev_num}"
-
         if "headset" in n:
             headset_cards.append((alsa, card_name))
         elif _is_logi(n) and not any(w in n for w in WEBCAM_WORDS):
@@ -163,29 +191,13 @@ def detect_speaker() -> str:
 
 
 def detect_camera() -> int:
-    """
-    Return the /dev/videoN *index* for the C270 webcam.
-
-    Key insight from probe output:
-      • /dev/video0 = 'cedrus' (hardware video codec — NOT a webcam, can't stream)
-      • /dev/video1 = C270 HD WEBCAM  ← correct capture node
-      • /dev/video2 = C270 HD WEBCAM  ← metadata/secondary node (also uvcvideo)
-
-    Strategy:
-      1. v4l2-ctl pass: find nodes whose Card type is Logi AND driver is uvcvideo.
-         Among those, take the lowest-numbered node (video1 before video2).
-      2. OpenCV open-test: skip index 0, try each remaining node for a real frame.
-      3. Hard fallback: 1  (never 0 — cedrus always sits there on OrangePi).
-    """
     video_nodes = sorted(glob.glob("/dev/video*"),
                          key=lambda p: int(re.search(r"\d+", p).group()))
-
-    # ── Pass 1: v4l2-ctl — must be uvcvideo AND match Logi keywords ──────────
     uvc_logi_nodes = []
     for node in video_nodes:
         idx = int(re.search(r"\d+", node).group())
         if idx == 0:
-            continue   # cedrus is always video0 on OrangePi — skip unconditionally
+            continue
         try:
             info = subprocess.check_output(
                 ["v4l2-ctl", "--device", node, "--info"],
@@ -200,11 +212,10 @@ def detect_camera() -> int:
             pass
 
     if uvc_logi_nodes:
-        idx = min(uvc_logi_nodes)   # lowest node = primary capture node
+        idx = min(uvc_logi_nodes)
         print(f"[DETECT] Camera → /dev/video{idx}  (uvcvideo + Logi name)")
         return idx
 
-    # ── Pass 2: OpenCV open-test — skip 0, take first that yields a frame ────
     print("[DETECT] v4l2-ctl found nothing — trying OpenCV open test (skipping video0)...")
     for node in video_nodes:
         idx = int(re.search(r"\d+", node).group())
@@ -225,7 +236,6 @@ def detect_camera() -> int:
 
 
 def auto_detect_all() -> None:
-    """Run all three detectors and populate globals."""
     global AUDIO_INPUT_DEVICE, ALSA_OUTPUT_DEVICE, CAM_DEVICE
     print("\n" + "═" * 60)
     print("  AUTO-DETECTING LOGITECH DEVICES")
@@ -237,59 +247,110 @@ def auto_detect_all() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# COMMAND CORRECTION  (deterministic STT safety net)
+# ─────────────────────────────────────────────────────────────────────────────
+# The vocabulary is tiny and known, so we can snap near-miss tokens back to it.
+
+COMMAND_VOCAB = {
+    # scan triggers
+    "scan", "check", "go", "now", "yes", "okay", "ok", "capture", "take", "snap",
+    "shoot", "photo", "picture", "frame", "analyze", "detect", "read", "process",
+    "identify", "start", "run", "next", "continue", "more", "again", "ready",
+    # quit
+    "quit", "exit", "stop", "done", "end", "finish", "bye", "goodbye",
+    # currency
+    "dollar", "dollars", "usd", "buck", "bucks",
+    "lebanese", "lbp", "pound", "pounds", "lira", "lirah",
+    # number words
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty",
+    "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    "hundred", "thousand", "million",
+}
+
+# High-value, hard-coded fixes for the specific mistakes you reported, plus
+# common phonetic neighbours Whisper produces. These run first (exact).
+KNOWN_CONFUSIONS = {
+    "japanese": "lebanese", "javanese": "lebanese", "lebenese": "lebanese",
+    "lebanon": "lebanese",  "libanese": "lebanese", "leb": "lebanese",
+    "scun": "scan", "scam": "scan", "scanned": "scan", "skan": "scan",
+    "scane": "scan", "scen": "scan", "scon": "scan", "skin": "scan",
+    "scant": "scan", "scance": "scan",
+    "leera": "lira", "leira": "lira", "lera": "lira",
+    "dollor": "dollar", "dolar": "dollar", "dollers": "dollars",
+}
+
+FUZZY_CUTOFF = 0.74   # difflib ratio threshold for snapping unknown tokens
+
+
+def correct_transcript(text: str) -> tuple[str, list]:
+    """
+    Return (corrected_text, list_of_(orig, fixed) corrections).
+    1. exact KNOWN_CONFUSIONS replacement, then
+    2. fuzzy snap of remaining unknown tokens to COMMAND_VOCAB.
+    Digits and already-known words are left untouched.
+    """
+    corrections: list[tuple[str, str]] = []
+    out_tokens: list[str] = []
+    for tok in text.split():
+        low = tok.lower()
+        if low in KNOWN_CONFUSIONS:
+            fixed = KNOWN_CONFUSIONS[low]
+            corrections.append((tok, fixed))
+            out_tokens.append(fixed)
+            continue
+        if low in COMMAND_VOCAB or low.isdigit():
+            out_tokens.append(low)
+            continue
+        match = difflib.get_close_matches(low, COMMAND_VOCAB, n=1, cutoff=FUZZY_CUTOFF)
+        if match:
+            corrections.append((tok, match[0]))
+            out_tokens.append(match[0])
+        else:
+            out_tokens.append(low)
+    return " ".join(out_tokens), corrections
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _preprocess_tts(text: str) -> str:
-    """
-    Clean up text before passing to espeak-ng so it sounds more natural:
-    - Expand common abbreviations that espeak reads awkwardly
-    - Convert ALL-CAPS words to title-case (espeak spells them out otherwise)
-    - Add commas after sentence-opening conjunctions for natural pauses
-    - Convert slash-separated alternatives to "or"
-    - Remove parenthetical asides that break speech rhythm
-    """
+    """Clean text before espeak so the LAST-RESORT fallback sounds less awful."""
     import re as _re
-
-    # Expand abbreviations espeak stumbles on
     abbrevs = {
-        r'\bI\.?P\.?\b':    'I P',
+        r'\bI\.?P\.?\b':         'I P',
         r'\bI\.?P\.? address\b': 'I P address',
-        r'\bOK\b':           'okay',
-        r'\be\.g\.\b':       'for example',
-        r'\bi\.e\.\b':       'that is',
-        r'\betc\.\b':        'et cetera',
-        r'\bvs\.\b':         'versus',
-        r'\bDr\.\b':         'Doctor',
-        r'\bMr\.\b':         'Mister',
-        r'\bMrs\.\b':        'Missus',
-        r'\bst\.\b':         'street',
-        r'\bapprox\.\b':     'approximately',
+        r'\bOK\b':               'okay',
+        r'\be\.g\.\b':           'for example',
+        r'\bi\.e\.\b':           'that is',
+        r'\betc\.\b':            'et cetera',
+        r'\bvs\.\b':             'versus',
+        r'\bDr\.\b':             'Doctor',
+        r'\bMr\.\b':             'Mister',
+        r'\bMrs\.\b':            'Missus',
+        r'\bst\.\b':             'street',
+        r'\bapprox\.\b':         'approximately',
     }
     for pat, rep in abbrevs.items():
         text = _re.sub(pat, rep, text, flags=_re.IGNORECASE)
-
-    # ALL-CAPS words → Title Case (prevents letter-by-letter spelling)
-    text = _re.sub(r'\b([A-Z]{2,})\b',
-                   lambda m: m.group(1).title(), text)
-
-    # Remove parenthetical content — breaks sentence flow
+    text = _re.sub(r'\b([A-Z]{2,})\b', lambda m: m.group(1).title(), text)
     text = _re.sub(r'\([^)]*\)', '', text)
-
-    # Slash alternatives → "or"  e.g. "yes/no" → "yes or no"
     text = _re.sub(r'(\w+)\s*/\s*(\w+)', r'\1 or \2', text)
-
-    # Pause after sentence-opening connectors
     for word in ('However', 'Therefore', 'Meanwhile', 'Otherwise',
                  'Furthermore', 'Additionally', 'Nevertheless'):
         text = _re.sub(rf'\b{word}\b', f'{word},', text)
-
-    # Collapse multiple spaces / strip
     text = _re.sub(r'  +', ' ', text).strip()
     return text
 
 
-
+def _play_wav_bytes(wav_bytes: bytes) -> subprocess.Popen:
+    """
+    RESTORED FUNCTION (was missing in the original — this is the bug that made
+    the natural PC voice silently fail and forced robotic espeak fallback).
+    Pipes a complete WAV (with header) into aplay on the detected speaker.
+    """
     proc = subprocess.Popen(
         ["aplay", "-D", ALSA_OUTPUT_DEVICE, "-q"],
         stdin=subprocess.PIPE,
@@ -303,9 +364,8 @@ def _preprocess_tts(text: str) -> str:
 
 def speak(text: str, wav_bytes: bytes | None = None) -> None:
     """
-    Non-blocking. Plays SAPI WAV from server if provided, else local espeak-ng.
-    Interrupts any currently playing audio first.
-    Text is preprocessed for more natural prosody before being sent to espeak.
+    Non-blocking. Plays the PC's natural-voice WAV if provided, else falls back
+    to local espeak-ng. Interrupts any currently-playing audio first.
     """
     global _aplay_proc
     clean = _preprocess_tts(text)
@@ -324,7 +384,7 @@ def speak(text: str, wav_bytes: bytes | None = None) -> None:
                  "-v", ESPEAK_VOICE,
                  "-p", str(ESPEAK_PITCH),
                  "-a", str(ESPEAK_AMPLITUDE),
-                 "-g", "6",       # ← word gap: 6 × 10ms = 60ms between words
+                 "-g", "6",
                  "--stdout", clean],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -365,20 +425,26 @@ def wait_speaking() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_models() -> None:
-    global whisper_model, vad
+    global whisper_model, vad, _supports_hotwords
     print("[INIT] Loading webrtcvad...")
     vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
     print("[INIT] webrtcvad ready.")
-    print(f"[INIT] Loading faster-whisper '{WHISPER_MODEL}' int8 CPU...")
+    print(f"[INIT] Loading faster-whisper '{WHISPER_MODEL}' int8, {WHISPER_CPU_THREADS} threads...")
     print("[INIT] First run downloads the model — 'base' is ~150 MB, may take a minute...")
-    whisper_model = WhisperModel(WHISPER_MODEL, device="cpu",
-                                 compute_type=WHISPER_COMPUTE,
-                                 num_workers=2)   # ← parallel decode threads on ARM
+    whisper_model = WhisperModel(
+        WHISPER_MODEL, device="cpu",
+        compute_type=WHISPER_COMPUTE,
+        cpu_threads=WHISPER_CPU_THREADS,   # ← use every core; biggest speed win
+        num_workers=1,
+    )
+    _supports_hotwords = "hotwords" in inspect.signature(
+        WhisperModel.transcribe).parameters
+    print(f"[INIT] hotwords supported: {_supports_hotwords}")
     print("[INIT] All models ready.\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VAD RECORDING
+# VAD RECORDING  (unchanged logic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _to_pcm(frame: np.ndarray) -> bytes:
@@ -386,19 +452,6 @@ def _to_pcm(frame: np.ndarray) -> bytes:
 
 
 def record_with_vad() -> np.ndarray | None:
-    """
-    Capture audio with VAD gating.
-
-    ALSA xrun fix for C270 on OrangePi:
-    ─────────────────────────────────────
-    The C270 USB mic on OrangePi triggers PortAudio xrun errors
-    ("Broken pipe", ALSA error -32) when blocksize is too small or
-    latency is unspecified.  Two fixes applied here:
-      1. latency="high"  — tells PortAudio to use a large ALSA buffer
-         (≈100 ms) which absorbs scheduling jitter on the ARM CPU.
-      2. stream.read() wrapped in try/except — if a transient xrun still
-         occurs we discard that frame and continue rather than crashing.
-    """
     ring_buffer   = collections.deque(maxlen=RING_BUFFER_FRAMES)
     triggered     = False
     voiced_frames: list[np.ndarray] = []
@@ -406,18 +459,13 @@ def record_with_vad() -> np.ndarray | None:
     max_frames    = int(MAX_RECORD_SEC * 1000 / FRAME_DURATION)
     frame_count   = 0
     xrun_count    = 0
-    MAX_XRUNS     = 10   # abort and retry if stream is totally broken
+    MAX_XRUNS     = 10
 
     print("[MIC] Listening... speak now")
-
     try:
         stream_ctx = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=FRAME_SIZE,
-            device=AUDIO_INPUT_DEVICE,
-            latency="high",          # ← key fix: large ALSA buffer avoids xruns
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+            blocksize=FRAME_SIZE, device=AUDIO_INPUT_DEVICE, latency="high",
         )
     except Exception as e:
         print(f"[MIC] Could not open input stream: {e}")
@@ -428,7 +476,6 @@ def record_with_vad() -> np.ndarray | None:
             try:
                 chunk, overflowed = stream.read(FRAME_SIZE)
                 if overflowed:
-                    # Buffer overflowed — data may be stale; skip this frame
                     continue
             except sd.PortAudioError as e:
                 xrun_count += 1
@@ -439,14 +486,12 @@ def record_with_vad() -> np.ndarray | None:
                 time.sleep(0.02)
                 continue
 
-            chunk     = chunk.flatten()
-
-            # Noise gate: skip frames that are near-silence (background hum, etc.)
+            chunk = chunk.flatten()
             rms = float(np.sqrt(np.mean(chunk ** 2)))
             if rms < NOISE_GATE_RMS and not triggered:
                 continue
 
-            pcm       = _to_pcm(chunk)
+            pcm = _to_pcm(chunk)
             if len(pcm) != FRAME_SIZE * 2:
                 continue
             is_speech = vad.is_speech(pcm, SAMPLE_RATE)
@@ -487,72 +532,114 @@ def record_with_vad() -> np.ndarray | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _normalize_audio(audio: np.ndarray) -> np.ndarray:
-    """Peak-normalize to 90% full scale so Whisper gets a strong clean signal."""
+    """Remove DC offset then peak-normalize. (No pre-emphasis/high-pass on
+    purpose — Whisper was trained on natural audio, and filtering it can hurt.)"""
+    audio = audio - float(np.mean(audio))
     peak = np.abs(audio).max()
     if peak > 1e-6:
-        audio = audio * (0.9 / peak)
+        audio = audio * (0.95 / peak)
     return audio.astype("float32")
 
 
-def transcribe(audio: np.ndarray | None) -> str:
+def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
+    """Returns (raw_text, stats). stats carries Whisper confidence numbers."""
+    stats = {"avg_logprob": None, "no_speech_prob": None, "n_segments": 0}
     if audio is None:
-        return ""
+        return "", stats
+
     print("[STT] Transcribing...")
     audio = _normalize_audio(audio)
-    segments, _ = whisper_model.transcribe(
-        audio,
+
+    kwargs = dict(
         language=WHISPER_LANGUAGE,
-        beam_size=5,           # ↑ was 1: explores more paths → far fewer word errors
-        best_of=5,             # ↑ was 1: picks best from multiple samples
-        temperature=0.0,       # deterministic — good for command recognition
-        condition_on_previous_text=False,   # avoids hallucinated "repetition loops"
+        beam_size=WHISPER_BEAM,
+        best_of=WHISPER_BEAM,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        initial_prompt=WHISPER_INITIAL_PROMPT,   # ← domain biasing
         vad_filter=True,
         vad_parameters={
-            "min_silence_duration_ms": 400,  # ↑ was 300: don't cut off trailing words
-            "speech_pad_ms": 150,            # ↑ was 100: keep a bit more context
-            "threshold": 0.35,               # ↓ slightly: catch quieter speech
+            "min_silence_duration_ms": 400,
+            "speech_pad_ms": 150,
+            "threshold": 0.35,
         },
-        no_speech_threshold=0.5,    # discard segments Whisper thinks are non-speech
-        compression_ratio_threshold=2.0,  # toss hallucinated repetitive outputs
+        no_speech_threshold=0.5,
+        compression_ratio_threshold=2.0,
     )
-    return " ".join(s.text for s in segments).strip().lower()
+    if _supports_hotwords:
+        kwargs["hotwords"] = "scan check ready Lebanese pounds lira dollars done quit"
+
+    segments, _ = whisper_model.transcribe(audio, **kwargs)
+
+    seg_list = list(segments)
+    stats["n_segments"] = len(seg_list)
+    if seg_list:
+        stats["avg_logprob"]   = sum(s.avg_logprob   for s in seg_list) / len(seg_list)
+        stats["no_speech_prob"] = sum(s.no_speech_prob for s in seg_list) / len(seg_list)
+    text = " ".join(s.text for s in seg_list).strip().lower()
+    return text, stats
 
 
-def listen(retries: int = 5) -> str:
+def listen(retries: int = 5) -> tuple[str, dict]:
+    """
+    Returns (corrected_text, audit). audit holds timings/confidence/corrections
+    for metrics logging.
+    """
     for attempt in range(1, retries + 1):
+        t0 = time.time()
         audio = record_with_vad()
-        text  = transcribe(audio)
-        if text.strip():
+        t_record = time.time() - t0
+
+        t1 = time.time()
+        raw_text, stats = transcribe(audio)
+        t_transcribe = time.time() - t1
+
+        corrected, corrections = correct_transcript(raw_text)
+
+        audit = {
+            "t_record": round(t_record, 3),
+            "t_transcribe": round(t_transcribe, 3),
+            "raw_text": raw_text,
+            "corrected_text": corrected,
+            "corrections": corrections,
+            "avg_logprob": (round(stats["avg_logprob"], 4)
+                            if stats["avg_logprob"] is not None else None),
+            "no_speech_prob": (round(stats["no_speech_prob"], 4)
+                               if stats["no_speech_prob"] is not None else None),
+            "attempt": attempt,
+        }
+
+        if corrected.strip():
             print("\n" + "─" * 50)
-            print(f"  YOU SAID  →  {text}")
+            if corrections:
+                fixes = ", ".join(f"{a}→{b}" for a, b in corrections)
+                print(f"  RAW       →  {raw_text}")
+                print(f"  CORRECTED →  {corrected}   [{fixes}]")
+            else:
+                print(f"  YOU SAID  →  {corrected}")
+            conf = audit["avg_logprob"]
+            if conf is not None:
+                print(f"  confidence (avg_logprob) = {conf}")
             print("─" * 50 + "\n")
-            return text
+            return corrected, audit
+
         print(f"[STT] Nothing understood ({attempt}/{retries}), retrying...")
-    return ""
+    return "", {"t_record": 0, "t_transcribe": 0, "raw_text": "",
+                "corrected_text": "", "corrections": [], "attempt": retries}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CAMERA — Logitech webcam on OrangePi
+# CAMERA  (unchanged logic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def capture_best_frame_local() -> bytes | None:
-    """
-    Open the auto-detected Logi webcam, warm it up, capture CAM_CAPTURE_SEC
-    seconds of frames, pick the sharpest, encode as JPEG and return bytes.
-    Tries multiple OpenCV backends so it works across kernel/driver versions.
-    """
-    backends = [
-        (cv2.CAP_V4L2,  "V4L2"),
-        (cv2.CAP_GSTREAMER, "GStreamer"),
-        (cv2.CAP_ANY,   "ANY"),
-    ]
-
+    backends = [(cv2.CAP_V4L2, "V4L2"), (cv2.CAP_GSTREAMER, "GStreamer"),
+                (cv2.CAP_ANY, "ANY")]
     cap = None
     for backend, bname in backends:
         print(f"[CAM] Trying /dev/video{CAM_DEVICE} with backend {bname}...")
         _c = cv2.VideoCapture(CAM_DEVICE, backend)
         if _c.isOpened():
-            # Quick sanity: can we grab at least one frame?
             ok, _f = _c.read()
             if ok and _f is not None:
                 cap = _c
@@ -563,7 +650,6 @@ def capture_best_frame_local() -> bytes | None:
             _c.release()
 
     if cap is None:
-        # Last resort: try each /dev/videoN node directly
         print("[CAM] Index open failed — scanning all /dev/video* nodes...")
         for node in sorted(glob.glob("/dev/video*"),
                            key=lambda p: int(re.search(r"\d+", p).group())):
@@ -580,7 +666,6 @@ def capture_best_frame_local() -> bytes | None:
         print("[CAM] ERROR: Could not open any webcam device.")
         return None
 
-    # Warmup — let exposure/AWB settle
     print(f"[CAM] Warming up ({CAM_WARMUP_FRAMES} frames)...")
     for _ in range(CAM_WARMUP_FRAMES):
         cap.grab()
@@ -588,7 +673,6 @@ def capture_best_frame_local() -> bytes | None:
     best_frame, best_score, count = None, -1.0, 0
     interval  = 1.0 / CAM_FPS
     end_time  = time.time() + CAM_CAPTURE_SEC
-
     print(f"[CAM] Capturing {CAM_CAPTURE_SEC}s @ {CAM_FPS} fps...")
     while time.time() < end_time:
         ret, frame = cap.read()
@@ -606,7 +690,6 @@ def capture_best_frame_local() -> bytes | None:
 
     cap.release()
     print(f"[CAM] Best sharpness: {best_score:.1f} from {count} frames")
-
     if best_score < MIN_SHARPNESS or best_frame is None:
         print("[CAM] All frames too blurry — aborting.")
         return None
@@ -616,14 +699,13 @@ def capture_best_frame_local() -> bytes | None:
     if not ok:
         print("[CAM] JPEG encode failed.")
         return None
-
     jpeg_bytes = buf.tobytes()
     print(f"[CAM] JPEG ready: {len(jpeg_bytes) / 1024:.1f} KB")
     return jpeg_bytes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NETWORK
+# NETWORK  (unchanged logic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
@@ -678,18 +760,18 @@ def _speak_resp(resp: dict) -> None:
         return
     audio_b64 = resp.get("audio")
     wav_bytes  = base64.b64decode(audio_b64) if audio_b64 else None
+    if wav_bytes is None:
+        print("[TTS] No PC audio in response — using local espeak fallback.")
     speak(tts, wav_bytes)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCAN TRIGGER WORDS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── SCAN TRIGGER WORDS ────────────────────────────────────────────────────────
 SCAN_TRIGGERS = {
-    "scan","check","go","now","yes","okay","ok","capture","take","snap",
-    "shoot","photo","picture","frame","analyze","detect","read","process",
-    "identify","start","run","next","continue","more","again","ready",
-    "do it","let's go","lets go","scan it","do scan","take picture",
-    "take photo","scan now","check now","yalla","hayde","sur",
+    "scan", "check", "go", "now", "yes", "okay", "ok", "capture", "take", "snap",
+    "shoot", "photo", "picture", "frame", "analyze", "detect", "read", "process",
+    "identify", "start", "run", "next", "continue", "more", "again", "ready",
+    "do it", "let's go", "lets go", "scan it", "do scan", "take picture",
+    "take photo", "scan now", "check now", "yalla", "hayde", "sur",
 }
 
 
@@ -698,65 +780,56 @@ SCAN_TRIGGERS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global SERVER_HOST, SERVER_PORT
+    global SERVER_HOST, SERVER_PORT, WHISPER_MODEL, WHISPER_BEAM
     global ESPEAK_SPEED, ESPEAK_VOICE, ESPEAK_PITCH, ESPEAK_AMPLITUDE
     global CAM_WARMUP_FRAMES, CAM_CAPTURE_SEC, CAM_FPS, CAM_JPEG_QUALITY
-    global CAM_DEVICE, AUDIO_INPUT_DEVICE, ALSA_OUTPUT_DEVICE
+    global CAM_DEVICE, AUDIO_INPUT_DEVICE, ALSA_OUTPUT_DEVICE, metrics
 
-    ap = argparse.ArgumentParser(description="OrangePi 2W Zero voice client")
-    # Network
-    ap.add_argument("--host",  default=SERVER_HOST)
-    ap.add_argument("--port",  default=SERVER_PORT, type=int)
-    # Whisper
-    ap.add_argument("--model", default=WHISPER_MODEL,
-                    choices=["tiny", "base", "small"],
-                    help="Whisper model size (default: base — better accuracy than tiny)")
-    # Manual overrides (skip auto-detect)
-    ap.add_argument("--mic",     default=None, type=int,
-                    help="Force sounddevice mic index (skips auto-detect)")
-    ap.add_argument("--alsa",    default=None,
-                    help="Force ALSA output device string, e.g. plughw:3,0")
-    ap.add_argument("--cam",     default=None, type=int,
-                    help="Force camera /dev/videoN index (skips auto-detect)")
-    # Voice calibration
-    ap.add_argument("--speed",      type=int,   default=ESPEAK_SPEED)
-    ap.add_argument("--pitch",      type=int,   default=ESPEAK_PITCH)
-    ap.add_argument("--amplitude",  type=int,   default=ESPEAK_AMPLITUDE)
-    ap.add_argument("--voice",      type=str,   default=ESPEAK_VOICE,
-                    help="espeak-ng voice, e.g. en, en-gb, en+m3, en+f3")
-    # Camera tuning
-    ap.add_argument("--cam-warmup",  type=int,   default=CAM_WARMUP_FRAMES)
-    ap.add_argument("--cam-sec",     type=float, default=CAM_CAPTURE_SEC)
-    ap.add_argument("--cam-fps",     type=int,   default=CAM_FPS)
-    ap.add_argument("--cam-quality", type=int,   default=CAM_JPEG_QUALITY)
+    ap = argparse.ArgumentParser(description="OrangePi 2W Zero voice client (improved)")
+    ap.add_argument("--host", default=SERVER_HOST)
+    ap.add_argument("--port", default=SERVER_PORT, type=int)
+    ap.add_argument("--model", default=WHISPER_MODEL, choices=["tiny", "base", "small"],
+                    help="Whisper size. 'base' is the practical ceiling on a "
+                         "Zero 2W; 'small' is more accurate but ~2-3x slower.")
+    ap.add_argument("--beam", type=int, default=WHISPER_BEAM,
+                    help="Whisper beam size (lower = faster, higher = accurate).")
+    ap.add_argument("--mic", default=None, type=int)
+    ap.add_argument("--alsa", default=None)
+    ap.add_argument("--cam", default=None, type=int)
+    ap.add_argument("--speed", type=int, default=ESPEAK_SPEED)
+    ap.add_argument("--pitch", type=int, default=ESPEAK_PITCH)
+    ap.add_argument("--amplitude", type=int, default=ESPEAK_AMPLITUDE)
+    ap.add_argument("--voice", type=str, default=ESPEAK_VOICE)
+    ap.add_argument("--cam-warmup", type=int, default=CAM_WARMUP_FRAMES)
+    ap.add_argument("--cam-sec", type=float, default=CAM_CAPTURE_SEC)
+    ap.add_argument("--cam-fps", type=int, default=CAM_FPS)
+    ap.add_argument("--cam-quality", type=int, default=CAM_JPEG_QUALITY)
+    ap.add_argument("--metrics", default="client_metrics.jsonl",
+                    help="JSONL audit log path (set '' to disable file logging).")
     args = ap.parse_args()
 
-    SERVER_HOST      = args.host
-    SERVER_PORT      = args.port
-    ESPEAK_SPEED     = args.speed
-    ESPEAK_PITCH     = args.pitch
-    ESPEAK_AMPLITUDE = args.amplitude
-    ESPEAK_VOICE     = args.voice
-    CAM_WARMUP_FRAMES = args.cam_warmup
-    CAM_CAPTURE_SEC   = args.cam_sec
-    CAM_FPS           = args.cam_fps
-    CAM_JPEG_QUALITY  = args.cam_quality
+    SERVER_HOST, SERVER_PORT = args.host, args.port
+    WHISPER_MODEL, WHISPER_BEAM = args.model, args.beam
+    ESPEAK_SPEED, ESPEAK_PITCH = args.speed, args.pitch
+    ESPEAK_AMPLITUDE, ESPEAK_VOICE = args.amplitude, args.voice
+    CAM_WARMUP_FRAMES, CAM_CAPTURE_SEC = args.cam_warmup, args.cam_sec
+    CAM_FPS, CAM_JPEG_QUALITY = args.cam_fps, args.cam_quality
 
-    # ── Auto-detect all three devices ────────────────────────────────────────
+    if args.metrics:
+        metrics = Metrics(args.metrics)
+
     auto_detect_all()
 
-    # Apply manual overrides if given
-    if args.mic  is not None:
+    if args.mic is not None:
         AUDIO_INPUT_DEVICE = args.mic
         print(f"[OVERRIDE] Mic  → device index {AUDIO_INPUT_DEVICE}")
     if args.alsa is not None:
         ALSA_OUTPUT_DEVICE = args.alsa
         print(f"[OVERRIDE] Speaker → {ALSA_OUTPUT_DEVICE}")
-    if args.cam  is not None:
+    if args.cam is not None:
         CAM_DEVICE = args.cam
         print(f"[OVERRIDE] Camera → /dev/video{CAM_DEVICE}")
 
-    # ── Print final device summary ────────────────────────────────────────────
     print("─" * 60)
     print("  DEVICES IN USE")
     sd_name = sd.query_devices(AUDIO_INPUT_DEVICE)["name"] \
@@ -764,11 +837,7 @@ def main() -> None:
     print(f"    Mic      : [{AUDIO_INPUT_DEVICE}] {sd_name}")
     print(f"    Speaker  : {ALSA_OUTPUT_DEVICE}")
     print(f"    Camera   : /dev/video{CAM_DEVICE}")
-    print("  VOICE CALIBRATION")
-    print(f"    Speed    : {ESPEAK_SPEED} WPM")
-    print(f"    Pitch    : {ESPEAK_PITCH}")
-    print(f"    Amplitude: {ESPEAK_AMPLITUDE}")
-    print(f"    Voice    : {ESPEAK_VOICE}  (try en-us+f3 for female, en-gb+m3 for British male)")
+    print(f"    Whisper  : {WHISPER_MODEL} (beam {WHISPER_BEAM}, {WHISPER_CPU_THREADS} threads)")
     print("─" * 60 + "\n")
 
     load_models()
@@ -788,59 +857,87 @@ def main() -> None:
         wait_speaking()
         sock.close()
         return
-
     _speak_resp(resp)
     wait_speaking()
 
-    # ── Main voice loop ───────────────────────────────────────────────────────
-    while True:
-        text = listen()
-        if not text:
-            continue
-
-        payload: dict = {"type": "voice", "text": text}
-
-        if any(t in text for t in SCAN_TRIGGERS):
-            print("[CAM] Scan trigger — capturing from Logi webcam...")
-            jpeg_bytes = capture_best_frame_local()
-            if jpeg_bytes is None:
-                speak("Camera error. Could not capture a frame. Please try again.")
-                wait_speaking()
+    try:
+        while True:
+            text, audit = listen()
+            if not text:
                 continue
-            payload["frame"] = jpeg_bytes
 
-        kb = len(payload.get("frame", b"")) / 1024
-        print(f"[NET] Sending → {text!r}"
-              + (f"  +{kb:.1f} KB frame" if "frame" in payload else ""))
+            payload: dict = {"type": "voice", "text": text}
 
-        resp = _send(sock, payload)
-        if resp is None:
-            speak("Connection lost. Reconnecting.")
-            wait_speaking()
-            sock.close()
-            time.sleep(2)
-            sock = connect_to_server()
-            if sock is None:
-                speak("Could not reconnect. Exiting.")
+            t_cam = 0.0
+            if any(t in text for t in SCAN_TRIGGERS):
+                print("[CAM] Scan trigger — capturing from Logi webcam...")
+                tc = time.time()
+                jpeg_bytes = capture_best_frame_local()
+                t_cam = time.time() - tc
+                if jpeg_bytes is None:
+                    speak("Camera error. Could not capture a frame. Please try again.")
+                    wait_speaking()
+                    audit.update({"event": "utterance", "t_cam": round(t_cam, 3),
+                                  "outcome": "camera_error"})
+                    if metrics: metrics.log(audit)
+                    continue
+                payload["frame"] = jpeg_bytes
+
+            kb = len(payload.get("frame", b"")) / 1024
+            print(f"[NET] Sending → {text!r}"
+                  + (f"  +{kb:.1f} KB frame" if "frame" in payload else ""))
+
+            tn = time.time()
+            resp = _send(sock, payload)
+            t_network = time.time() - tn
+
+            if resp is None:
+                speak("Connection lost. Reconnecting.")
                 wait_speaking()
+                sock.close()
+                time.sleep(2)
+                sock = connect_to_server()
+                if sock is None:
+                    speak("Could not reconnect. Exiting.")
+                    wait_speaking()
+                    break
+                speak("Reconnected. Session was reset. Please start again.")
+                wait_speaking()
+                resp = _send(sock, {"type": "hello"})
+                if resp:
+                    _speak_resp(resp)
+                    wait_speaking()
+                continue
+
+            tts_played_locally = resp.get("audio") is None
+            _speak_resp(resp)
+            wait_speaking()
+
+            # ── audit this full round-trip ─────────────────────────────────
+            audit.update({
+                "event": "utterance",
+                "t_cam": round(t_cam, 3),
+                "t_network": round(t_network, 3),
+                "t_total": round(audit["t_record"] + audit["t_transcribe"]
+                                 + t_cam + t_network, 3),
+                "had_frame": "frame" in payload,
+                "tts_engine": "espeak_local" if tts_played_locally else "pc_voice",
+                "reply": resp.get("tts", "")[:160],
+            })
+            if metrics:
+                metrics.log(audit)
+
+            if resp.get("quit"):
                 break
-            speak("Reconnected. Session was reset. Please start again.")
-            wait_speaking()
-            resp = _send(sock, {"type": "hello"})
-            if resp:
-                _speak_resp(resp)
-                wait_speaking()
-            continue
-
-        _speak_resp(resp)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        speak("Goodbye.")
         wait_speaking()
-
-        if resp.get("quit"):
-            break
-
-    sock.close()
-    speak("Goodbye.")
-    wait_speaking()
+        if metrics:
+            metrics.summary()
 
 
 if __name__ == "__main__":
