@@ -1,6 +1,6 @@
 import socket, json, threading, subprocess, collections
 import argparse, warnings, time, struct, base64, glob, re, os
-import difflib, inspect
+import difflib, inspect, shutil, tempfile
 
 import cv2
 import numpy as np
@@ -39,6 +39,16 @@ WHISPER_INITIAL_PROMPT = (
     "next, done, quit. Currencies: Lebanese pounds, lira, dollars, USD, LBP. "
     "Numbers: twenty, fifty, one hundred, two hundred, one thousand."
 )
+
+# ── PIPER (LOCAL NEURAL TTS — the natural voice the blind user hears) ─────────
+# This runs ON the Pi. It is the preferred engine; espeak below is last-resort.
+#   Install:  pip install piper-tts
+#   Voice:    download e.g. en_US-amy-medium.onnx (+ .onnx.json beside it) from
+#             https://huggingface.co/rhasspy/piper-voices  and pass --piper-model
+PIPER_MODEL = ""                       # path to a .onnx voice; empty = disabled
+PIPER_TMP   = "/tmp/opi_tts.wav"       # single reusable synth target
+_piper_cli  = shutil.which("piper")    # CLI is the most version-stable interface
+LAST_TTS_ENGINE = "none"               # for metrics: which engine actually spoke
 
 # ── ESPEAK DEFAULTS (LAST-RESORT fallback only — PC voice is preferred) ────────
 ESPEAK_SPEED     = 145
@@ -362,12 +372,39 @@ def _play_wav_bytes(wav_bytes: bytes) -> subprocess.Popen:
     return proc
 
 
+def _piper_ready() -> bool:
+    return bool(PIPER_MODEL and _piper_cli and os.path.exists(PIPER_MODEL))
+
+
+def _speak_piper(text: str) -> subprocess.Popen | None:
+    """
+    Synthesize `text` to a WAV with local Piper, then play it via aplay (async).
+    Returns the aplay Popen (so it can be interrupted for barge-in), or None on
+    failure so the caller can fall back to the PC WAV / espeak.
+    """
+    try:
+        subprocess.run(
+            [_piper_cli, "--model", PIPER_MODEL, "--output_file", PIPER_TMP],
+            input=text.encode("utf-8"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+        )
+        if not os.path.exists(PIPER_TMP) or os.path.getsize(PIPER_TMP) < 64:
+            return None
+        return subprocess.Popen(
+            ["aplay", "-D", ALSA_OUTPUT_DEVICE, "-q", PIPER_TMP],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"[TTS] Piper local error: {e}")
+        return None
+
+
 def speak(text: str, wav_bytes: bytes | None = None) -> None:
     """
     Non-blocking. Plays the PC's natural-voice WAV if provided, else falls back
     to local espeak-ng. Interrupts any currently-playing audio first.
     """
-    global _aplay_proc
+    global _aplay_proc, LAST_TTS_ENGINE
     clean = _preprocess_tts(text)
     print(f"\n[TTS] >> {clean}\n")
     with _tts_lock:
@@ -375,28 +412,41 @@ def speak(text: str, wav_bytes: bytes | None = None) -> None:
             _aplay_proc.terminate()
             _aplay_proc.wait()
 
+        # 1) Local Piper — natural neural voice, runs on the Pi, no PC needed
+        if _piper_ready():
+            proc = _speak_piper(clean)
+            if proc is not None:
+                _aplay_proc = proc
+                LAST_TTS_ENGINE = "piper_local"
+                return
+
+        # 2) PC-rendered WAV (Piper/SAPI on the server) if Piper isn't on the Pi
         if wav_bytes:
             _aplay_proc = _play_wav_bytes(wav_bytes)
-        else:
-            espeak = subprocess.Popen(
-                ["espeak-ng",
-                 "-s", str(ESPEAK_SPEED),
-                 "-v", ESPEAK_VOICE,
-                 "-p", str(ESPEAK_PITCH),
-                 "-a", str(ESPEAK_AMPLITUDE),
-                 "-g", "6",
-                 "--stdout", clean],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            aplay = subprocess.Popen(
-                ["aplay", "-D", ALSA_OUTPUT_DEVICE, "-q"],
-                stdin=espeak.stdout,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            espeak.stdout.close()
-            _aplay_proc = aplay
+            LAST_TTS_ENGINE = "pc_voice"
+            return
+
+        # 3) espeak-ng — robotic last resort
+        espeak = subprocess.Popen(
+            ["espeak-ng",
+             "-s", str(ESPEAK_SPEED),
+             "-v", ESPEAK_VOICE,
+             "-p", str(ESPEAK_PITCH),
+             "-a", str(ESPEAK_AMPLITUDE),
+             "-g", "6",
+             "--stdout", clean],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        aplay = subprocess.Popen(
+            ["aplay", "-D", ALSA_OUTPUT_DEVICE, "-q"],
+            stdin=espeak.stdout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        espeak.stdout.close()
+        _aplay_proc = aplay
+        LAST_TTS_ENGINE = "espeak_local"
 
 
 def is_speaking() -> bool:
@@ -784,6 +834,7 @@ def main() -> None:
     global ESPEAK_SPEED, ESPEAK_VOICE, ESPEAK_PITCH, ESPEAK_AMPLITUDE
     global CAM_WARMUP_FRAMES, CAM_CAPTURE_SEC, CAM_FPS, CAM_JPEG_QUALITY
     global CAM_DEVICE, AUDIO_INPUT_DEVICE, ALSA_OUTPUT_DEVICE, metrics
+    global PIPER_MODEL
 
     ap = argparse.ArgumentParser(description="OrangePi 2W Zero voice client (improved)")
     ap.add_argument("--host", default=SERVER_HOST)
@@ -796,6 +847,10 @@ def main() -> None:
     ap.add_argument("--mic", default=None, type=int)
     ap.add_argument("--alsa", default=None)
     ap.add_argument("--cam", default=None, type=int)
+    ap.add_argument("--piper-model", default=PIPER_MODEL,
+                    help="Path to a local Piper .onnx voice (natural TTS on the "
+                         "Pi). Strongly recommended for the blind user's voice. "
+                         "e.g. ~/piper/en_US-amy-medium.onnx")
     ap.add_argument("--speed", type=int, default=ESPEAK_SPEED)
     ap.add_argument("--pitch", type=int, default=ESPEAK_PITCH)
     ap.add_argument("--amplitude", type=int, default=ESPEAK_AMPLITUDE)
@@ -814,6 +869,7 @@ def main() -> None:
     ESPEAK_AMPLITUDE, ESPEAK_VOICE = args.amplitude, args.voice
     CAM_WARMUP_FRAMES, CAM_CAPTURE_SEC = args.cam_warmup, args.cam_sec
     CAM_FPS, CAM_JPEG_QUALITY = args.cam_fps, args.cam_quality
+    PIPER_MODEL = args.piper_model
 
     if args.metrics:
         metrics = Metrics(args.metrics)
@@ -838,6 +894,15 @@ def main() -> None:
     print(f"    Speaker  : {ALSA_OUTPUT_DEVICE}")
     print(f"    Camera   : /dev/video{CAM_DEVICE}")
     print(f"    Whisper  : {WHISPER_MODEL} (beam {WHISPER_BEAM}, {WHISPER_CPU_THREADS} threads)")
+    if _piper_ready():
+        print(f"    Voice    : Piper LOCAL → {os.path.basename(PIPER_MODEL)}  (natural)")
+    elif PIPER_MODEL:
+        print(f"    Voice    : Piper requested but unavailable "
+              f"(cli={'yes' if _piper_cli else 'no'}, "
+              f"model_exists={os.path.exists(PIPER_MODEL)}) → PC voice / espeak")
+    else:
+        print(f"    Voice    : PC-rendered WAV if sent, else espeak (robotic). "
+              f"Pass --piper-model for a natural voice.")
     print("─" * 60 + "\n")
 
     load_models()
@@ -909,7 +974,6 @@ def main() -> None:
                     wait_speaking()
                 continue
 
-            tts_played_locally = resp.get("audio") is None
             _speak_resp(resp)
             wait_speaking()
 
@@ -921,7 +985,7 @@ def main() -> None:
                 "t_total": round(audit["t_record"] + audit["t_transcribe"]
                                  + t_cam + t_network, 3),
                 "had_frame": "frame" in payload,
-                "tts_engine": "espeak_local" if tts_played_locally else "pc_voice",
+                "tts_engine": LAST_TTS_ENGINE,
                 "reply": resp.get("tts", "")[:160],
             })
             if metrics:
