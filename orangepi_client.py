@@ -10,6 +10,16 @@ from faster_whisper import WhisperModel
 
 warnings.filterwarnings("ignore")
 
+# Optional software noise cancellation (spectral gating). If installed, only the
+# user's speech is cleaned before transcription.  Install:  pip install noisereduce
+try:
+    import noisereduce as _nr
+    _NR_AVAILABLE = True
+except Exception:
+    _nr = None
+    _NR_AVAILABLE = False
+NR_ENABLED = True   # honored only when _NR_AVAILABLE; toggle with --no-denoise
+
 # ── SERVER ────────────────────────────────────────────────────────────────────
 SERVER_HOST = "10.254.249.159"
 SERVER_PORT = 9000
@@ -29,7 +39,7 @@ NOISE_GATE_RMS     = 0.004
 WHISPER_MODEL      = "base"
 WHISPER_COMPUTE    = "int8"
 WHISPER_LANGUAGE   = "en"
-WHISPER_BEAM       = 5
+WHISPER_BEAM       = 1          # greedy = fastest. Raise (--beam 3/5) for accuracy.
 WHISPER_CPU_THREADS = os.cpu_count() or 4   # use all 4 A53 cores on the Zero 2W
 
 # Domain prompt: biases Whisper's decoder toward the words this app actually uses.
@@ -82,6 +92,7 @@ CUES_ENABLED = True
 _CUE_LISTEN: bytes | None = None   # soft beep: "I'm listening, speak now"
 _CUE_ACK:    bytes | None = None   # rising two-tone: "got it, working on it"
 _CUE_SHOT:   bytes | None = None   # bright blip: "frame captured"
+_CUE_THINK:  bytes | None = None   # low blip: "transcribing now"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,10 +304,11 @@ def _tone_wav(segments: list[tuple[float, int]], sr: int = 16000,
 
 def init_cues() -> None:
     """Pre-render the earcons once at startup."""
-    global _CUE_LISTEN, _CUE_ACK, _CUE_SHOT
+    global _CUE_LISTEN, _CUE_ACK, _CUE_SHOT, _CUE_THINK
     _CUE_LISTEN = _tone_wav([(880, 110)])                 # one soft beep
     _CUE_ACK    = _tone_wav([(660, 90), (990, 110)])      # rising "got it"
     _CUE_SHOT   = _tone_wav([(1320, 70), (1320, 70)])     # bright double blip
+    _CUE_THINK  = _tone_wav([(440, 90)])                  # low "thinking" blip
 
 
 def play_cue(wav_bytes: bytes | None) -> None:
@@ -653,6 +665,19 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
     return audio.astype("float32")
 
 
+def _denoise(audio: np.ndarray) -> np.ndarray:
+    """Spectral-gate noise cancellation so only the speaker's voice reaches
+    Whisper. No-op if noisereduce isn't installed or --no-denoise was passed."""
+    if not (NR_ENABLED and _NR_AVAILABLE):
+        return audio
+    try:
+        cleaned = _nr.reduce_noise(y=audio, sr=SAMPLE_RATE, stationary=False)
+        return cleaned.astype("float32")
+    except Exception as e:
+        print(f"[NR] denoise skipped: {e}")
+        return audio
+
+
 def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
     """Returns (raw_text, stats). stats carries Whisper confidence numbers."""
     stats = {"avg_logprob": None, "no_speech_prob": None, "n_segments": 0}
@@ -661,6 +686,7 @@ def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
 
     print("[STT] Transcribing...")
     audio = _normalize_audio(audio)
+    audio = _denoise(audio)            # noise cancellation: keep only the voice
 
     kwargs = dict(
         language=WHISPER_LANGUAGE,
@@ -669,12 +695,7 @@ def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
         temperature=0.0,
         condition_on_previous_text=False,
         initial_prompt=WHISPER_INITIAL_PROMPT,   # ← domain biasing
-        vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 400,
-            "speech_pad_ms": 150,
-            "threshold": 0.35,
-        },
+        vad_filter=False,    # we already VAD-gate on the Pi — skip Silero (faster)
         no_speech_threshold=0.5,
         compression_ratio_threshold=2.0,
     )
@@ -694,14 +715,26 @@ def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
 
 def listen(retries: int = 5) -> tuple[str, dict]:
     """
-    Returns (corrected_text, audit). audit holds timings/confidence/corrections
-    for metrics logging.
+    Returns (corrected_text, audit). Skips the expensive Whisper call entirely
+    when no speech was captured, beeps to mark each stage, and tells the user
+    out loud when it heard nothing or couldn't understand.
     """
+    told = False   # avoid repeating the spoken "didn't catch that" every retry
     for attempt in range(1, retries + 1):
         t0 = time.time()
-        audio = record_with_vad()
+        audio = record_with_vad()          # plays the LISTEN cue inside
         t_record = time.time() - t0
 
+        # ── Nothing to transcribe → DON'T run Whisper; tell the user ────────
+        if audio is None:
+            print(f"[STT] No speech captured ({attempt}/{retries}).")
+            if not told:
+                speak("I didn't catch that. Please speak after the beep.")
+                wait_speaking()
+                told = True
+            continue
+
+        play_cue(_CUE_THINK)               # "transcribing now" beep
         t1 = time.time()
         raw_text, stats = transcribe(audio)
         t_transcribe = time.time() - t1
@@ -733,10 +766,17 @@ def listen(retries: int = 5) -> tuple[str, dict]:
             conf = audit["avg_logprob"]
             if conf is not None:
                 print(f"  confidence (avg_logprob) = {conf}")
+            print(f"  timing: record {audit['t_record']}s  transcribe {audit['t_transcribe']}s")
             print("─" * 50 + "\n")
             return corrected, audit
 
-        print(f"[STT] Nothing understood ({attempt}/{retries}), retrying...")
+        # Heard sound but no words came out
+        print(f"[STT] Nothing understood ({attempt}/{retries}).")
+        if not told:
+            speak("Sorry, I did not understand. Please try again.")
+            wait_speaking()
+            told = True
+
     return "", {"t_record": 0, "t_transcribe": 0, "raw_text": "",
                 "corrected_text": "", "corrections": [], "attempt": retries}
 
@@ -897,7 +937,7 @@ def main() -> None:
     global ESPEAK_SPEED, ESPEAK_VOICE, ESPEAK_PITCH, ESPEAK_AMPLITUDE
     global CAM_WARMUP_FRAMES, CAM_CAPTURE_SEC, CAM_FPS, CAM_JPEG_QUALITY
     global CAM_DEVICE, AUDIO_INPUT_DEVICE, ALSA_OUTPUT_DEVICE, metrics
-    global PIPER_MODEL, CUES_ENABLED
+    global PIPER_MODEL, CUES_ENABLED, NR_ENABLED
 
     ap = argparse.ArgumentParser(description="OrangePi 2W Zero voice client (improved)")
     ap.add_argument("--host", default=SERVER_HOST)
@@ -926,6 +966,8 @@ def main() -> None:
                     help="JSONL audit log path (set '' to disable file logging).")
     ap.add_argument("--quiet-cues", action="store_true",
                     help="Disable the beep/earcon audio cues (keeps spoken cues).")
+    ap.add_argument("--no-denoise", action="store_true",
+                    help="Disable software noise cancellation before transcription.")
     args = ap.parse_args()
 
     SERVER_HOST, SERVER_PORT = args.host, args.port
@@ -936,6 +978,7 @@ def main() -> None:
     CAM_FPS, CAM_JPEG_QUALITY = args.cam_fps, args.cam_quality
     PIPER_MODEL = args.piper_model
     CUES_ENABLED = not args.quiet_cues
+    NR_ENABLED = not args.no_denoise
     init_cues()
 
     if args.metrics:
@@ -961,6 +1004,12 @@ def main() -> None:
     print(f"    Speaker  : {ALSA_OUTPUT_DEVICE}")
     print(f"    Camera   : /dev/video{CAM_DEVICE}")
     print(f"    Whisper  : {WHISPER_MODEL} (beam {WHISPER_BEAM}, {WHISPER_CPU_THREADS} threads)")
+    if NR_ENABLED and _NR_AVAILABLE:
+        print(f"    Denoise  : ON (noisereduce)")
+    elif NR_ENABLED and not _NR_AVAILABLE:
+        print(f"    Denoise  : unavailable — run 'pip install noisereduce' to enable")
+    else:
+        print(f"    Denoise  : OFF (--no-denoise)")
     if _piper_ready():
         print(f"    Voice    : Piper LOCAL → {os.path.basename(PIPER_MODEL)}  (natural)")
     elif PIPER_MODEL:
