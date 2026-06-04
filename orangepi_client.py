@@ -45,9 +45,10 @@ WHISPER_CPU_THREADS = os.cpu_count() or 4   # use all 4 A53 cores on the Zero 2W
 # Domain prompt: biases Whisper's decoder toward the words this app actually uses.
 # This is the single most effective upstream fix for "Lebanese"→"Japanese" etc.
 WHISPER_INITIAL_PROMPT = (
-    "Currency scanner voice commands. Words used: scan, check, ready, again, "
-    "next, done, quit. Currencies: Lebanese pounds, lira, dollars, USD, LBP. "
-    "Numbers: twenty, fifty, one hundred, two hundred, one thousand."
+    "Currency scanner voice commands. Words used: scan, rescan, redo, discard, "
+    "ready, again, done, quit, yes, no, confirm, change. "
+    "Currencies: Lebanese pounds, lira, dollars, USD, LBP. "
+    "Numbers: twenty, fifty, eighty, one hundred, two hundred, one thousand."
 )
 
 # ── PIPER (LOCAL NEURAL TTS — the natural voice the blind user hears) ─────────
@@ -335,10 +336,15 @@ def play_cue(wav_bytes: bytes | None) -> None:
 # The vocabulary is tiny and known, so we can snap near-miss tokens back to it.
 
 COMMAND_VOCAB = {
-    # scan triggers
-    "scan", "check", "go", "now", "yes", "okay", "ok", "capture", "take", "snap",
-    "shoot", "photo", "picture", "frame", "analyze", "detect", "read", "process",
-    "identify", "start", "run", "next", "continue", "more", "again", "ready",
+    # scan / redo / discard
+    "scan", "rescan", "redo", "capture", "snap", "shoot", "photo", "picture",
+    "frame", "again", "over", "discard", "cancel", "remove", "delete",
+    # confirm / reject
+    "yes", "yeah", "yep", "yup", "no", "nope", "nah", "correct", "confirm",
+    "confirmed", "right", "sure", "okay", "ok", "wrong", "incorrect", "change",
+    # other commands
+    "check", "go", "now", "ready", "start", "run", "next", "continue", "more",
+    "analyze", "detect", "read", "process", "identify",
     # quit
     "quit", "exit", "stop", "done", "end", "finish", "bye", "goodbye",
     # currency
@@ -362,6 +368,9 @@ KNOWN_CONFUSIONS = {
     "scant": "scan", "scance": "scan",
     "leera": "lira", "leira": "lira", "lera": "lira",
     "dollor": "dollar", "dolar": "dollar", "dollers": "dollars",
+    "yas": "yes", "yus": "yes", "redu": "redo", "ridu": "redo",
+    "riddo": "redo", "diskard": "discard", "kancel": "cancel",
+    "conform": "confirm", "no.": "no",
 }
 
 FUZZY_CUTOFF = 0.74   # difflib ratio threshold for snapping unknown tokens
@@ -700,7 +709,8 @@ def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
         compression_ratio_threshold=2.0,
     )
     if _supports_hotwords:
-        kwargs["hotwords"] = "scan check ready Lebanese pounds lira dollars done quit"
+        kwargs["hotwords"] = ("scan rescan redo discard yes no confirm change "
+                              "ready Lebanese pounds lira dollars done quit")
 
     segments, _ = whisper_model.transcribe(audio, **kwargs)
 
@@ -919,12 +929,12 @@ def _speak_resp(resp: dict) -> None:
 
 
 # ── SCAN TRIGGER WORDS ────────────────────────────────────────────────────────
+# Capture a frame for scans AND redo/rescan. NOTE: confirmation words (yes/ok/no)
+# are deliberately NOT here, so confirming an amount never fires the camera.
 SCAN_TRIGGERS = {
-    "scan", "check", "go", "now", "yes", "okay", "ok", "capture", "take", "snap",
-    "shoot", "photo", "picture", "frame", "analyze", "detect", "read", "process",
-    "identify", "start", "run", "next", "continue", "more", "again", "ready",
-    "do it", "let's go", "lets go", "scan it", "do scan", "take picture",
-    "take photo", "scan now", "check now", "yalla", "hayde", "sur",
+    "scan", "rescan", "redo", "capture", "snap", "shoot", "photo", "picture",
+    "frame", "take picture", "take photo", "scan now", "do scan", "scan it",
+    "scan again", "redo scan", "do over", "yalla",
 }
 
 
