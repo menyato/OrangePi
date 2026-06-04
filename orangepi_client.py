@@ -1,6 +1,6 @@
 import socket, json, threading, subprocess, collections
 import argparse, warnings, time, struct, base64, glob, re, os
-import difflib, inspect, shutil, tempfile
+import difflib, inspect, shutil, tempfile, wave, io
 
 import cv2
 import numpy as np
@@ -76,6 +76,12 @@ _tts_lock   = threading.Lock()
 _aplay_proc: subprocess.Popen | None = None
 
 metrics: "Metrics | None" = None
+
+# ── AUDIO CUES (earcons) — non-verbal feedback for a blind user ───────────────
+CUES_ENABLED = True
+_CUE_LISTEN: bytes | None = None   # soft beep: "I'm listening, speak now"
+_CUE_ACK:    bytes | None = None   # rising two-tone: "got it, working on it"
+_CUE_SHOT:   bytes | None = None   # bright blip: "frame captured"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -254,6 +260,61 @@ def auto_detect_all() -> None:
     ALSA_OUTPUT_DEVICE = detect_speaker()
     CAM_DEVICE         = detect_camera()
     print("═" * 60 + "\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUDIO CUES (earcons)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tone_wav(segments: list[tuple[float, int]], sr: int = 16000,
+              vol: float = 0.22) -> bytes:
+    """Build a small mono WAV from (freq_hz, duration_ms) segments, with short
+    fades to avoid clicks. Returns complete WAV bytes ready for aplay."""
+    pcm_all = []
+    for freq, dur_ms in segments:
+        n = int(sr * dur_ms / 1000)
+        t = np.arange(n) / sr
+        wav = np.sin(2 * np.pi * freq * t)
+        fade = max(1, int(sr * 0.008))
+        env = np.ones(n)
+        env[:fade]  = np.linspace(0, 1, fade)
+        env[-fade:] = np.linspace(1, 0, fade)
+        pcm_all.append(wav * env * vol)
+    data = np.concatenate(pcm_all) if pcm_all else np.zeros(1)
+    pcm = (np.clip(data, -1, 1) * 32767).astype(np.int16).tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def init_cues() -> None:
+    """Pre-render the earcons once at startup."""
+    global _CUE_LISTEN, _CUE_ACK, _CUE_SHOT
+    _CUE_LISTEN = _tone_wav([(880, 110)])                 # one soft beep
+    _CUE_ACK    = _tone_wav([(660, 90), (990, 110)])      # rising "got it"
+    _CUE_SHOT   = _tone_wav([(1320, 70), (1320, 70)])     # bright double blip
+
+
+def play_cue(wav_bytes: bytes | None) -> None:
+    """Play an earcon synchronously (short). Safe to call before opening the
+    mic — it finishes before recording starts, so it won't leak into VAD."""
+    if not CUES_ENABLED or not wav_bytes or ALSA_OUTPUT_DEVICE is None:
+        return
+    try:
+        p = subprocess.Popen(
+            ["aplay", "-D", ALSA_OUTPUT_DEVICE, "-q"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        p.stdin.write(wav_bytes)
+        p.stdin.close()
+        p.wait()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,6 +573,7 @@ def record_with_vad() -> np.ndarray | None:
     MAX_XRUNS     = 10
 
     print("[MIC] Listening... speak now")
+    play_cue(_CUE_LISTEN)   # tells the blind user: speak now
     try:
         stream_ctx = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -660,6 +722,7 @@ def listen(retries: int = 5) -> tuple[str, dict]:
         }
 
         if corrected.strip():
+            play_cue(_CUE_ACK)   # tells the blind user: heard you, working on it
             print("\n" + "─" * 50)
             if corrections:
                 fixes = ", ".join(f"{a}→{b}" for a, b in corrections)
@@ -834,7 +897,7 @@ def main() -> None:
     global ESPEAK_SPEED, ESPEAK_VOICE, ESPEAK_PITCH, ESPEAK_AMPLITUDE
     global CAM_WARMUP_FRAMES, CAM_CAPTURE_SEC, CAM_FPS, CAM_JPEG_QUALITY
     global CAM_DEVICE, AUDIO_INPUT_DEVICE, ALSA_OUTPUT_DEVICE, metrics
-    global PIPER_MODEL
+    global PIPER_MODEL, CUES_ENABLED
 
     ap = argparse.ArgumentParser(description="OrangePi 2W Zero voice client (improved)")
     ap.add_argument("--host", default=SERVER_HOST)
@@ -861,6 +924,8 @@ def main() -> None:
     ap.add_argument("--cam-quality", type=int, default=CAM_JPEG_QUALITY)
     ap.add_argument("--metrics", default="client_metrics.jsonl",
                     help="JSONL audit log path (set '' to disable file logging).")
+    ap.add_argument("--quiet-cues", action="store_true",
+                    help="Disable the beep/earcon audio cues (keeps spoken cues).")
     args = ap.parse_args()
 
     SERVER_HOST, SERVER_PORT = args.host, args.port
@@ -870,6 +935,8 @@ def main() -> None:
     CAM_WARMUP_FRAMES, CAM_CAPTURE_SEC = args.cam_warmup, args.cam_sec
     CAM_FPS, CAM_JPEG_QUALITY = args.cam_fps, args.cam_quality
     PIPER_MODEL = args.piper_model
+    CUES_ENABLED = not args.quiet_cues
+    init_cues()
 
     if args.metrics:
         metrics = Metrics(args.metrics)
@@ -936,6 +1003,8 @@ def main() -> None:
             t_cam = 0.0
             if any(t in text for t in SCAN_TRIGGERS):
                 print("[CAM] Scan trigger — capturing from Logi webcam...")
+                speak("Hold the bill steady. Capturing now.")
+                wait_speaking()
                 tc = time.time()
                 jpeg_bytes = capture_best_frame_local()
                 t_cam = time.time() - tc
@@ -946,6 +1015,9 @@ def main() -> None:
                                   "outcome": "camera_error"})
                     if metrics: metrics.log(audit)
                     continue
+                play_cue(_CUE_SHOT)                  # captured
+                speak("Captured. Analyzing now.")
+                wait_speaking()
                 payload["frame"] = jpeg_bytes
 
             kb = len(payload.get("frame", b"")) / 1024
