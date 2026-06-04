@@ -35,22 +35,25 @@ SERVER_PORT = 9000
 SAMPLE_RATE        = 16000
 FRAME_DURATION     = 30
 FRAME_SIZE         = int(SAMPLE_RATE * FRAME_DURATION / 1000)   # 480 samples
-VAD_AGGRESSIVENESS = 2
-VOICED_THRESHOLD   = 0.7
-UNVOICED_THRESHOLD = 0.4
-RING_BUFFER_MS     = 400
+VAD_AGGRESSIVENESS = 3           # ↑ was 2: stricter filtering of non-speech noise
+VOICED_THRESHOLD   = 0.6        # ↓ was 0.7: trigger speech sooner (less clipping)
+UNVOICED_THRESHOLD = 0.6        # ↑ was 0.4: require more silence before cutting off
+RING_BUFFER_MS     = 500        # ↑ was 400: longer context window for VAD decisions
 RING_BUFFER_FRAMES = int(RING_BUFFER_MS / FRAME_DURATION)
 MAX_RECORD_SEC     = 15
-MIN_SPEECH_SEC     = 0.3
-WHISPER_MODEL      = "tiny"
+MIN_SPEECH_SEC     = 0.4        # ↑ was 0.3: discard very short noise bursts
+NOISE_GATE_RMS     = 0.004      # RMS floor — frames quieter than this are skipped
+WHISPER_MODEL      = "base"     # ↑ was "tiny": much better accuracy, ~2× slower
 WHISPER_COMPUTE    = "int8"
 WHISPER_LANGUAGE   = "en"
 
 # ── ESPEAK DEFAULTS (tunable via CLI) ─────────────────────────────────────────
-ESPEAK_SPEED     = 130
-ESPEAK_VOICE     = "en"
-ESPEAK_PITCH     = 30
-ESPEAK_AMPLITUDE = 180
+# en-us+m3 uses a male voice variant with more inflection than plain "en"
+# Speed 145 feels conversational; pitch 38 is warm without sounding shrill
+ESPEAK_SPEED     = 145          # ↑ was 130: slightly faster feels less robotic
+ESPEAK_VOICE     = "en-us+m3"  # was "en": variant with natural pitch variation
+ESPEAK_PITCH     = 38           # ↑ was 30: warmer, less monotone
+ESPEAK_AMPLITUDE = 170          # ↓ was 180: slightly softer to reduce harshness
 
 # ── CAMERA ────────────────────────────────────────────────────────────────────
 CAM_WARMUP_FRAMES = 10
@@ -237,7 +240,56 @@ def auto_detect_all() -> None:
 # TTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _play_wav_bytes(wav_bytes: bytes) -> subprocess.Popen:
+def _preprocess_tts(text: str) -> str:
+    """
+    Clean up text before passing to espeak-ng so it sounds more natural:
+    - Expand common abbreviations that espeak reads awkwardly
+    - Convert ALL-CAPS words to title-case (espeak spells them out otherwise)
+    - Add commas after sentence-opening conjunctions for natural pauses
+    - Convert slash-separated alternatives to "or"
+    - Remove parenthetical asides that break speech rhythm
+    """
+    import re as _re
+
+    # Expand abbreviations espeak stumbles on
+    abbrevs = {
+        r'\bI\.?P\.?\b':    'I P',
+        r'\bI\.?P\.? address\b': 'I P address',
+        r'\bOK\b':           'okay',
+        r'\be\.g\.\b':       'for example',
+        r'\bi\.e\.\b':       'that is',
+        r'\betc\.\b':        'et cetera',
+        r'\bvs\.\b':         'versus',
+        r'\bDr\.\b':         'Doctor',
+        r'\bMr\.\b':         'Mister',
+        r'\bMrs\.\b':        'Missus',
+        r'\bst\.\b':         'street',
+        r'\bapprox\.\b':     'approximately',
+    }
+    for pat, rep in abbrevs.items():
+        text = _re.sub(pat, rep, text, flags=_re.IGNORECASE)
+
+    # ALL-CAPS words → Title Case (prevents letter-by-letter spelling)
+    text = _re.sub(r'\b([A-Z]{2,})\b',
+                   lambda m: m.group(1).title(), text)
+
+    # Remove parenthetical content — breaks sentence flow
+    text = _re.sub(r'\([^)]*\)', '', text)
+
+    # Slash alternatives → "or"  e.g. "yes/no" → "yes or no"
+    text = _re.sub(r'(\w+)\s*/\s*(\w+)', r'\1 or \2', text)
+
+    # Pause after sentence-opening connectors
+    for word in ('However', 'Therefore', 'Meanwhile', 'Otherwise',
+                 'Furthermore', 'Additionally', 'Nevertheless'):
+        text = _re.sub(rf'\b{word}\b', f'{word},', text)
+
+    # Collapse multiple spaces / strip
+    text = _re.sub(r'  +', ' ', text).strip()
+    return text
+
+
+
     proc = subprocess.Popen(
         ["aplay", "-D", ALSA_OUTPUT_DEVICE, "-q"],
         stdin=subprocess.PIPE,
@@ -253,9 +305,11 @@ def speak(text: str, wav_bytes: bytes | None = None) -> None:
     """
     Non-blocking. Plays SAPI WAV from server if provided, else local espeak-ng.
     Interrupts any currently playing audio first.
+    Text is preprocessed for more natural prosody before being sent to espeak.
     """
     global _aplay_proc
-    print(f"\n[TTS] >> {text}\n")
+    clean = _preprocess_tts(text)
+    print(f"\n[TTS] >> {clean}\n")
     with _tts_lock:
         if _aplay_proc and _aplay_proc.poll() is None:
             _aplay_proc.terminate()
@@ -270,7 +324,8 @@ def speak(text: str, wav_bytes: bytes | None = None) -> None:
                  "-v", ESPEAK_VOICE,
                  "-p", str(ESPEAK_PITCH),
                  "-a", str(ESPEAK_AMPLITUDE),
-                 "--stdout", text],
+                 "-g", "6",       # ← word gap: 6 × 10ms = 60ms between words
+                 "--stdout", clean],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
@@ -315,9 +370,10 @@ def load_models() -> None:
     vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
     print("[INIT] webrtcvad ready.")
     print(f"[INIT] Loading faster-whisper '{WHISPER_MODEL}' int8 CPU...")
-    print("[INIT] First run downloads the model — may take 30-60s...")
+    print("[INIT] First run downloads the model — 'base' is ~150 MB, may take a minute...")
     whisper_model = WhisperModel(WHISPER_MODEL, device="cpu",
-                                 compute_type=WHISPER_COMPUTE)
+                                 compute_type=WHISPER_COMPUTE,
+                                 num_workers=2)   # ← parallel decode threads on ARM
     print("[INIT] All models ready.\n")
 
 
@@ -384,6 +440,12 @@ def record_with_vad() -> np.ndarray | None:
                 continue
 
             chunk     = chunk.flatten()
+
+            # Noise gate: skip frames that are near-silence (background hum, etc.)
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            if rms < NOISE_GATE_RMS and not triggered:
+                continue
+
             pcm       = _to_pcm(chunk)
             if len(pcm) != FRAME_SIZE * 2:
                 continue
@@ -424,16 +486,34 @@ def record_with_vad() -> np.ndarray | None:
 # TRANSCRIPTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _normalize_audio(audio: np.ndarray) -> np.ndarray:
+    """Peak-normalize to 90% full scale so Whisper gets a strong clean signal."""
+    peak = np.abs(audio).max()
+    if peak > 1e-6:
+        audio = audio * (0.9 / peak)
+    return audio.astype("float32")
+
+
 def transcribe(audio: np.ndarray | None) -> str:
     if audio is None:
         return ""
     print("[STT] Transcribing...")
+    audio = _normalize_audio(audio)
     segments, _ = whisper_model.transcribe(
         audio,
         language=WHISPER_LANGUAGE,
-        beam_size=1, best_of=1, temperature=0.0,
+        beam_size=5,           # ↑ was 1: explores more paths → far fewer word errors
+        best_of=5,             # ↑ was 1: picks best from multiple samples
+        temperature=0.0,       # deterministic — good for command recognition
+        condition_on_previous_text=False,   # avoids hallucinated "repetition loops"
         vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 100},
+        vad_parameters={
+            "min_silence_duration_ms": 400,  # ↑ was 300: don't cut off trailing words
+            "speech_pad_ms": 150,            # ↑ was 100: keep a bit more context
+            "threshold": 0.35,               # ↓ slightly: catch quieter speech
+        },
+        no_speech_threshold=0.5,    # discard segments Whisper thinks are non-speech
+        compression_ratio_threshold=2.0,  # toss hallucinated repetitive outputs
     )
     return " ".join(s.text for s in segments).strip().lower()
 
@@ -628,7 +708,9 @@ def main() -> None:
     ap.add_argument("--host",  default=SERVER_HOST)
     ap.add_argument("--port",  default=SERVER_PORT, type=int)
     # Whisper
-    ap.add_argument("--model", default=WHISPER_MODEL, choices=["tiny", "base"])
+    ap.add_argument("--model", default=WHISPER_MODEL,
+                    choices=["tiny", "base", "small"],
+                    help="Whisper model size (default: base — better accuracy than tiny)")
     # Manual overrides (skip auto-detect)
     ap.add_argument("--mic",     default=None, type=int,
                     help="Force sounddevice mic index (skips auto-detect)")
@@ -686,7 +768,7 @@ def main() -> None:
     print(f"    Speed    : {ESPEAK_SPEED} WPM")
     print(f"    Pitch    : {ESPEAK_PITCH}")
     print(f"    Amplitude: {ESPEAK_AMPLITUDE}")
-    print(f"    Voice    : {ESPEAK_VOICE}")
+    print(f"    Voice    : {ESPEAK_VOICE}  (try en-us+f3 for female, en-gb+m3 for British male)")
     print("─" * 60 + "\n")
 
     load_models()
