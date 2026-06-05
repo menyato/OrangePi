@@ -1,59 +1,24 @@
 """
-state_machine.py — hub control loop implementing the new gesture-driven flow.
+state_machine.py — hub control loop with full TTS narration and START lockout.
 
-═══════════════════════════════════════════════════════════════════════════════
-FLOW OVERVIEW
-═══════════════════════════════════════════════════════════════════════════════
+TTS contract (for blind users):
+  Every state transition, every action, every error is spoken aloud.
+  Haptic confirmation (vibration) accompanies every successful action.
+  Nothing happens silently.
 
-START (hardcoded) is the global glove on/off toggle.
-  • Perform START while off  → glove ACTIVE, begins listening for all gestures.
-  • Perform START while on   → glove INACTIVE, ignores everything.
-  Without START the engine is paused; no other gesture fires.
+START lockout:
+  After START fires (activate OR deactivate), a cooldown of START_LOCKOUT_S
+  seconds is enforced before START can fire again.  This prevents the user
+  from accidentally toggling the glove back off immediately with the same
+  sustained gesture hold.
 
-──────────────────────────────────────────────────────────────────────────────
-FIRST BOOT / ENROLLMENT (some features have no gesture yet)
-──────────────────────────────────────────────────────────────────────────────
-After START, if any feature has no gesture assigned, the hub enters ENROLL:
-
-  • TTS: "No gesture for <Feature>. Perform twice to register."
-  • NEXT scrolls to the next unassigned feature (skipping already-saved ones).
-  • User performs the desired gesture twice in a row (record-by-example).
-    Both samples must agree — if not, TTS says so and the user tries again.
-  • On match → saved to gestures.json under key "FEAT:<title>".
-  • Walk continues until all features are assigned, then transitions to ACTIVE.
-
-──────────────────────────────────────────────────────────────────────────────
-ACTIVE (all features have gestures)
-──────────────────────────────────────────────────────────────────────────────
-  • Each feature gesture is a TOGGLE:
-      first fire  → launch feature (RUNNING state)
-      second fire → stop feature, return to ACTIVE
-  • While a feature is RUNNING, only its own gesture is acted on (to stop it).
-    All other gestures are ignored.
-  • START always works as the global off switch (drops back to INACTIVE,
-    stopping any running feature).
-
-──────────────────────────────────────────────────────────────────────────────
-PROGRAMMABLE FEATURE (one of the features is ProgrammableGestures)
-──────────────────────────────────────────────────────────────────────────────
-  When the Programmable feature is toggled on, the hub enters PROGRAMMABLE:
-  • NEXT scrolls through ALL features (cursor wraps).
-    TTS announces: "<Feature title>. Current gesture: <describe>."
-  • EDIT re-binds the highlighted feature's gesture (record-twice, same flow).
-  • Programmable's own gesture toggles it off → back to ACTIVE.
-
-──────────────────────────────────────────────────────────────────────────────
-HARDCODED GESTURES (never user-assignable):
-  START  flex=0x11 imu=0x01 STATIC  — global on/off
-  NEXT   flex=0x09 imu=0x08 FLICK   — scroll (enrollment + Programmable)
-  EDIT   flex=0x05 imu=0x04 FLICK   — re-bind in Programmable
-──────────────────────────────────────────────────────────────────────────────
-
-Threads
--------
-  RX thread  (GloveController) → on_frame() → engine.feed() / recorder.feed()
-  RX thread  (engine fires)    → dispatch()  puts name on _queue
-  Main thread                  → run() consumes _queue, blocks while feature runs
+States
+------
+  INACTIVE     — glove off; engine paused; only START is ever acted on.
+  ENROLL       — walking unassigned features; NEXT skips, any gesture records.
+  ACTIVE       — listening for feature toggle gestures.
+  RUNNING      — one feature executing; only its own toggle + START accepted.
+  PROGRAMMABLE — gesture-management panel open.
 """
 
 import queue
@@ -63,13 +28,16 @@ from enum import Enum, auto
 
 from features.base import Feature, FeatureContext
 
+# Seconds START is locked out after each toggle to prevent accidental re-fire.
+START_LOCKOUT_S = 2.0
+
 
 class State(Enum):
-    INACTIVE     = auto()   # START not yet done — engine paused
-    ENROLL       = auto()   # walking through unassigned features
-    ACTIVE       = auto()   # listening for feature gestures
-    RUNNING      = auto()   # one feature is executing
-    PROGRAMMABLE = auto()   # gesture-management panel is open
+    INACTIVE     = auto()
+    ENROLL       = auto()
+    ACTIVE       = auto()
+    RUNNING      = auto()
+    PROGRAMMABLE = auto()
 
 
 class HubStateMachine:
@@ -93,16 +61,17 @@ class HubStateMachine:
         self.record_window_s = record_window_s
 
         self.state     = State.INACTIVE
-        self._queue:   queue.Queue             = queue.Queue()
-        self._abort:   threading.Event | None  = None
+        self._queue:   queue.Queue            = queue.Queue()
+        self._abort:   threading.Event | None = None
         self._shutdown = threading.Event()
 
-        # recording gate — set True while capture window is open
         self.recording = False
 
-        # feature currently active in RUNNING / PROGRAMMABLE
         self._active_feature  = None
-        self._active_key: str = ""      # gesture key that launched it
+        self._active_key: str = ""
+
+        # Timestamp of the last START toggle; enforces lockout.
+        self._last_start_ts: float = 0.0
 
     # ═══════════════════════════════════════════════════════════════════════
     # Frame routing  (RX thread)
@@ -113,26 +82,26 @@ class HubStateMachine:
             self.recorder.feed(frame)
         elif self.state != State.INACTIVE:
             self.engine.feed(frame)
-        # INACTIVE: engine is paused; frames are discarded
 
     # ═══════════════════════════════════════════════════════════════════════
     # Gesture dispatch  (RX thread → queue)
     # ═══════════════════════════════════════════════════════════════════════
 
     def dispatch(self, name: str) -> None:
-        """Called by GestureEngine when a gesture fires."""
-        # START is handled inline on every state
         if name == "START":
+            # Enforce lockout: drop the event if fired too soon after last toggle.
+            if time.time() - self._last_start_ts < START_LOCKOUT_S:
+                print(f"[SM] START ignored — within lockout window.")
+                return
             self._queue.put("START")
             return
 
         if self.state == State.INACTIVE:
-            return  # everything else blocked
+            return
 
         if self.state == State.RUNNING:
-            # only the feature's own toggle gesture (or START) is forwarded
             if name == self._active_key and self._abort is not None:
-                print(f"[SM] Toggle-off gesture for running feature.")
+                print(f"[SM] Toggle-off for running feature.")
                 self._abort.set()
             return
 
@@ -144,7 +113,7 @@ class HubStateMachine:
 
     def run(self) -> None:
         self.feedback.speak(
-            "Glove ready. Perform the start gesture to activate."
+            "Glove ready. Perform the start gesture to activate the glove."
         )
         while not self._shutdown.is_set():
             try:
@@ -163,8 +132,6 @@ class HubStateMachine:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _handle(self, name: str) -> None:
-
-        # ── global START toggle ───────────────────────────────────────────
         if name == "START":
             if self.state == State.INACTIVE:
                 self._activate()
@@ -172,41 +139,63 @@ class HubStateMachine:
                 self._deactivate()
             return
 
-        # ── per-state handling ────────────────────────────────────────────
         if self.state == State.ENROLL:
             self._handle_enroll(name)
-
         elif self.state == State.ACTIVE:
             self._handle_active(name)
-
         elif self.state == State.PROGRAMMABLE:
             self._handle_programmable(name)
 
-        # RUNNING is handled inline in dispatch() (abort only)
-
     # ═══════════════════════════════════════════════════════════════════════
-    # INACTIVE → ACTIVE / ENROLL
+    # Activate / Deactivate
     # ═══════════════════════════════════════════════════════════════════════
 
     def _activate(self) -> None:
-        self.feedback.confirm()
+        self._last_start_ts = time.time()
+        self.feedback.confirm()                          # haptic: short buzz
+
         missing = self.registry.unassigned(self.store)
         if missing:
             self.state = State.ENROLL
+            names = ", ".join(f.title for f in missing)
+            self.feedback.speak(
+                f"Glove active. "
+                f"{len(missing)} feature{'s' if len(missing) > 1 else ''} "
+                f"need a gesture: {names}. "
+                f"Starting enrollment now."
+            )
             feat = self.registry.start_enrollment(self.store)
             self._announce_enroll(feat)
         else:
             self.state = State.ACTIVE
-            self.feedback.speak("Glove active.")
+            feat_list  = ", ".join(f.title for f in self.registry.features)
+            self.feedback.speak(
+                f"Glove active. "
+                f"Available features: {feat_list}. "
+                f"Perform a feature gesture to open it."
+            )
 
     def _deactivate(self) -> None:
+        self._last_start_ts = time.time()
+        prev_state = self.state
+
         if self._abort:
             self._abort.set()
-        self.state = State.INACTIVE
+
+        self.state           = State.INACTIVE
         self._active_feature = None
         self._active_key     = ""
         self._drain_queue()
-        self.feedback.speak("Glove off.")
+
+        self.feedback.error()                            # haptic: long buzz = off
+        if prev_state == State.RUNNING and self._active_feature:
+            self.feedback.speak(
+                f"{self._active_feature.title} stopped. Glove off."
+            )
+        elif prev_state == State.PROGRAMMABLE:
+            self.feedback.speak("Programmable closed. Glove off.")
+        else:
+            self.feedback.speak("Glove off.")
 
     # ═══════════════════════════════════════════════════════════════════════
     # ENROLL state
@@ -215,51 +204,55 @@ class HubStateMachine:
     def _handle_enroll(self, name: str) -> None:
         feat = self.registry.current_unassigned
         if feat is None:
-            # shouldn't happen, but guard
             self.state = State.ACTIVE
             self.feedback.speak("All gestures assigned. Glove active.")
             return
 
         if name == "NEXT":
-            # skip to next unassigned feature
             nxt = self.registry.next_enrollment(self.store)
             if nxt is None:
                 self.state = State.ACTIVE
                 self.feedback.speak("All gestures assigned. Glove active.")
             else:
+                self.feedback.tick()                     # haptic: tiny blip
                 self._announce_enroll(nxt)
             return
 
-        # Any other gesture name means: user performed a gesture → record it
-        # (The engine fired it, so it's a real gesture attempt.)
-        # We ignore the name itself; we do record-by-example here.
-        # But actually, record-by-example requires the user to hold the gesture
-        # through a capture window — so we start capture on any non-system
-        # gesture event. If it's NEXT we skip; any other name triggers capture.
-        if name in ("EDIT",):
-            # EDIT has no meaning in ENROLL; ignore
+        if name == "EDIT":
+            # No meaning in ENROLL — tell the user
+            self.feedback.speak(
+                "Edit is not available here. "
+                "Perform a gesture to register it, or use next to skip."
+            )
             return
 
-        # Trigger the two-sample capture for the current feature
+        # Any other gesture name: start the two-sample capture
         self._record_feature_gesture(feat)
 
     def _announce_enroll(self, feat) -> None:
         key = self.registry.gesture_key(feat)
         if key in self.store.gestures:
-            # already assigned (race), move on
             self._advance_enroll()
             return
+        remaining = len(self.registry.unassigned(self.store))
         self.feedback.speak(
-            f"No gesture for {feat.title}. "
+            f"Feature {feat.title}. "
+            f"No gesture assigned. "
             f"Perform the gesture twice to register it. "
-            f"Or do the next gesture to skip to the next feature."
+            f"Or perform the next gesture to skip. "
+            f"{remaining} feature{'s' if remaining > 1 else ''} remaining."
         )
 
     def _advance_enroll(self) -> None:
         nxt = self.registry.next_enrollment(self.store)
         if nxt is None:
             self.state = State.ACTIVE
-            self.feedback.speak("All gestures assigned. Glove active.")
+            self.feedback.confirm()                      # haptic: all done
+            feat_list  = ", ".join(f.title for f in self.registry.features)
+            self.feedback.speak(
+                f"All gestures registered. Glove active. "
+                f"Available features: {feat_list}."
+            )
         else:
             self._announce_enroll(nxt)
 
@@ -268,19 +261,27 @@ class HubStateMachine:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _handle_active(self, name: str) -> None:
-        # NEXT / EDIT have no role in ACTIVE
-        if name in ("NEXT", "EDIT"):
+        if name == "NEXT":
+            self.feedback.speak(
+                "Next gesture is for scrolling inside the programmable panel. "
+                "Open programmable gestures first."
+            )
             return
 
-        # Check if 'name' matches any feature's assigned gesture key
+        if name == "EDIT":
+            self.feedback.speak(
+                "Edit gesture is for the programmable panel. "
+                "Open programmable gestures first."
+            )
+            return
+
         for feat in self.registry.features:
             key = self.registry.gesture_key(feat)
             if key == name:
                 self._launch_feature(feat, key)
                 return
 
-        # Unknown gesture — ignore silently
-        print(f"[SM] Unknown gesture in ACTIVE: {name!r}")
+        print(f"[SM] Unrecognised gesture in ACTIVE: {name!r}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # PROGRAMMABLE state
@@ -290,32 +291,44 @@ class HubStateMachine:
         prog_key = self._active_key
 
         if name == prog_key:
-            # toggle off
+            # Toggle off
             self.state           = State.ACTIVE
             self._active_feature = None
             self._active_key     = ""
-            self.feedback.speak("Programmable closed.")
+            self.feedback.confirm()                      # haptic: closed
+            self.feedback.speak(
+                "Programmable gestures closed. Glove active. "
+                "Perform a feature gesture to open it."
+            )
             return
 
         if name == "NEXT":
             self.registry.advance()
             feat = self.registry.current
+            self.feedback.tick()                         # haptic: scrolled
             self._announce_prog_feature(feat)
             return
 
         if name == "EDIT":
             feat = self.registry.current
+            self.feedback.speak(f"Editing gesture for {feat.title}.")
             self._record_feature_gesture(feat, in_programmable=True)
             return
+
+        # Feature gesture fired while in programmable — tell the user
+        self.feedback.speak(
+            "A feature gesture was detected. "
+            "Close programmable gestures first to use features."
+        )
 
     def _announce_prog_feature(self, feat) -> None:
         key  = self.registry.gesture_key(feat)
         spec = self.store.gestures.get(key)
-        if spec:
-            desc = spec.describe()
-        else:
-            desc = "no gesture assigned"
-        self.feedback.speak(f"{feat.title}. Current gesture: {desc}.")
+        desc = spec.describe() if spec else "no gesture assigned"
+        self.feedback.speak(
+            f"{feat.title}. Current gesture: {desc}. "
+            f"Perform the edit gesture to change it."
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # Launching a feature
@@ -324,23 +337,27 @@ class HubStateMachine:
     def _launch_feature(self, feat, key: str) -> None:
         from features.programmable import ProgrammableGestures
 
-        self.feedback.select()
-        self.feedback.speak(f"Opening {feat.title}.")
-
         self._active_feature = feat
         self._active_key     = key
 
         if isinstance(feat, ProgrammableGestures):
-            # Enter Programmable panel — no blocking thread needed
             self.state = State.PROGRAMMABLE
+            self.feedback.select()                       # haptic: launched
             self.feedback.speak(
-                "Programmable open. Next to scroll features, "
-                "edit to change a gesture, or do the programmable gesture again to close."
+                f"Programmable gestures open. "
+                f"Perform the next gesture to scroll through features. "
+                f"Perform the edit gesture to change a gesture. "
+                f"Perform the programmable gesture again to close."
             )
             self._announce_prog_feature(self.registry.current)
             return
 
-        # Normal feature: run in main thread, blocking
+        # Normal feature — blocking run
+        self.feedback.select()                           # haptic: launched
+        self.feedback.speak(
+            f"Opening {feat.title}. "
+            f"Perform the same gesture again to close it."
+        )
         self._abort = threading.Event()
         self.state  = State.RUNNING
         try:
@@ -350,41 +367,63 @@ class HubStateMachine:
         except Exception as e:
             print(f"[SM] Feature crashed: {e}")
             self.feedback.error()
+            self.feedback.speak(f"{feat.title} encountered an error and closed.")
         finally:
             self._abort          = None
             self._active_feature = None
             self._active_key     = ""
             self.state           = State.ACTIVE
             self._drain_queue()
-            self.feedback.speak(f"{feat.title} closed.")
+            self.feedback.confirm()                      # haptic: closed
+            self.feedback.speak(
+                f"{feat.title} closed. Glove active. "
+                f"Perform a feature gesture to open it."
+            )
 
     # ═══════════════════════════════════════════════════════════════════════
     # Record-by-example (two-sample match)
     # ═══════════════════════════════════════════════════════════════════════
 
     def _record_feature_gesture(self, feat, in_programmable: bool = False) -> None:
-        """Record a gesture for feat via two matching samples."""
         title = feat.title
         key   = self.registry.gesture_key(feat)
 
         self.feedback.speak(
             f"Recording gesture for {title}. "
-            f"Perform the gesture after the buzz."
+            f"Hold your hand still, then perform the gesture "
+            f"after you feel the buzz."
         )
         sample1 = self._capture_sample()
+
         if sample1 is None:
-            self.feedback.error()
-            self.feedback.speak("No gesture detected. Try again.")
+            self.feedback.error()                        # haptic: failed
+            self.feedback.speak(
+                f"No gesture was detected for {title}. "
+                f"Please try again."
+            )
+            if not in_programmable:
+                self._announce_enroll(feat)
+            else:
+                self._announce_prog_feature(feat)
             return
 
-        self.feedback.speak("Good. Perform it again to confirm.")
+        self.feedback.confirm()                          # haptic: first sample OK
+        self.feedback.speak(
+            f"First sample recorded. "
+            f"Now perform the exact same gesture again after the buzz."
+        )
         sample2 = self._capture_sample()
 
         if sample2 is None or sample1 != sample2:
-            self.feedback.error()
+            self.feedback.error()                        # haptic: mismatch
             self.feedback.speak(
-                "The two tries did not match. Nothing was saved. Try again."
+                f"The two gestures did not match. Nothing was saved for {title}. "
+                f"Please try again."
             )
+            if not in_programmable:
+                self._announce_enroll(feat)
+            else:
+                self._announce_prog_feature(feat)
             return
 
         spec = self.recorder.build_spec(key, sample1)
@@ -392,20 +431,21 @@ class HubStateMachine:
         self.store.save()
         self.engine.set_gestures(self.store.gestures)
 
-        self.feedback.confirm()
+        self.feedback.select()                           # haptic: saved (double buzz)
         self.feedback.speak(
-            f"Gesture for {title} saved. Now {spec.describe()}."
+            f"Gesture for {title} saved. "
+            f"It is now {spec.describe()}."
         )
 
-        # After saving in enrollment, advance to next unassigned
         if not in_programmable:
             self._advance_enroll()
+        else:
+            self._announce_prog_feature(feat)
 
     def _capture_sample(self):
-        """Open a recording window and return analyze() result."""
         self.recorder.reset()
-        self.feedback.beep()
-        time.sleep(0.4)          # brief pause before window opens
+        self.feedback.beep()                             # haptic: window opening
+        time.sleep(0.4)
         self.recording = True
         time.sleep(self.record_window_s)
         self.recording = False

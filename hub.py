@@ -133,6 +133,7 @@ def main() -> None:
             print(f"[HUB] Threshold error: {e}")
 
     # ── Calibration ─────────────────────────────────────────────────────────
+    # Always save after a successful calibration so the next boot auto-restores.
     if args.calibrate:
         result = diagnostics.run_calibration(controller, say=feedback.speak)
         if result:
@@ -142,8 +143,17 @@ def main() -> None:
                 thresh_pct=args.threshold or cal_store.thresh_pct,
             )
             feedback.speak("Calibration saved.")
+            # Restore immediately so this session also uses the new values
+            cal_store.restore(controller)
+            time.sleep(0.3)
         else:
-            print("[HUB] Calibration aborted — continuing with existing values.")
+            print("[HUB] Calibration aborted.")
+            if cal_store.has_calibration():
+                print("[HUB] Restoring previous calibration...")
+                cal_store.restore(controller)
+                time.sleep(0.3)
+            else:
+                print("[HUB] No saved calibration available.")
     elif cal_store.has_calibration():
         print("[HUB] Restoring saved calibration...")
         cal_store.restore(controller)
