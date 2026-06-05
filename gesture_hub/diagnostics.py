@@ -71,10 +71,14 @@ def run_monitor(controller, gestures: dict, say=print) -> None:
         print("\n[MONITOR] exit.")
 
 
-def run_calibration(controller, say=print) -> bool:
+def run_calibration(controller, say=print) -> dict | None:
     """Run the firmware's open/bent calibration for all 5 fingers.
-    Returns True on success. Advance each step by pressing Enter."""
-    done = threading.Event()
+
+    Returns a dict {"rest": [...], "bent": [...]} on success, or None if
+    aborted. The caller (hub.py) saves this to calibration.json via CalStore.
+    """
+    done       = threading.Event()
+    result     = {}
 
     def on_cal(ev: str, data: dict) -> None:
         if ev == "START":
@@ -89,8 +93,10 @@ def run_calibration(controller, say=print) -> bool:
             print(f"   bent[{FINGER_NAMES[data['finger']]}] = {data['value']}")
         elif ev == "DONE":
             say("Calibration complete.")
-            print(f"   REST: {data.get('rest')}")
-            print(f"   BENT: {data.get('bent')}")
+            result["rest"] = data.get("rest", [])
+            result["bent"] = data.get("bent", [])
+            print(f"   REST: {result['rest']}")
+            print(f"   BENT: {result['bent']}")
             done.set()
 
     controller.on_cal_event = on_cal
@@ -103,10 +109,10 @@ def run_calibration(controller, say=print) -> bool:
         except (EOFError, KeyboardInterrupt):
             print("\n[CAL] aborted.")
             controller.on_cal_event = None
-            return False
+            return None
         controller.cal_confirm()
         if done.wait(0.4):
             break
 
     controller.on_cal_event = None
-    return True
+    return result if result else None
