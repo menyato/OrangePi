@@ -157,13 +157,19 @@ class HubStateMachine:
         missing = self.registry.unassigned(self.store)
         if missing:
             self.state = State.ENROLL
-            names = ", ".join(f.title for f in missing)
-            self.feedback.speak(
+            missing_names = ", ".join(f.title for f in missing)
+            available = [f for f in self.registry.features
+                         if self.registry.gesture_key(f) in self.store.gestures]
+            msg = (
                 f"Glove active. "
                 f"{len(missing)} feature{'s' if len(missing) > 1 else ''} "
-                f"need a gesture: {names}. "
-                f"Starting enrollment now."
+                f"need a gesture: {missing_names}. "
             )
+            if available:
+                avail_names = ", ".join(f.title for f in available)
+                msg += f"Available features: {avail_names}. "
+            msg += "Starting enrollment now."
+            self.feedback.speak(msg)
             feat = self.registry.start_enrollment(self.store)
             self._announce_enroll(feat)
         else:
@@ -177,7 +183,8 @@ class HubStateMachine:
 
     def _deactivate(self) -> None:
         self._last_start_ts = time.time()
-        prev_state = self.state
+        prev_state   = self.state
+        prev_feature = self._active_feature          # save before clearing
 
         if self._abort:
             self._abort.set()
@@ -188,9 +195,9 @@ class HubStateMachine:
         self._drain_queue()
 
         self.feedback.error()                            # haptic: long buzz = off
-        if prev_state == State.RUNNING and self._active_feature:
+        if prev_state == State.RUNNING and prev_feature:
             self.feedback.speak(
-                f"{self._active_feature.title} stopped. Glove off."
+                f"{prev_feature.title} stopped. Glove off."
             )
         elif prev_state == State.PROGRAMMABLE:
             self.feedback.speak("Programmable closed. Glove off.")
@@ -219,15 +226,29 @@ class HubStateMachine:
             return
 
         if name == "EDIT":
-            # No meaning in ENROLL — tell the user
-            self.feedback.speak(
-                "Edit is not available here. "
-                "Perform a gesture to register it, or use next to skip."
-            )
+            # EDIT is the explicit trigger to start two-sample recording
+            self.feedback.tick()                         # haptic: starting record
+            self._record_feature_gesture(feat)
             return
 
-        # Any other gesture name: start the two-sample capture
-        self._record_feature_gesture(feat)
+        # Any other gesture: check if it's an already-assigned feature → activate it
+        for f in self.registry.features:
+            key = self.registry.gesture_key(f)
+            if key == name and key in self.store.gestures:
+                self._launch_feature(f, key)
+                # After the feature closes, resume enrollment if still needed
+                if self.state == State.ACTIVE and self.registry.unassigned(self.store):
+                    self.state = State.ENROLL
+                    cur = self.registry.current_unassigned
+                    if cur:
+                        self._announce_enroll(cur)
+                return
+
+        # Unknown gesture — guide the user
+        self.feedback.speak(
+            "Perform the edit gesture to record a gesture for this feature, "
+            "or perform the next gesture to skip."
+        )
 
     def _announce_enroll(self, feat) -> None:
         key = self.registry.gesture_key(feat)
@@ -238,8 +259,8 @@ class HubStateMachine:
         self.feedback.speak(
             f"Feature {feat.title}. "
             f"No gesture assigned. "
-            f"Perform the gesture twice to register it. "
-            f"Or perform the next gesture to skip. "
+            f"Perform the edit gesture to record a gesture for it, "
+            f"or perform the next gesture to skip. "
             f"{remaining} feature{'s' if remaining > 1 else ''} remaining."
         )
 
@@ -311,6 +332,7 @@ class HubStateMachine:
 
         if name == "EDIT":
             feat = self.registry.current
+            self.feedback.tick()                         # haptic: starting edit
             self.feedback.speak(f"Editing gesture for {feat.title}.")
             self._record_feature_gesture(feat, in_programmable=True)
             return
@@ -360,25 +382,33 @@ class HubStateMachine:
         )
         self._abort = threading.Event()
         self.state  = State.RUNNING
+        crashed = False
         try:
             feat.run(FeatureContext(link=self.link,
                                     abort=self._abort,
                                     feedback=self.feedback))
         except Exception as e:
             print(f"[SM] Feature crashed: {e}")
+            crashed = True
             self.feedback.error()
             self.feedback.speak(f"{feat.title} encountered an error and closed.")
         finally:
+            # Check deactivation BEFORE clearing state: if START was pressed
+            # while this feature ran, _deactivate already set state to INACTIVE
+            # and spoke its own message — don't override it.
+            deactivated = (self.state != State.RUNNING)
             self._abort          = None
             self._active_feature = None
             self._active_key     = ""
-            self.state           = State.ACTIVE
+            if not deactivated:
+                self.state = State.ACTIVE
             self._drain_queue()
-            self.feedback.confirm()                      # haptic: closed
-            self.feedback.speak(
-                f"{feat.title} closed. Glove active. "
-                f"Perform a feature gesture to open it."
-            )
+            if not deactivated and not crashed:
+                self.feedback.confirm()                  # haptic: closed
+                self.feedback.speak(
+                    f"{feat.title} closed. Glove active. "
+                    f"Perform a feature gesture to open it."
+                )
 
     # ═══════════════════════════════════════════════════════════════════════
     # Record-by-example (two-sample match)
