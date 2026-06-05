@@ -1,28 +1,29 @@
 """
 diagnostics.py — calibration + live monitor tools for the hub.
 
-run_monitor()      shows the raw glove feed and which gesture poses match right
-                   now, plus prints each gesture the moment it fires. Use it to
-                   verify the 3 gestures and see how YOUR hand bends.
+run_monitor()
+    Shows the raw ATmega output: flex_bits and imu_bits as hex, which
+    fingers are bent, which IMU flags are active, and a live "match"
+    column for every gesture in the store. Use this to verify the 3
+    system gestures and tune per-hand thresholds.
 
-run_calibration()  runs the ATmega's per-finger flex calibration (open/bent per
-                   finger). Bend range differs hand to hand, so do this once for
-                   each new wearer — otherwise finger_bent (and every gesture)
-                   will be unreliable.
+run_calibration()
+    Runs the ATmega's open/bent calibration for all 5 fingers so that
+    the firmware's bend thresholds are accurate for this wearer's hand.
 """
 
 import threading
 import time
 
-from gesture_hub.specs import FINGER_NAMES, Motion
+from gesture_hub.specs import FINGER_NAMES, IMU_BIT_NAMES, Motion
 from gesture_hub.engine import GestureEngine
 
 
 def run_monitor(controller, gestures: dict, say=print) -> None:
     say("Monitor mode. Move your hand to see the live feed.")
-    print("\n[MONITOR] Live glove feed — Ctrl-C to exit.")
-    print("[MONITOR] flex = raw bend per finger (Thumb..Pinky)")
-    print("[MONITOR] match column shows which gesture POSE is satisfied right now\n")
+    print("\n[MONITOR] Live ATmega feed — Ctrl-C to exit.")
+    print("[MONITOR] flex = raw flex byte (hex)  |  imu = raw IMU byte (hex)")
+    print("[MONITOR] match column: gesture name : OK / ..\n")
 
     def on_event(name: str) -> None:
         print(f"\n>>> GESTURE FIRED: {name}\n")
@@ -31,27 +32,36 @@ def run_monitor(controller, gestures: dict, say=print) -> None:
     last_print = [0.0]
 
     def on_frame(frame) -> None:
-        engine.feed(frame)                       # so real gesture events fire too
+        engine.feed(frame)
         now = time.time()
-        if now - last_print[0] < 0.2:            # throttle the status line to ~5 Hz
+        if now - last_print[0] < 0.2:     # throttle to ~5 Hz display
             return
         last_print[0] = now
 
-        bent_idx = [i for i, b in enumerate(frame.finger_bent) if b]
-        bent = ",".join(FINGER_NAMES[i] for i in bent_idx) or "-"
-        flags = ",".join(k for k, v in frame.imu_flags.items() if v) or "-"
-        bent_set = frozenset(bent_idx)
+        fb  = frame.flex_bits
+        ib  = frame.imu_bits
+        raw = " ".join(f"{r:3d}" for r in frame.raw_flex)
+
+        bent  = ",".join(FINGER_NAMES[i]  for i in range(5) if fb & (1 << i)) or "-"
+        flags = ",".join(IMU_BIT_NAMES[i] for i in range(6) if ib & (1 << i)) or "-"
 
         marks = []
         for nm, sp in gestures.items():
-            ok = (bent_set == sp.fingers_set())
-            if ok and sp.motion == Motion.STATIC and sp.orientation:
-                ok = frame.imu_flags.get(sp.orientation, False)
+            flex_ok = (fb & sp.flex_mask) == sp.flex_mask
+            imu_ok  = (sp.imu_mask == 0) or ((ib & sp.imu_mask) == sp.imu_mask)
+            ok = flex_ok and imu_ok
             marks.append(f"{nm}:{'OK' if ok else '..'}")
 
-        raw = " ".join(f"{r:3d}" for r in frame.raw_flex)
-        print(f"\rflex[{raw}]  bent:{bent:<22} imu:{flags:<22} | {'  '.join(marks)}   ",
-              end="", flush=True)
+        # Per-finger state: show name and [BENT] or [open]
+        finger_states = "  ".join(
+            f"{FINGER_NAMES[i]}:{'[BENT]' if fb & (1 << i) else '[open]'}"
+            for i in range(5)
+        )
+        gesture_matches = "  ".join(marks)
+        print(
+            f"\r{finger_states}  |  imu:{flags:<28}| {gesture_matches}   ",
+            end="", flush=True
+        )
 
     controller.on_frame = on_frame
     try:
@@ -62,8 +72,8 @@ def run_monitor(controller, gestures: dict, say=print) -> None:
 
 
 def run_calibration(controller, say=print) -> bool:
-    """Run the firmware's open/bent calibration for all 5 fingers. Returns True
-    on completion. Advance each step by pressing Enter at the terminal."""
+    """Run the firmware's open/bent calibration for all 5 fingers.
+    Returns True on success. Advance each step by pressing Enter."""
     done = threading.Event()
 
     def on_cal(ev: str, data: dict) -> None:

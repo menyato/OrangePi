@@ -13,6 +13,13 @@ Threads:
     thread keeps the stream flowing.
 
 States:  IDLE -> MENU -> FEATURE / EDIT_SELECT
+
+Gesture editing:
+    When the user triggers EDIT and confirms a gesture name, the hub records
+    two matching samples (raw flex_bits + imu_bits from the ATmega). On a
+    double match it builds a new GestureSpec and writes it straight to
+    gestures.json.  The engine is hot-reloaded with the new spec so it takes
+    effect immediately — no restart needed.
 """
 
 import queue
@@ -24,33 +31,35 @@ from features.base import FeatureContext
 
 
 class State(Enum):
-    IDLE = auto()
-    MENU = auto()
-    FEATURE = auto()
+    IDLE        = auto()
+    MENU        = auto()
+    FEATURE     = auto()
     EDIT_SELECT = auto()
 
 
 class HubStateMachine:
     def __init__(self, controller, engine, recorder, registry, store, feedback, link,
                  abort_gesture: str = "START", record_window_s: float = 2.5):
-        self.controller = controller
-        self.engine = engine
-        self.recorder = recorder
-        self.registry = registry
-        self.store = store
-        self.feedback = feedback
-        self.link = link
-        self.abort_gesture = abort_gesture
+        self.controller      = controller
+        self.engine          = engine
+        self.recorder        = recorder
+        self.registry        = registry
+        self.store           = store
+        self.feedback        = feedback
+        self.link            = link
+        self.abort_gesture   = abort_gesture
         self.record_window_s = record_window_s
 
-        self.state = State.IDLE
-        self._queue: queue.Queue = queue.Queue()
-        self._abort: threading.Event | None = None
+        self.state     = State.IDLE
+        self._queue:   queue.Queue          = queue.Queue()
+        self._abort:   threading.Event | None = None
         self._shutdown = threading.Event()
         self.recording = False
 
-        self._editable = list(self.store.gestures.keys())   # e.g. ["START","NEXT","EDIT"]
-        self._edit_index = 0
+        # names of gestures the user can edit (system gestures first, then feature
+        # gestures added dynamically when a feature registers one)
+        self._editable    = list(self.store.gestures.keys())
+        self._edit_index  = 0
 
     # ── frame routing (RX thread) ─────────────────────────────────────────────
     def on_frame(self, frame) -> None:
@@ -81,6 +90,7 @@ class HubStateMachine:
     def stop(self) -> None:
         self._shutdown.set()
 
+    # ── state handler ─────────────────────────────────────────────────────────
     def _handle(self, name: str) -> None:
         if self.state == State.IDLE:
             if name == "START":
@@ -96,11 +106,14 @@ class HubStateMachine:
             elif name == "START":
                 self._launch_current()
             elif name == "EDIT":
-                self.state = State.EDIT_SELECT
+                self.state       = State.EDIT_SELECT
                 self._edit_index = 0
+                self._editable   = list(self.store.gestures.keys())
                 self.feedback.confirm()
-                self.feedback.speak("Edit mode. Scroll to a gesture, start to record, "
-                                    "or edit again to cancel.")
+                self.feedback.speak(
+                    "Edit mode. Scroll to a gesture, start to record, "
+                    "or edit again to cancel."
+                )
                 self._announce_edit_target()
 
         elif self.state == State.EDIT_SELECT:
@@ -117,8 +130,9 @@ class HubStateMachine:
 
     # ── announcements ─────────────────────────────────────────────────────────
     def _announce_feature(self) -> None:
-        self.feedback.speak(f"{self.registry.current().title}. "
-                            f"Start to open, next to scroll.")
+        self.feedback.speak(
+            f"{self.registry.current().title}. Start to open, next to scroll."
+        )
 
     def _announce_edit_target(self) -> None:
         name = self._editable[self._edit_index]
@@ -129,10 +143,11 @@ class HubStateMachine:
     def _launch_current(self) -> None:
         feature = self.registry.current()
         self.feedback.select()
-        self.feedback.speak(f"Opening {feature.title}. "
-                            f"Hold the start gesture to exit.")
+        self.feedback.speak(
+            f"Opening {feature.title}. Hold the start gesture to exit."
+        )
         self._abort = threading.Event()
-        self.state = State.FEATURE
+        self.state  = State.FEATURE
         try:
             feature.run(FeatureContext(link=self.link,
                                        abort=self._abort,
@@ -142,14 +157,16 @@ class HubStateMachine:
             self.feedback.error()
         finally:
             self._abort = None
-            self.state = State.MENU
+            self.state  = State.MENU
             self._drain_queue()
             self.feedback.speak(f"{feature.title} closed.")
             self._announce_feature()
 
-    # ── record-by-example ─────────────────────────────────────────────────────
+    # ── record-by-example  ────────────────────────────────────────────────────
     def _record_gesture(self, name: str) -> None:
-        self.feedback.speak(f"Recording {name}. Perform the gesture after the buzz.")
+        self.feedback.speak(
+            f"Recording {name}. Perform the gesture after the buzz."
+        )
         sample1 = self._capture_sample()
         if sample1 is None:
             self.feedback.error()
@@ -158,15 +175,23 @@ class HubStateMachine:
 
         self.feedback.speak("Now do it again to confirm, after the buzz.")
         sample2 = self._capture_sample()
+
         if sample2 is None or sample1 != sample2:
             self.feedback.error()
             self.feedback.speak("The two tries did not match. Nothing changed.")
             return
 
+        # Build spec from the raw bit-mask sample and persist it
         spec = self.recorder.build_spec(name, sample1)
         self.store.set(name, spec)
-        self.store.save()
-        self.engine.set_gestures(self.store.gestures)
+        self.store.save()                          # → gestures.json
+        self.engine.set_gestures(self.store.gestures)   # hot-reload engine
+
+        # If this is a new gesture (e.g. a feature gesture), add it to the
+        # editable list if it isn't already there.
+        if name not in self._editable:
+            self._editable.append(name)
+
         self.feedback.confirm()
         self.feedback.speak(f"{name} saved. Now {spec.describe()}.")
         self.state = State.MENU
@@ -181,7 +206,7 @@ class HubStateMachine:
         self.recording = False
         return self.recorder.analyze()
 
-    # ── helpers ────────────────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
     def _drain_queue(self) -> None:
         try:
             while True:

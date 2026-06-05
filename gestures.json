@@ -1,0 +1,26 @@
+{
+  "START": {
+    "name": "START",
+    "flex_mask": 17,
+    "imu_mask": 1,
+    "motion": "static",
+    "hold_frames": 3,
+    "_comment": "Thumb(bit0)+Pinky(bit4)=0x11=17, tilt_right=bit0=0x01=1, hold 3 frames"
+  },
+  "NEXT": {
+    "name": "NEXT",
+    "flex_mask": 9,
+    "imu_mask": 8,
+    "motion": "flick",
+    "hold_frames": 2,
+    "_comment": "Thumb(bit0)+Ring(bit3)=0x09=9, tilt_backward=bit3=0x08=8, flick"
+  },
+  "EDIT": {
+    "name": "EDIT",
+    "flex_mask": 5,
+    "imu_mask": 4,
+    "motion": "flick",
+    "hold_frames": 2,
+    "_comment": "Thumb(bit0)+Middle(bit2)=0x05=5, tilt_forward=bit2=0x04=4, flick"
+  }
+}

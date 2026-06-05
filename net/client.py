@@ -16,11 +16,11 @@ import threading
 
 class ServerLink:
     def __init__(self, host: str, port: int, timeout: float = 120.0):
-        self.host = host
-        self.port = port
+        self.host    = host
+        self.port    = port
         self.timeout = timeout
-        self.sock: socket.socket | None = None
-        self._lock = threading.Lock()
+        self.sock:   socket.socket | None = None
+        self._lock   = threading.Lock()
 
     def connect(self) -> bool:
         try:

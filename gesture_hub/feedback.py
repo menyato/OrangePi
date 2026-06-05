@@ -49,7 +49,8 @@ class Feedback:
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 ap = subprocess.Popen(
                     ["aplay", "-D", self.alsa, "-q"],
-                    stdin=es.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    stdin=es.stdout, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
                 es.stdout.close()
                 ap.wait()
             else:
