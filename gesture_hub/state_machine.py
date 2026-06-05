@@ -61,7 +61,7 @@ import threading
 import time
 from enum import Enum, auto
 
-from features.base import FeatureContext
+from features.base import Feature, FeatureContext
 
 
 class State(Enum):
