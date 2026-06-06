@@ -26,7 +26,7 @@ import threading
 import time
 from enum import Enum, auto
 
-from features.base import Feature, FeatureContext
+from features.base import FeatureContext
 
 # Seconds START is locked out after each toggle to prevent accidental re-fire.
 START_LOCKOUT_S = 2.0
@@ -80,8 +80,8 @@ class HubStateMachine:
     def on_frame(self, frame) -> None:
         if self.recording:
             self.recorder.feed(frame)
-        elif self.state != State.INACTIVE:
-            self.engine.feed(frame)
+        else:
+            self.engine.feed(frame)   # always feed — dispatch() filters by state
 
     # ═══════════════════════════════════════════════════════════════════════
     # Gesture dispatch  (RX thread → queue)

@@ -7,14 +7,31 @@ given, audio is routed through it so it lands on the same speaker the money
 feature uses; otherwise espeak plays on the system default.
 """
 
+import re
 import subprocess
 import time
+
+
+def _auto_alsa() -> str | None:
+    """Return the first available ALSA playback device (e.g. 'plughw:0,0')."""
+    try:
+        out = subprocess.check_output(["aplay", "-l"],
+                                      stderr=subprocess.DEVNULL, text=True)
+        m = re.search(r"card\s+(\d+)[^,]*,\s*device\s+(\d+)", out)
+        if m:
+            dev = f"plughw:{m.group(1)},{m.group(2)}"
+            print(f"[AUDIO] Auto-detected ALSA device: {dev}")
+            return dev
+    except Exception:
+        pass
+    print("[AUDIO] No ALSA device found — espeak will use system default.")
+    return None
 
 
 class Feedback:
     def __init__(self, controller, alsa: str | None = None, speed: int = 150):
         self.ctrl = controller
-        self.alsa = alsa
+        self.alsa = alsa if alsa is not None else _auto_alsa()
         self.speed = speed
 
     # ── haptics ──────────────────────────────────────────────────────────────
