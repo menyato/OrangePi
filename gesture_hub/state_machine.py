@@ -437,9 +437,13 @@ class HubStateMachine:
                 self._announce_prog_feature(feat)
             return
 
+        # Tell the blind user exactly what was captured so they can
+        # decide whether to repeat or retry.
+        preview = self.recorder.build_spec("preview", sample1)
         self.feedback.confirm()                          # haptic: first sample OK
         self.feedback.speak(
             f"First sample recorded. "
+            f"Detected: {preview.describe()}. "
             f"Now perform the exact same gesture again after the buzz."
         )
         sample2 = self._capture_sample()
@@ -464,7 +468,8 @@ class HubStateMachine:
         self.feedback.select()                           # haptic: saved (double buzz)
         self.feedback.speak(
             f"Gesture for {title} saved. "
-            f"It is now {spec.describe()}."
+            f"It is: {spec.describe()}. "
+            f"Saved to gestures file."
         )
 
         if not in_programmable:

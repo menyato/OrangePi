@@ -59,18 +59,16 @@ class FeatureRegistry:
         return self._enroll_feat
 
     def next_enrollment(self, store):
-        """Advance to the next unassigned feature. Returns it or None if done."""
+        """Advance to the next unassigned feature. Returns it or None if all done."""
         missing = self.unassigned(store)   # re-query after each save
         if not missing:
             self._enroll_feat = None
-            return None
-        # try to keep walking forward from where we were
+            return None                    # genuinely all enrolled
+        # Walk forward, wrapping around so the user can cycle through
+        # all unassigned features without accidentally ending enrollment early.
         idx = 0
         if hasattr(self, "_enroll_feat") and self._enroll_feat in missing:
-            idx = missing.index(self._enroll_feat) + 1
-        if idx >= len(missing):
-            self._enroll_feat = None
-            return None
+            idx = (missing.index(self._enroll_feat) + 1) % len(missing)
         self._enroll_feat = missing[idx]
         return self._enroll_feat
 
