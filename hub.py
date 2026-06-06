@@ -70,6 +70,51 @@ FEATURES = [
 ]
 
 
+def _probe_devices(feedback, link) -> None:
+    """
+    Boot-time device check for a blind user.
+    Tests camera, microphone, and server connection, then speaks the results.
+    The speaker test is implicit: if the user hears anything, audio is working.
+    """
+    results = []
+
+    # Server
+    server_ok = link.sock is not None
+    results.append("Server " + ("connected" if server_ok else "not reachable, will retry when needed"))
+
+    # Camera
+    camera_ok = False
+    try:
+        import cv2
+        cap = cv2.VideoCapture(0)
+        camera_ok = cap.isOpened()
+        cap.release()
+    except Exception:
+        pass
+    results.append("Camera " + ("ready" if camera_ok else "not found"))
+
+    # Microphone
+    mic_ok = False
+    mic_name = ""
+    try:
+        import sounddevice as sd
+        devs = sd.query_devices()
+        for d in devs:
+            if d["max_input_channels"] > 0:
+                mic_ok  = True
+                mic_name = d["name"].split("(")[0].strip()
+                break
+    except Exception:
+        pass
+    results.append("Microphone " + (f"ready, {mic_name}" if mic_ok else "not found"))
+
+    feedback.speak(
+        "Device check. "
+        + ". ".join(results)
+        + ". If you hear this message the speaker is working."
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="OrangePi gesture hub")
     ap.add_argument("--host",      default="10.254.249.159", help="Server IP")
@@ -185,6 +230,8 @@ def main() -> None:
     controller.on_frame = sm.on_frame
 
     link.connect()   # best-effort; features reconnect on demand
+
+    _probe_devices(feedback, link)
 
     print("[HUB] Running. Ctrl-C to quit.")
     try:
