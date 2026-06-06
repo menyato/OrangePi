@@ -112,8 +112,11 @@ class HubStateMachine:
     # ═══════════════════════════════════════════════════════════════════════
 
     def run(self) -> None:
+        start_spec = self.store.gestures.get("START")
+        start_desc = f" — {start_spec.describe()}" if start_spec else ""
         self.feedback.speak(
-            "Glove ready. Perform the start gesture to activate the glove."
+            f"Glove ready. "
+            f"Perform the start gesture{start_desc} to activate."
         )
         while not self._shutdown.is_set():
             try:
@@ -244,11 +247,9 @@ class HubStateMachine:
                         self._announce_enroll(cur)
                 return
 
-        # Unknown gesture — guide the user
-        self.feedback.speak(
-            "Perform the edit gesture to record a gesture for this feature, "
-            "or perform the next gesture to skip."
-        )
+        # Unknown gesture — re-read the enrollment prompt so the user knows
+        # exactly which gesture to make next.
+        self._announce_enroll(feat)
 
     def _announce_enroll(self, feat) -> None:
         key = self.registry.gesture_key(feat)
@@ -256,12 +257,21 @@ class HubStateMachine:
             self._advance_enroll()
             return
         remaining = len(self.registry.unassigned(self.store))
+
+        # Include physical gesture descriptions so the blind user knows
+        # exactly which finger+wrist combination to make.
+        edit_spec = self.store.gestures.get("EDIT")
+        next_spec  = self.store.gestures.get("NEXT")
+        edit_desc  = f" — {edit_spec.describe()}" if edit_spec else ""
+        next_desc  = f" — {next_spec.describe()}" if next_spec else ""
+
         self.feedback.speak(
-            f"Feature {feat.title}. "
-            f"No gesture assigned. "
-            f"Perform the edit gesture to record a gesture for it, "
-            f"or perform the next gesture to skip. "
-            f"{remaining} feature{'s' if remaining > 1 else ''} remaining."
+            f"You are now enrolling: {feat.title}. "
+            f"No gesture has been assigned to this feature yet. "
+            f"To record a gesture: perform the edit gesture{edit_desc}. "
+            f"To skip to the next feature: perform the next gesture{next_desc}. "
+            f"To turn the glove off: perform the start gesture. "
+            f"{remaining} feature{'s' if remaining > 1 else ''} still need a gesture."
         )
 
     def _advance_enroll(self) -> None:
