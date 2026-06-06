@@ -1,14 +1,17 @@
 """
 feedback.py — non-visual feedback for the hub.
 
-TTS: espeak-ng writes a WAV file, aplay plays it. File-based is more reliable
-than piping because format negotiation issues can't cause silent failures.
+TTS: espeak-ng writes a WAV file then aplay plays it in a daemon thread.
+     speak() is always non-blocking: a new call kills the previous audio
+     immediately so gestures are never delayed by ongoing speech.
+     silence() can be called explicitly to clear audio before a recording
+     window so the user hears only the haptic "go" buzz.
 
-ALSA: devices are listed and tested at startup. Non-HDMI devices are preferred
-and tried in reverse order so a plugged-in headset (higher card number) beats
-the built-in codec (card 0).
+ALSA: devices listed and tested at startup. Non-HDMI devices are tried in
+      reverse card-number order so USB/external headsets (higher card #)
+      are preferred over the built-in codec (card 0).
 
-Volume: common mixer controls are unmuted and set to 90% before the test.
+Volume: every mixer control on every card is unmuted and set to 90%.
 All errors are printed — nothing fails silently.
 """
 
@@ -18,6 +21,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 
@@ -25,10 +29,8 @@ import wave
 # ── Volume initialisation ─────────────────────────────────────────────────────
 
 def _unmute_all(card: str = "") -> None:
-    """Unmute and set 90% volume on every mixer control we can find."""
     card_flag = ["-c", card] if card else []
 
-    # Try common control names — wrong ones are silently skipped by amixer -q
     controls = [
         "Master", "PCM", "Speaker", "Headphone", "LINEOUT",
         "Line Out", "Output", "Digital", "DAC", "Playback",
@@ -43,7 +45,7 @@ def _unmute_all(card: str = "") -> None:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-    # Also try to unmute every control the card actually has
+    # Enumerate every control the card actually exposes
     try:
         out = subprocess.check_output(
             ["amixer"] + card_flag + ["scontents"],
@@ -60,7 +62,6 @@ def _unmute_all(card: str = "") -> None:
 # ── ALSA device selection ─────────────────────────────────────────────────────
 
 def _make_test_wav() -> str:
-    """Write a 0.5-second 440 Hz sine wave to a temp WAV file. Returns path."""
     rate = 22050
     samples = array.array(
         "h",
@@ -78,7 +79,6 @@ def _make_test_wav() -> str:
 
 
 def _test_device(alsa_dev: str, wav_path: str) -> bool:
-    """Return True if aplay can open and play wav_path on alsa_dev."""
     try:
         r = subprocess.run(
             ["aplay", "-D", alsa_dev, "-q", wav_path],
@@ -86,23 +86,15 @@ def _test_device(alsa_dev: str, wav_path: str) -> bool:
         )
         if r.returncode != 0:
             err = r.stderr.decode(errors="replace").strip()
-            print(f"[AUDIO]   {alsa_dev} — aplay error: {err}")
+            print(f"[AUDIO]   {alsa_dev} — {err}")
             return False
         return True
     except Exception as e:
-        print(f"[AUDIO]   {alsa_dev} — test exception: {e}")
+        print(f"[AUDIO]   {alsa_dev} — {e}")
         return False
 
 
-def _auto_alsa() -> str | None:
-    """
-    Find the best ALSA playback device:
-      1. List all devices.
-      2. Unmute every mixer control.
-      3. Test each non-HDMI device with a short tone; return the first that works.
-         Devices are tried in reverse card-number order so external / USB
-         headsets (higher card numbers) are preferred over the built-in codec.
-    """
+def _auto_alsa() -> "str | None":
     try:
         out = subprocess.check_output(
             ["aplay", "-l"], stderr=subprocess.DEVNULL, text=True)
@@ -113,8 +105,7 @@ def _auto_alsa() -> str | None:
         print(f"[AUDIO] aplay -l failed: {e}")
         return None
 
-    entries = re.findall(
-        r"card\s+(\d+):\s*(\S+)[^,]*,\s*device\s+(\d+)", out)
+    entries = re.findall(r"card\s+(\d+):\s*(\S+)[^,]*,\s*device\s+(\d+)", out)
     if not entries:
         print("[AUDIO] No playback devices found.")
         return None
@@ -123,8 +114,7 @@ def _auto_alsa() -> str | None:
     for card, name, dev in entries:
         print(f"  plughw:{card},{dev}  ({name})")
 
-    # Unmute mixer controls on every card found
-    cards_seen: set[str] = set()
+    cards_seen: set = set()
     for card, _, _ in entries:
         if card not in cards_seen:
             _unmute_all(card)
@@ -134,9 +124,8 @@ def _auto_alsa() -> str | None:
     try:
         non_hdmi = [(c, n, d) for c, n, d in entries if "hdmi" not in n.lower()]
         hdmi     = [(c, n, d) for c, n, d in entries if "hdmi"     in n.lower()]
-
-        # Reverse non-HDMI so external/USB headsets (higher card#) come first
-        ordered = list(reversed(non_hdmi)) + hdmi
+        # Reverse non-HDMI: higher card number = more recently connected device
+        ordered  = list(reversed(non_hdmi)) + hdmi
 
         for card, name, dev in ordered:
             alsa_dev = f"plughw:{card},{dev}"
@@ -150,17 +139,22 @@ def _auto_alsa() -> str | None:
         except OSError:
             pass
 
-    print("[AUDIO] No working ALSA device found — espeak will use system default.")
+    print("[AUDIO] No working device found — will use system default.")
     return None
 
 
 # ── Feedback class ────────────────────────────────────────────────────────────
 
 class Feedback:
-    def __init__(self, controller, alsa: str | None = None, speed: int = 150):
+    def __init__(self, controller, alsa: "str | None" = None, speed: int = 150):
         self.ctrl  = controller
         self.alsa  = alsa if alsa is not None else _auto_alsa()
         self.speed = speed
+
+        # Background audio state (protected by _audio_lock)
+        self._audio_proc: "subprocess.Popen | None" = None
+        self._audio_tmp:  "str | None"               = None
+        self._audio_lock  = threading.Lock()
 
         try:
             v = subprocess.check_output(
@@ -179,71 +173,117 @@ class Feedback:
         except Exception:
             pass
 
-    def confirm(self) -> None:       # single short buzz — "got it"
+    def confirm(self) -> None:
         self._pulse(1, 120)
 
-    def tick(self) -> None:          # tiny blip — menu moved
+    def tick(self) -> None:
         self._pulse(2, 60)
 
-    def select(self) -> None:        # double buzz — launched
+    def select(self) -> None:
         self._pulse(1, 90); time.sleep(0.12); self._pulse(1, 90)
 
-    def error(self) -> None:         # long buzz — rejected / off
+    def error(self) -> None:
         self._pulse(3, 400)
 
-    def beep(self) -> None:          # haptic "go" marker for recording
+    def beep(self) -> None:
         self._pulse(2, 150)
 
-    # ── speech ───────────────────────────────────────────────────────────────
-    def speak(self, text: str) -> None:
-        """
-        Synthesise text to a WAV file via espeak-ng then play with aplay.
-        File-based (not piped) to avoid format-negotiation failures.
-        """
-        print(f"[HUB] {text}")
+    # ── audio control ────────────────────────────────────────────────────────
+    def silence(self) -> None:
+        """Kill current audio immediately (call before a recording window)."""
+        self._stop_audio()
 
-        fd, tmp = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        try:
-            # Step 1: generate WAV
-            r = subprocess.run(
-                ["espeak-ng", "-s", str(self.speed), "-w", tmp, text],
-                stderr=subprocess.PIPE, timeout=30,
-            )
-            if r.returncode != 0:
-                err = r.stderr.decode(errors="replace").strip()
-                print(f"[AUDIO] espeak-ng synthesis error: {err}")
-                return
-
-            # Step 2: play WAV
-            if self.alsa:
-                r2 = subprocess.run(
-                    ["aplay", "-D", self.alsa, "-q", tmp],
-                    stderr=subprocess.PIPE, timeout=60,
-                )
-                if r2.returncode != 0:
-                    err2 = r2.stderr.decode(errors="replace").strip()
-                    print(f"[AUDIO] aplay error ({self.alsa}): {err2}")
-                    # Fallback: system default
-                    subprocess.run(
-                        ["aplay", "-q", tmp],
-                        stderr=subprocess.DEVNULL, timeout=60,
-                    )
-            else:
-                subprocess.run(
-                    ["aplay", "-q", tmp],
-                    stderr=subprocess.PIPE, timeout=60,
-                )
-
-        except FileNotFoundError as e:
-            print(f"[AUDIO] Command not found: {e}"
-                  " — sudo apt install espeak-ng alsa-utils")
-        except subprocess.TimeoutExpired:
-            print("[AUDIO] speak() timed out")
-        except Exception as e:
-            print(f"[AUDIO] speak error: {e}")
-        finally:
+    def _stop_audio(self) -> None:
+        with self._audio_lock:
+            proc = self._audio_proc
+            tmp  = self._audio_tmp
+            self._audio_proc = None
+            self._audio_tmp  = None
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=0.3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if tmp:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+    # ── speech ───────────────────────────────────────────────────────────────
+    def speak(self, text: str) -> None:
+        """
+        Speak text non-blocking: kills any current audio, synthesises a WAV
+        file via espeak-ng, then plays it in a daemon thread.
+
+        Gesture priority: a new speak() call always interrupts the previous
+        one immediately — the user never waits for speech to finish.
+        """
+        print(f"[HUB] {text}")
+        self._stop_audio()   # gesture priority — kill old speech first
+
+        # Synthesise WAV synchronously (fast, < 1 s even for long text)
+        fd, tmp = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            r = subprocess.run(
+                ["espeak-ng", "-s", str(self.speed), "-w", tmp, text],
+                stderr=subprocess.PIPE, timeout=30)
+            if r.returncode != 0:
+                err = r.stderr.decode(errors="replace").strip()
+                print(f"[AUDIO] espeak-ng: {err}")
+                os.unlink(tmp)
+                return
+        except FileNotFoundError:
+            print("[AUDIO] espeak-ng not found — sudo apt install espeak-ng")
+            try: os.unlink(tmp)
+            except OSError: pass
+            return
+        except Exception as e:
+            print(f"[AUDIO] espeak-ng: {e}")
+            try: os.unlink(tmp)
+            except OSError: pass
+            return
+
+        cmd = (["aplay", "-D", self.alsa, "-q", tmp] if self.alsa
+               else ["aplay", "-q", tmp])
+
+        # Launch aplay immediately so _stop_audio() can kill it at any point
+        try:
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+        except Exception as e:
+            print(f"[AUDIO] aplay launch: {e}")
+            try: os.unlink(tmp)
+            except OSError: pass
+            return
+
+        with self._audio_lock:
+            self._audio_proc = proc
+            self._audio_tmp  = tmp
+
+        # Daemon thread monitors for errors and cleans up the temp file
+        def _monitor(p: "subprocess.Popen", t: str) -> None:
+            try:
+                _, err = p.communicate(timeout=60)
+                if p.returncode not in (0, -15, -9):  # -15=SIGTERM, -9=SIGKILL
+                    print(f"[AUDIO] aplay: {err.decode(errors='replace').strip()}")
+                    # Fallback to system default device
+                    try:
+                        subprocess.run(["aplay", "-q", t],
+                                       stderr=subprocess.DEVNULL, timeout=60)
+                    except Exception:
+                        pass
+            except subprocess.TimeoutExpired:
+                p.kill()
+            except Exception as e:
+                print(f"[AUDIO] monitor: {e}")
+            finally:
+                with self._audio_lock:
+                    if self._audio_proc is p:
+                        self._audio_proc = None
+                        self._audio_tmp  = None
+                try: os.unlink(t)
+                except OSError: pass
+
+        threading.Thread(target=_monitor, args=(proc, tmp), daemon=True).start()

@@ -108,11 +108,7 @@ def _probe_devices(feedback, link) -> None:
         pass
     results.append("Microphone " + (f"ready, {mic_name}" if mic_ok else "not found"))
 
-    feedback.speak(
-        "Device check. "
-        + ". ".join(results)
-        + ". If you hear this message the speaker is working."
-    )
+    feedback.speak("Startup: " + ", ".join(results) + ". Speaker working.")
 
 
 def main() -> None:
