@@ -230,6 +230,7 @@ class HubStateMachine:
         if name == "EDIT":
             self.feedback.tick()
             self._record_feature_gesture(feat)
+            self._drain_queue()   # discard EDIT bounces that queued while recording
             return
 
         # Already-assigned feature gesture — activate it, then resume enrollment
@@ -323,6 +324,7 @@ class HubStateMachine:
             self.feedback.tick()
             self.feedback.speak(f"Editing {feat.title}.")
             self._record_feature_gesture(feat, in_programmable=True)
+            self._drain_queue()   # discard EDIT bounces that queued while recording
             return
 
         # Silently ignore any gesture that doesn't belong in programmable mode.
