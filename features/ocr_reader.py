@@ -195,11 +195,11 @@ def _capture_frame(fb) -> "bytes | None":
 
 # ── voice helpers ─────────────────────────────────────────────────────────────
 
-_SCAN_W  = {"scan", "capture", "take", "photo"}
-_LOAD_W  = {"load", "recall"}
+_SCAN_W  = {"scan", "capture", "take", "photo", "scam", "skan", "skun", "scanned"}
+_LOAD_W  = {"load", "recall", "open", "read"}
 _NEXT_W  = {"next", "skip", "forward"}
-_CLOSE_W = {"close", "stop", "quit", "finish", "exit"}
-_YES_W   = {"yes", "yeah", "resume", "continue", "ok"}
+_CLOSE_W = {"close", "stop", "quit", "finish", "exit", "done"}
+_YES_W   = {"yes", "yeah", "resume", "continue", "ok", "yep", "sure"}
 _NO_W    = {"no", "nope", "back"}
 _SKIP_W  = {"skip", "none", "no", "cancel", "default"}
 
@@ -341,11 +341,18 @@ def _voice_worker_v2(abort: threading.Event,
             except OSError: pass
             break
 
-        # Transcribe with VAD filter so silence clips return ""
+        # Transcribe — lower VAD threshold so quiet speech isn't stripped,
+        # and bias Whisper toward known command words via initial_prompt.
         text = ""
         try:
             segs, _ = wm.transcribe(
-                wav_tmp, language="en", beam_size=5, vad_filter=True
+                wav_tmp, language="en", beam_size=5,
+                vad_filter=True,
+                vad_parameters={"threshold": 0.25,
+                                 "min_speech_duration_ms": 100,
+                                 "min_silence_duration_ms": 200},
+                initial_prompt="Commands: scan, load, next, close, yes, no, skip, resume.",
+                condition_on_previous_text=False,
             )
             text = " ".join(s.text for s in segs).strip()
         except Exception as e:
