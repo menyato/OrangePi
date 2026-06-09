@@ -53,10 +53,12 @@ class GestureStore:
     def save(self) -> None:
         try:
             with open(self.path, "w") as f:
-                json.dump(
-                    {n: s.to_dict() for n, s in self.gestures.items()},
-                    f, indent=2
-                )
+                data = {}
+                for n, s in self.gestures.items():
+                    d = s.to_dict()
+                    d["_desc"] = s.describe()   # human-readable, ignored on load
+                    data[n] = d
+                json.dump(data, f, indent=2)
             print(f"[STORE] Saved {len(self.gestures)} gestures to {self.path}")
         except OSError as e:
             print(f"[STORE] Save failed: {e}")
