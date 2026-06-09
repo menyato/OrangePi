@@ -643,6 +643,52 @@ class OCRReader(Feature):
             g = _wait_gesture(ctx, timeout=ges_timeout)
             return _GMAP.get(g) if g else None
 
+        def _session_stats() -> "tuple[int, int]":
+            """Return (n_pages, total_words) for the current pages dict."""
+            order = _reading_order(pages)
+            return (
+                len(order),
+                sum(pages[k].get("word_count", 0) for k in order),
+            )
+
+        def _autosave() -> None:
+            if pages and session_name:
+                try:
+                    order = _reading_order(pages)
+                    _save_session(session_name, [pages[k] for k in order])
+                    print(f"[OCR] Auto-saved '{session_name}' ({len(order)} pages)")
+                except Exception as e:
+                    print(f"[OCR] Auto-save error: {e}")
+
+        def _after_read(result: str) -> bool:
+            """Handle the transition after _read_pages() returns.
+
+            Auto-saves progress, announces session status with next-step options,
+            re-enables voice, and for a 'scan' return injects the SCAN command so
+            capture starts immediately without requiring a second voice command.
+
+            Returns True if the outer loop should break (session close).
+            """
+            if result == "close":
+                return True
+            _autosave()
+            if result == "done":
+                n_pg, total_w = _session_stats()
+                _srvspeak(
+                    ctx, fb,
+                    f"Done reading {session_name}. "
+                    f"{n_pg} page{'s' if n_pg != 1 else ''}, {total_w} words. "
+                    "Say scan to add a page, "
+                    "load to open a different session, "
+                    "or close to save and exit."
+                )
+                fb.wait(timeout=10)
+            _voice_on()
+            if result == "scan":
+                # User said "scan" while paused — go straight to capture
+                voice_q.put("SCAN")
+            return False
+
         # ── opening ───────────────────────────────────────────────────────────
         _srvspeak(
             ctx, fb,
