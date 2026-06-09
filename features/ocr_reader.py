@@ -1,46 +1,36 @@
 """
 features/ocr_reader.py — Book Reader feature for the smart glove.
 
-Flow
-----
-1. Open  → "Say scan to capture."  Voice thread starts (mc.listen).
+State transitions (announced via TTS)
+--------------------------------------
+  IDLE     → "Book reader. Say scan, load <name>, or close."
+  CAPTURE  → "Hold steady. Capturing now."  haptic on success
+  PROCESS  → "Scanning complete. Processing text."
+  RESULT   → "Page N. X words."
+           or "No page number. X words. Say the number or skip."
+  NAME     → "Say a name for this session."  (first scan only)
+  READ     → "Session <name>. Reading now."
+  PAUSE    → "Paused. Scan, yes=resume, next, close."
+  DONE     → "All pages read. Scan for more or close."
+  CLOSE    → gap-warning → "Saved as <name>. N pages, X words."
 
-2. Scan  → voice "scan" or NEXT gesture:
-           "Hold steady. Capturing." → mc.capture_best_frame_local() (4 s)
-           → server EasyOCR → detect page number.
-           Announce: "Processed. Page 3. 45 words."
-                  or "Processed. No page number found. 45 words."
+Gesture controls (during reading only — voice OFF, no cue sounds)
+-----------------------------------------------------------------
+  OCR_PAUSE  (Thumb+Ring+Pinky tilt-back)  → pause / resume
+  OCR_FWD    (Thumb flick right)            → skip 3 chunks forward
+  OCR_BWD    (Thumb flick left)             → rewind 3 chunks
+  NEXT / OCR_SCAN gesture                   → jump to next page scan
 
-3. First scan only → "Say a name for this session." → mc.listen() → save name.
-   "Session: my history book. Reading now."
-
-4. Read  → chunks spoken via TTS.  Voice thread OFF during reading.
-           Gestures only:
-             OCR_PAUSE  (Thumb+Ring+Pinky tilt-back) → pause
-             OCR_FWD    (Thumb flick right)           → skip 3 chunks
-             OCR_BWD    (Thumb flick left)            → rewind 3 chunks
-             NEXT / OCR_SCAN gesture                  → skip to next page
-
-5. Paused → voice thread ON.
-           Say "scan"  → go capture another page (add to session)
-           Say "yes"   → resume reading
-           Say "no"    → resume reading
-           Say "next"  → jump to next already-scanned page
-           Say "close" → save and exit
-           OCR_PAUSE gesture also resumes.
-
-6. All pages of current session read:
-           "All pages read. Say scan to add more, or close to finish."
-
-7. Close → sort pages by page number → warn about gaps → save session.
-
-ALSA note
----------
-The Logitech headset uses the same ALSA device for output (aplay/TTS) and input
-(sounddevice/mic).  Opening the mic while aplay is still active causes:
-  "Error opening InputStream: Device unavailable [PaErrorCode -9985]"
-Fix: call fb.wait() to block until TTS finishes, then sleep 1 s inside _voice_on()
-before sounddevice opens the stream — by then ALSA is free.
+Voice controls (mc.listen / Whisper — ON during idle, paused, and after page)
+-----------------------------------------------------------------
+  "scan"       → capture a new page
+  "load <name>"→ load a previously saved session and re-read it
+  "next"       → jump to next already-scanned page
+  "close"      → save and exit
+  (paused) "yes" / "resume"  → resume reading
+  (paused) "scan"            → break out to capture a new page
+  (paused) "next"            → skip to next page
+  (paused) "close"           → save and exit
 """
 
 import contextlib
@@ -73,7 +63,7 @@ SESSIONS_DIR   = os.path.expanduser("~/ocr_sessions")
 CAMERA_INDICES = [0, 1, 2]
 IDLE_REMIND_S  = 60
 
-# ── mc initialisation (shared with money recognition) ─────────────────────────
+# ── mc initialisation ─────────────────────────────────────────────────────────
 _mc_ready = False
 _mc_lock  = threading.Lock()
 
@@ -96,7 +86,7 @@ def _ensure_mc(fb) -> bool:
             mc.init_cues()
             mc.auto_detect_all()
             fb.speak("Loading voice model. Please wait about one minute.")
-            mc.load_models()   # initialises vad + Whisper — must be called before mc.listen()
+            mc.load_models()
             _mc_ready = True
             return True
         except Exception as e:
@@ -104,7 +94,7 @@ def _ensure_mc(fb) -> bool:
             return False
 
 
-# ── cv2 fallback ──────────────────────────────────────────────────────────────
+# ── cv2 fallback camera ───────────────────────────────────────────────────────
 
 @contextlib.contextmanager
 def _quiet_stderr():
@@ -169,17 +159,45 @@ def _capture_frame(fb) -> "bytes | None":
     return jpeg
 
 
-# ── voice worker ──────────────────────────────────────────────────────────────
+# ── voice helpers ─────────────────────────────────────────────────────────────
 
 _SCAN_W  = {"scan", "capture", "take", "photo"}
+_LOAD_W  = {"load", "recall"}
 _NEXT_W  = {"next", "skip", "forward"}
 _CLOSE_W = {"close", "stop", "quit", "finish", "exit"}
-_YES_W   = {"yes", "yeah", "resume", "continue"}
+_YES_W   = {"yes", "yeah", "resume", "continue", "ok"}
 _NO_W    = {"no", "nope", "back"}
+_SKIP_W  = {"skip", "none", "no", "cancel", "default"}
+
+# Words used to say page numbers
+_WORD_NUMS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+
+
+def _parse_number(text: str) -> "int | None":
+    """Extract first integer from spoken text (digits or words)."""
+    digits = re.findall(r'\b(\d+)\b', text)
+    if digits:
+        n = int(digits[0])
+        if 1 <= n <= 9999:
+            return n
+    for w in re.findall(r'[a-z]+', text.lower()):
+        n = _WORD_NUMS.get(w)
+        if n and n > 0:
+            return n
+    return None
 
 
 def _classify(text: str) -> "str | None":
     words = set(re.findall(r"[a-z]+", text.lower()))
+    if words & _LOAD_W:   return "LOAD"
     if words & _SCAN_W:   return "SCAN"
     if words & _NEXT_W:   return "NEXT"
     if words & _YES_W:    return "YES"
@@ -204,6 +222,8 @@ def _voice_worker(abort: threading.Event,
         if cmd:
             print(f"[OCR] voice: {text!r} → {cmd}")
             voice_q.put(cmd)
+        else:
+            print(f"[OCR] voice: {text!r} → (unrecognised)")
 
 
 # ── gesture → command ─────────────────────────────────────────────────────────
@@ -220,7 +240,7 @@ _GMAP = {
 }
 
 
-# ── queue / timing helpers ────────────────────────────────────────────────────
+# ── queue helpers ─────────────────────────────────────────────────────────────
 
 def _drain(q: queue.Queue) -> None:
     while True:
@@ -271,10 +291,9 @@ def _chunk_dur(chunk: str) -> float:
     return max(0.8, len(chunk.split()) / WORDS_PER_SEC + 0.4)
 
 
-# ── page ordering / session helpers ──────────────────────────────────────────
+# ── session helpers ───────────────────────────────────────────────────────────
 
 def _reading_order(pages: dict) -> list:
-    """Numbered pages first (ascending), then unnumbered in capture order."""
     numbered = sorted([k for k in pages if k[0] == "num"], key=lambda k: k[1])
     indexed  = sorted([k for k in pages if k[0] == "idx"], key=lambda k: k[1])
     return numbered + indexed
@@ -315,6 +334,47 @@ def _save_session(name: str, pages_list: list) -> str:
     return path
 
 
+def _find_session(query: str) -> "dict | None":
+    """Find a saved session by name (exact then partial match)."""
+    if not os.path.isdir(SESSIONS_DIR):
+        return None
+    q = query.lower().strip()
+    candidates = []
+    for fname in os.listdir(SESSIONS_DIR):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(SESSIONS_DIR, fname), encoding="utf-8") as f:
+                data = json.load(f)
+            candidates.append(data)
+        except Exception:
+            pass
+    # Exact match first
+    for d in candidates:
+        if d.get("name", "").lower() == q:
+            return d
+    # Partial match
+    for d in candidates:
+        name = d.get("name", "").lower()
+        if q in name or name in q:
+            return d
+    return None
+
+
+def _pages_from_session(data: dict) -> "tuple[dict, int]":
+    """Convert saved session data to pages dict. Returns (pages, next_idx)."""
+    pages: dict = {}
+    idx = 0
+    for p in data.get("pages", []):
+        pnum = p.get("page")
+        if pnum is not None:
+            pages[("num", pnum)] = p
+        else:
+            pages[("idx", idx)] = p
+            idx += 1
+    return pages, idx
+
+
 # ── feature ───────────────────────────────────────────────────────────────────
 
 class OCRReader(Feature):
@@ -335,25 +395,25 @@ class OCRReader(Feature):
 
         self._session_counter += 1
         session_name: "str | None" = None
-        pages:        dict         = {}   # ("num", N) or ("idx", N) → page_data
-        page_idx      = 0                 # counter for unnumbered pages
+        pages:        dict         = {}
+        page_idx      = 0
 
-        # ── voice thread management ───────────────────────────────────────────
+        # ── voice thread ──────────────────────────────────────────────────────
         voice_q   = queue.Queue()
         _cur_stop = [threading.Event()]
         _cur_stop[0].set()
 
         def _voice_on() -> None:
-            """Start a new listen thread.  Delays 1 s so aplay releases ALSA first."""
             if not mc_ok:
                 return
-            _cur_stop[0].set()           # stop previous thread
+            _cur_stop[0].set()
             stop = threading.Event()
             _cur_stop[0] = stop
             _drain(voice_q)
 
             def _delayed():
-                time.sleep(1.0)          # wait for aplay to free the ALSA device
+                # Wait for aplay to release ALSA before sounddevice opens the mic
+                time.sleep(1.0)
                 if not stop.is_set():
                     _voice_worker(ctx.abort, voice_q, stop)
 
@@ -372,13 +432,147 @@ class OCRReader(Feature):
             return _GMAP.get(g) if g else None
 
         # ── opening ───────────────────────────────────────────────────────────
-        fb.speak("Book reader. Say scan to capture, or close to exit.")
+        fb.speak(
+            "Book reader. "
+            "Say scan to capture a page, "
+            "load to open a saved session, "
+            "or close to exit."
+        )
         _voice_on()
 
+        # ── nested reading loop ───────────────────────────────────────────────
+        def _read_pages(start_key: tuple) -> str:
+            """Read pages starting at start_key.
+
+            Returns:
+              "scan"  — user asked to scan a new page (from pause)
+              "close" — user asked to close
+              "done"  — finished reading all pages
+            """
+            current_key: "tuple | None" = start_key
+
+            while current_key is not None and not ctx.abort.is_set():
+                pdata  = pages[current_key]
+                chunks = _chunk_text(pdata["text"])
+
+                if not chunks:
+                    fb.speak("Page appears blank.")
+                    nk = _next_key(pages, current_key)
+                    current_key = nk
+                    continue
+
+                i               = 0
+                paused          = False
+                pause_announced = False
+
+                while i < len(chunks) and not ctx.abort.is_set():
+
+                    # ── PAUSED ────────────────────────────────────────────────
+                    if paused:
+                        if not pause_announced:
+                            fb.speak(
+                                "Paused. "
+                                "Say scan to add a page. "
+                                "Say yes to resume. "
+                                "Say next for the next page. "
+                                "Say close to finish. "
+                                "Or use pause gesture to resume."
+                            )
+                            pause_announced = True
+                            fb.wait(timeout=10)
+                            _voice_on()
+
+                        cmd = _get_cmd(ges_timeout=0.4)
+                        if cmd is None:
+                            continue
+
+                        if cmd.startswith("TEXT:"):
+                            # Raw text in pause — ignore (not a command)
+                            continue
+
+                        _voice_off()
+
+                        if cmd in ("PAUSE", "YES", "NO"):
+                            paused = False; pause_announced = False
+                            fb.speak("Resuming.")
+
+                        elif cmd == "SCAN":
+                            paused = False; pause_announced = False
+                            return "scan"
+
+                        elif cmd == "NEXT":
+                            fb.silence(); fb.speak("Next page.")
+                            i = len(chunks); paused = False; pause_announced = False
+
+                        elif cmd == "FWD":
+                            skip = min(SKIP_CHUNKS, len(chunks) - i)
+                            i    = min(i + skip, len(chunks))
+                            paused = False; pause_announced = False
+                            fb.speak("Skipped. Resuming.")
+
+                        elif cmd == "BWD":
+                            i = max(0, i - SKIP_CHUNKS)
+                            paused = False; pause_announced = False
+                            fb.speak("Rewound. Resuming.")
+
+                        elif cmd == "CLOSE":
+                            ctx.abort.set()
+                            return "close"
+
+                        continue
+
+                    # ── READ CHUNK ────────────────────────────────────────────
+                    fb.speak(chunks[i])
+                    dur = _chunk_dur(chunks[i])
+                    i  += 1
+
+                    deadline = time.time() + dur
+                    while time.time() < deadline and not ctx.abort.is_set():
+                        g    = _wait_gesture(ctx,
+                                             timeout=min(0.05, deadline - time.time()))
+                        gcmd = _GMAP.get(g) if g else None
+
+                        if gcmd == "PAUSE":
+                            paused = True; pause_announced = False
+                            fb.silence(); fb.speak("Paused.")
+                            break
+                        elif gcmd == "FWD":
+                            skip = min(SKIP_CHUNKS, len(chunks) - i)
+                            i    = min(i + skip, len(chunks))
+                            fb.silence(); fb.speak(f"Skipped {skip}.")
+                            break
+                        elif gcmd == "BWD":
+                            i = max(0, i - SKIP_CHUNKS - 1)
+                            fb.silence(); fb.speak("Rewinding.")
+                            break
+                        elif gcmd in ("NEXT", "SCAN"):
+                            fb.silence(); fb.speak("Next page.")
+                            i = len(chunks); break
+                        elif gcmd == "CLOSE":
+                            fb.silence(); ctx.abort.set(); return "close"
+
+                # Advance to next page
+                if not ctx.abort.is_set() and i >= len(chunks):
+                    nk = _next_key(pages, current_key)
+                    if nk is not None:
+                        label = _page_label(pages[nk])
+                        fb.speak(f"Page done. Next is {label}. Reading.")
+                        current_key = nk
+                    else:
+                        fb.speak(
+                            "All pages read. "
+                            "Say scan to add more pages, "
+                            "or say close to save and exit."
+                        )
+                        fb.wait(timeout=8)
+                        current_key = None
+
+            return "done"
+
+        # ── outer scan-wait loop ──────────────────────────────────────────────
         try:
             idle_t = time.time() + IDLE_REMIND_S
 
-            # ── outer scan-wait loop ──────────────────────────────────────────
             while not ctx.abort.is_set():
                 cmd = _get_cmd(ges_timeout=0.4)
 
@@ -386,17 +580,60 @@ class OCRReader(Feature):
                     break
                 if cmd == "CLOSE":
                     break
-                if cmd in ("SCAN", "NEXT"):
-                    pass   # fall through to capture
-                elif cmd is None:
+                if cmd is None:
                     if time.time() >= idle_t:
-                        fb.speak("Say scan to capture a page, or close to exit.")
+                        fb.speak("Say scan to capture, load for a saved session, or close.")
                         idle_t = time.time() + IDLE_REMIND_S
                     continue
-                else:
+
+                # ── LOAD saved session ─────────────────────────────────────
+                if cmd == "LOAD":
+                    _voice_off()
+                    raw_text = ""
+
+                    if not raw_text:
+                        fb.speak("Say the session name.")
+                        fb.wait(timeout=5)
+                        if mc_ok:
+                            try:
+                                raw_text, _ = mc.listen()
+                            except Exception:
+                                raw_text = ""
+
+                    if raw_text:
+                        sdata = _find_session(raw_text)
+                        if sdata:
+                            loaded_name  = sdata["name"]
+                            loaded_pages, loaded_idx = _pages_from_session(sdata)
+                            if loaded_pages:
+                                session_name = session_name or loaded_name
+                                pages.update(loaded_pages)
+                                page_idx = max(page_idx, loaded_idx)
+                                fb.speak(
+                                    f"Loaded {loaded_name}. "
+                                    f"{len(loaded_pages)} pages. Reading now."
+                                )
+                                fb.wait(timeout=5)
+                                order      = _reading_order(pages)
+                                start_key  = order[0] if order else None
+                                if start_key:
+                                    result = _read_pages(start_key)
+                                    if result == "close":
+                                        break
+                                    _voice_on()
+                                    idle_t = time.time() + IDLE_REMIND_S
+                                continue
+                            else:
+                                fb.speak(f"Session {loaded_name} has no pages.")
+                        else:
+                            fb.speak(f"No session found matching {raw_text!r}.")
+                    _voice_on()
                     continue
 
-                # ── CAPTURE ───────────────────────────────────────────────────
+                if cmd not in ("SCAN", "NEXT"):
+                    continue
+
+                # ── CAPTURE ────────────────────────────────────────────────────
                 _voice_off()
                 idle_t = time.time() + IDLE_REMIND_S
 
@@ -409,7 +646,7 @@ class OCRReader(Feature):
                     _voice_on()
                     continue
 
-                fb.speak("Processing, please wait.")
+                fb.speak("Scanning complete. Processing text.")
                 resp = ctx.link.send("ocr", {"type": "scan", "frame": jpeg})
 
                 if resp is None:
@@ -420,14 +657,42 @@ class OCRReader(Feature):
 
                 text_body = resp.get("text", "").strip()
                 if not text_body:
-                    fb.speak("No text found. Try better lighting and say scan again.")
-                    fb.wait(timeout=6)
+                    fb.speak(
+                        "No text found. "
+                        "Hold page 30 to 40 centimetres from camera "
+                        "with good lighting, then scan again."
+                    )
+                    fb.wait(timeout=8)
                     _voice_on()
                     continue
 
                 detected_page = resp.get("page")
                 word_count    = len(text_body.split())
 
+                # ── ANNOUNCE RESULT ───────────────────────────────────────────
+                if detected_page is not None:
+                    fb.speak(f"Page {detected_page}. {word_count} words.")
+                else:
+                    fb.speak(f"No page number. {word_count} words.")
+                    fb.wait(timeout=5)
+                    # Ask user to provide the page number
+                    if mc_ok:
+                        fb.speak("Say the page number, or say skip.")
+                        fb.wait(timeout=5)
+                        try:
+                            vtxt, _ = mc.listen()
+                            if vtxt:
+                                skip = set(re.findall(r"[a-z]+", vtxt.lower())) & _SKIP_W
+                                if not skip:
+                                    num = _parse_number(vtxt)
+                                    if num is not None:
+                                        detected_page = num
+                                        fb.speak(f"Page {detected_page}.")
+                                        fb.wait(timeout=3)
+                        except Exception:
+                            pass
+
+                # ── STORE PAGE ────────────────────────────────────────────────
                 if detected_page is not None:
                     key = ("num", detected_page)
                     if key in pages:
@@ -442,24 +707,18 @@ class OCRReader(Feature):
                     "word_count": word_count,
                 }
 
-                if detected_page is not None:
-                    fb.speak(f"Processed. Page {detected_page}. {word_count} words.")
-                else:
-                    fb.speak(f"Processed. No page number found. {word_count} words.")
-
-                # ── NAME SESSION (first scan only) ────────────────────────────
+                # ── NAME SESSION (first scan) ──────────────────────────────────
                 if session_name is None:
-                    fb.wait(timeout=6)   # wait for "Processed..." to finish
+                    fb.wait(timeout=4)
                     if mc_ok:
                         fb.speak("Say a name for this reading session.")
                         fb.wait(timeout=5)
                         try:
                             vtxt, _ = mc.listen()
                             if vtxt:
-                                skip_w = {"skip", "done", "no", "cancel", "default"}
-                                clean  = vtxt.strip()
-                                if not (set(re.findall(r"[a-z]+", clean.lower())) & skip_w):
-                                    session_name = clean
+                                skip = set(re.findall(r"[a-z]+", vtxt.lower())) & _SKIP_W
+                                if not skip:
+                                    session_name = vtxt.strip()
                         except Exception:
                             pass
                     if not session_name:
@@ -467,128 +726,17 @@ class OCRReader(Feature):
                     fb.speak(f"Session: {session_name}. Reading now.")
                     fb.wait(timeout=5)
                 else:
-                    fb.wait(timeout=5)
+                    fb.wait(timeout=4)
                     fb.speak("Reading now.")
+                    fb.wait(timeout=3)
 
-                # ── READING LOOP ──────────────────────────────────────────────
-                # Start with the freshly-scanned page; continue into later pages
-                # in reading order if they were already scanned.
-                current_key = key
-                go_scan     = False   # set True when user says "scan" while paused
-
-                while current_key is not None and not ctx.abort.is_set() and not go_scan:
-                    pdata  = pages[current_key]
-                    chunks = _chunk_text(pdata["text"])
-
-                    if not chunks:
-                        fb.speak("Page appears blank.")
-                        break
-
-                    i               = 0
-                    paused          = False
-                    pause_announced = False
-
-                    while i < len(chunks) and not ctx.abort.is_set():
-
-                        # ── PAUSED ────────────────────────────────────────────
-                        if paused:
-                            if not pause_announced:
-                                fb.speak(
-                                    "Paused. "
-                                    "Say scan to add a page. "
-                                    "Say yes to resume. "
-                                    "Say next for the next page. "
-                                    "Say close to save and exit."
-                                )
-                                pause_announced = True
-                                fb.wait(timeout=8)   # wait for TTS before opening mic
-                                _voice_on()
-
-                            cmd = _get_cmd(ges_timeout=0.4)
-                            if cmd is None:
-                                continue
-                            _voice_off()
-
-                            if cmd in ("PAUSE", "YES", "NO"):
-                                paused = False; pause_announced = False
-                                fb.speak("Resuming.")
-
-                            elif cmd == "SCAN":
-                                paused = False; pause_announced = False
-                                i       = len(chunks)   # stop reading current page
-                                go_scan = True          # signal outer loop to re-scan
-
-                            elif cmd == "NEXT":
-                                fb.silence(); fb.speak("Next page.")
-                                i = len(chunks); paused = False; pause_announced = False
-
-                            elif cmd == "FWD":
-                                skip = min(SKIP_CHUNKS, len(chunks) - i)
-                                i    = min(i + skip, len(chunks))
-                                paused = False; pause_announced = False
-                                fb.speak("Skipped. Resuming.")
-
-                            elif cmd == "BWD":
-                                i = max(0, i - SKIP_CHUNKS)
-                                paused = False; pause_announced = False
-                                fb.speak("Rewound. Resuming.")
-
-                            elif cmd == "CLOSE":
-                                ctx.abort.set()
-
-                            continue
-
-                        # ── READ CHUNK ────────────────────────────────────────
-                        fb.speak(chunks[i])
-                        dur = _chunk_dur(chunks[i])
-                        i  += 1
-
-                        deadline = time.time() + dur
-                        while time.time() < deadline and not ctx.abort.is_set():
-                            g    = _wait_gesture(ctx, timeout=min(0.05,
-                                                                   deadline - time.time()))
-                            gcmd = _GMAP.get(g) if g else None
-
-                            if gcmd == "PAUSE":
-                                paused = True; pause_announced = False
-                                fb.silence(); fb.speak("Paused.")
-                                break
-                            elif gcmd == "FWD":
-                                skip = min(SKIP_CHUNKS, len(chunks) - i)
-                                i    = min(i + skip, len(chunks))
-                                fb.silence(); fb.speak(f"Skipped {skip}.")
-                                break
-                            elif gcmd == "BWD":
-                                i = max(0, i - SKIP_CHUNKS - 1)
-                                fb.silence(); fb.speak("Rewinding.")
-                                break
-                            elif gcmd in ("NEXT", "SCAN"):
-                                fb.silence(); fb.speak("Next page.")
-                                i = len(chunks); break
-                            elif gcmd == "CLOSE":
-                                fb.silence(); ctx.abort.set(); break
-
-                    if go_scan:
-                        break
-
-                    # ── ADVANCE TO NEXT PAGE ──────────────────────────────────
-                    if i >= len(chunks) and not ctx.abort.is_set():
-                        nk = _next_key(pages, current_key)
-                        if nk is not None:
-                            label = _page_label(pages[nk])
-                            fb.speak(f"Page done. Next is {label}. Reading.")
-                            current_key = nk
-                        else:
-                            fb.speak(
-                                "All pages read. "
-                                "Say scan to add more, or close to save and exit."
-                            )
-                            fb.wait(timeout=8)
-                            current_key = None
-
-                # Back to scan-wait (also reached when go_scan=True)
-                if not ctx.abort.is_set():
-                    _voice_on()
+                # ── READ ──────────────────────────────────────────────────────
+                result = _read_pages(key)
+                if result == "close":
+                    break
+                # result == "scan" or "done" → loop back to scan-wait
+                _voice_on()
+                idle_t = time.time() + IDLE_REMIND_S
 
         finally:
             _voice_off()
@@ -601,7 +749,7 @@ class OCRReader(Feature):
                 if missing:
                     labels = ", ".join(str(p) for p in missing[:5])
                     more   = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
-                    fb.speak(f"Warning: pages {labels}{more} were not scanned.")
+                    fb.speak(f"Warning: pages {labels}{more} not scanned.")
 
                 try:
                     path        = _save_session(session_name, pages_list)
