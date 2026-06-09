@@ -157,13 +157,13 @@ def _capture_frame(fb) -> "bytes | None":
     if _ensure_mc_camera(fb):
         jpeg = mc.capture_best_frame_local()
         if jpeg is not None:
-            try:
-                mc.play_cue(mc._CUE_SHOT)   # satisfying camera click
-            except Exception:
-                pass
+            fb.confirm()   # haptic click — no audio conflict with fb.speak
             return jpeg
     # fallback
-    return _capture_jpeg_cv2()
+    jpeg = _capture_jpeg_cv2()
+    if jpeg is not None:
+        fb.confirm()
+    return jpeg
 
 
 # ── text helpers ──────────────────────────────────────────────────────────────
@@ -250,13 +250,8 @@ class OCRReader(Feature):
         fb.speak(
             "Book reader ready. "
             "Say scan or gesture next to capture a page. "
-            "While reading: "
-            "Thumb Ring Pinky back to pause. "
-            "When paused, say yes to add a page or say no to resume. "
-            "Thumb flick right to skip, left to rewind. "
-            "Say close or use close gesture to exit."
+            "Say close to exit."
         )
-        fb.wait(timeout=16)
 
         try:
             # ── outer scan loop ───────────────────────────────────────────
@@ -294,10 +289,10 @@ class OCRReader(Feature):
                     continue
 
                 # ── capture — like money: hold steady, multi-frame, click ──
+                # No fb.wait() here — the 4 s capture window is enough for
+                # the "Capturing now" speech to finish naturally.
                 fb.speak("Hold the page flat and steady. Capturing now.")
-                fb.wait(timeout=6)
-                # mc.capture_best_frame_local() takes ~4 s internally
-                jpeg = _capture_frame(fb)
+                jpeg = _capture_frame(fb)   # ~4 s; haptic click on success
 
                 if jpeg is None:
                     fb.speak(
@@ -358,8 +353,6 @@ class OCRReader(Feature):
                 if not chunks:
                     fb.speak("Page appears blank.")
                     continue
-
-                fb.wait(timeout=6)
 
                 i               = 0
                 paused          = False
