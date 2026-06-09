@@ -833,13 +833,8 @@ class OCRReader(Feature):
                         _srvspeak(ctx, fb, f"Page done. Next is {label}. Reading.")
                         current_key = nk
                     else:
-                        _srvspeak(
-                            ctx, fb,
-                            "All pages read. "
-                            "Say scan to add more pages, "
-                            "or say close to save and exit."
-                        )
-                        fb.wait(timeout=8)
+                        _srvspeak(ctx, fb, "All pages read.")
+                        fb.wait(timeout=3)
                         current_key = None
 
             return "done"
@@ -858,7 +853,14 @@ class OCRReader(Feature):
                 if cmd is None:
                     if time.time() >= idle_t:
                         _voice_off()
-                        _srvspeak(ctx, fb, "Say scan to capture, load a saved session, or close.")
+                        if session_name:
+                            _srvspeak(ctx, fb,
+                                f"Say scan to add a page to {session_name}, "
+                                "load to open a session, or close to save and exit.")
+                        else:
+                            _srvspeak(ctx, fb,
+                                "Say scan to capture a page, "
+                                "load to open a session, or close to exit.")
                         fb.wait(timeout=10)
                         _voice_on()
                         idle_t = time.time() + IDLE_REMIND_S
@@ -897,9 +899,8 @@ class OCRReader(Feature):
                                 if start_key:
                                     if gq: _drain(gq)
                                     result = _read_pages(start_key)
-                                    if result == "close":
+                                    if _after_read(result):
                                         break
-                                    _voice_on()
                                     idle_t = time.time() + IDLE_REMIND_S
                                 continue
                             else:
@@ -1015,17 +1016,16 @@ class OCRReader(Feature):
                     _srvspeak(ctx, fb, f"Session: {session_name}. Reading now.")
                     fb.wait(timeout=5)
                 else:
+                    pg_label = f"Page {detected_page}" if detected_page is not None else "Page"
                     fb.wait(timeout=4)
-                    _srvspeak(ctx, fb, "Reading now.")
-                    fb.wait(timeout=3)
+                    _srvspeak(ctx, fb, f"{pg_label} added to {session_name}. Reading now.")
+                    fb.wait(timeout=4)
 
                 # ── READ ──────────────────────────────────────────────────────
                 if gq: _drain(gq)
                 result = _read_pages(key)
-                if result == "close":
+                if _after_read(result):
                     break
-                # result == "scan" or "done" → loop back to scan-wait
-                _voice_on()
                 idle_t = time.time() + IDLE_REMIND_S
 
         finally:
