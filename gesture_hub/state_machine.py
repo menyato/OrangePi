@@ -373,10 +373,10 @@ class HubStateMachine:
         title = feat.title
         key   = self.registry.gesture_key(feat)
 
-        # Instruction plays non-blocking; sleep gives it time to finish
+        # Wait until the instruction finishes playing so the user hears it fully
         # before the haptic "go" buzz fires.
         self.feedback.speak(f"Recording {title}. Hold still, gesture after buzz.")
-        time.sleep(3.5)
+        self.feedback.wait(timeout=10)
         sample1 = self._capture_sample()
 
         if sample1 is None:
@@ -393,7 +393,7 @@ class HubStateMachine:
         self.feedback.speak(
             f"Got it: {preview.describe()}. Same gesture after buzz."
         )
-        time.sleep(3.0)
+        self.feedback.wait(timeout=10)
         sample2 = self._capture_sample()
 
         if sample2 is None or sample1 != sample2:

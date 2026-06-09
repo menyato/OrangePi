@@ -272,8 +272,16 @@ class Feedback:
         def _monitor(p: "subprocess.Popen", t: str) -> None:
             try:
                 _, err = p.communicate(timeout=60)
-                if p.returncode not in (0, -15, -9):  # -15=SIGTERM, -9=SIGKILL
-                    print(f"[AUDIO] aplay: {err.decode(errors='replace').strip()}")
+                # -15=SIGTERM, -9=SIGKILL (normal kill paths); also
+                # aplay exits with code 1 + "Interrupted system call" when
+                # terminated mid-stream — that is expected, not an error.
+                err_str = err.decode(errors="replace").strip()
+                is_normal_kill = (
+                    p.returncode in (0, -15, -9)
+                    or "Interrupted system call" in err_str
+                )
+                if not is_normal_kill and err_str:
+                    print(f"[AUDIO] aplay: {err_str}")
                     # Fallback to system default device
                     try:
                         subprocess.run(["aplay", "-q", t],
@@ -293,3 +301,16 @@ class Feedback:
                 except OSError: pass
 
         threading.Thread(target=_monitor, args=(proc, tmp), daemon=True).start()
+
+    def wait(self, timeout: float = 12.0) -> None:
+        """Block until current speech finishes or timeout expires.
+
+        Use before recording windows so the instruction is fully heard
+        before the haptic 'go' buzz fires.
+        """
+        time.sleep(0.15)   # give aplay a moment to start
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.is_speaking():
+                return
+            time.sleep(0.05)

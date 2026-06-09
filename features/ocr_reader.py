@@ -45,13 +45,20 @@ CAMERA_INDICES  = [0, 1, 2]    # try these in order until one opens
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _open_camera():
-    """Return an opened cv2.VideoCapture or None."""
+    """Return a working cv2.VideoCapture or None.
+
+    Some V4L2 nodes (metadata, obsensor) report isOpened()=True but can't
+    actually deliver frames.  A test-read verifies the device is real.
+    """
     if not _CV2_OK:
         return None
     for idx in CAMERA_INDICES:
         cap = cv2.VideoCapture(idx)
         if cap.isOpened():
-            return cap
+            ret, _ = cap.read()
+            if ret:
+                return cap
+            cap.release()
     return None
 
 
@@ -148,6 +155,15 @@ class OCRReader(Feature):
         gq  = ctx.gesture_queue
         fb  = ctx.feedback
 
+        # Drain any gestures that fired during feature launch (e.g. bounce
+        # from the same gesture that opened this feature).
+        if gq is not None:
+            while True:
+                try:
+                    gq.get_nowait()
+                except queue.Empty:
+                    break
+
         # Auto-name the session
         self._session_counter += 1
         session_name = f"Reading session {self._session_counter}"
@@ -170,6 +186,7 @@ class OCRReader(Feature):
             "Thumb flick left to skip back. "
             "Next for next page."
         )
+        fb.wait(timeout=12)   # let the full opening announcement play
 
         try:
             # ── outer scan loop ───────────────────────────────────────────
