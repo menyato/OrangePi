@@ -166,8 +166,19 @@ class HubStateMachine:
             self._announce_enroll(feat)
         else:
             self.state = State.ACTIVE
-            feat_list  = ", ".join(f.title for f in self.registry.features)
-            self.feedback.speak(f"Active. Features: {feat_list}. Gesture to open.")
+            # Build a per-feature gesture summary
+            parts = []
+            for f in self.registry.features:
+                key  = self.registry.gesture_key(f)
+                spec = self.store.gestures.get(key)
+                desc = spec.describe() if spec else "no gesture assigned"
+                parts.append(f"{f.title}: {desc}")
+            features_desc = ". ".join(parts)
+            self.feedback.speak(
+                f"Glove on. {features_desc}. "
+                "Say a feature name to ask about its gesture. "
+                "Say stop to turn off."
+            )
 
     def _deactivate(self) -> None:
         self._last_start_ts = time.time()
@@ -264,13 +275,13 @@ class HubStateMachine:
     # ACTIVE state
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _handle_active(self, name: str) -> None:
-        if name == "NEXT":
-            self.feedback.speak("Next scrolls programmable panel. Open it first.")
-            return
+    # System gesture names that are only valid inside a running feature —
+    # silently ignore them in all other states.
+    _FEATURE_ONLY_GESTURES = frozenset({"OCR_PAUSE", "OCR_FWD", "OCR_BWD"})
 
-        if name == "EDIT":
-            self.feedback.speak("Edit is for programmable panel. Open it first.")
+    def _handle_active(self, name: str) -> None:
+        # OCR-only and nav-only gestures have no meaning while idle
+        if name in self._FEATURE_ONLY_GESTURES or name in ("NEXT", "EDIT"):
             return
 
         for feat in self.registry.features:

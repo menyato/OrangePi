@@ -20,6 +20,7 @@ Hardcoded OCR gesture meanings (only active while Book Reader is RUNNING):
   BACK → skip 3 chunks backward  (Thumb + Index, flick left — new system gesture)
 """
 
+import contextlib
 import json
 import os
 import queue
@@ -44,21 +45,46 @@ CAMERA_INDICES  = [0, 1, 2]    # try these in order until one opens
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+@contextlib.contextmanager
+def _suppress_cv2_stderr():
+    """Redirect file-descriptor 2 to /dev/null while OpenCV probes devices.
+
+    V4L2 codec nodes and obsensor plugins spam the terminal with harmless
+    'Not a video capture device' / 'Camera index out of range' errors even
+    when they are correctly rejected.  Suppressing at the C-level fd avoids
+    polluting the log without touching Python's sys.stderr.
+    """
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved   = os.dup(2)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
 def _open_camera():
     """Return a working cv2.VideoCapture or None.
 
-    Some V4L2 nodes (metadata, obsensor) report isOpened()=True but can't
-    actually deliver frames.  A test-read verifies the device is real.
+    Probes each index with the V4L2 backend only.  A test-read that returns
+    a non-empty, non-zero frame confirms the device is a real camera.
+    Hardware encoder/codec nodes typically return all-zero frames or fail
+    the read entirely.
     """
     if not _CV2_OK:
         return None
+    backend = getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)
     for idx in CAMERA_INDICES:
-        cap = cv2.VideoCapture(idx)
-        if cap.isOpened():
-            ret, _ = cap.read()
-            if ret:
-                return cap
-            cap.release()
+        with _suppress_cv2_stderr():
+            cap = cv2.VideoCapture(idx, backend)
+        if not cap.isOpened():
+            continue
+        ret, frame = cap.read()
+        if ret and frame is not None and frame.size > 0 and frame.max() > 0:
+            return cap
+        cap.release()
     return None
 
 
