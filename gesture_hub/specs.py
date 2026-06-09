@@ -19,8 +19,8 @@ Motion:
 
 System gestures (hardcoded, never user-assignable):
     START     : Thumb+Pinky          0x11  tilt_right     STATIC  exact
-    NEXT      : Thumb+Ring           0x09  tilt_backward  FLICK   exact
-    EDIT      : Thumb+Middle         0x05  tilt_forward   FLICK   exact
+    NEXT      : Pinky only           0x10  tilt_right     FLICK   exact
+    EDIT      : Thumb+Middle         0x05  (any tilt)     STATIC  exact
 
 Book-reader OCR gestures (only acted on while Book Reader is RUNNING):
     OCR_PAUSE : Thumb+Ring+Pinky     0x19  tilt_backward  STATIC  exact
@@ -109,10 +109,12 @@ DEFAULT_GESTURES: dict[str, GestureSpec] = {
     # ── global navigation ─────────────────────────────────────────────────────
     "START": GestureSpec("START", flex_mask=0x11, imu_mask=0x01,
                          motion=Motion.STATIC, hold_frames=3, flex_exact=True),
-    "NEXT":  GestureSpec("NEXT",  flex_mask=0x09, imu_mask=0x08,
+    # Pinky only, flick wrist right — scroll / next
+    "NEXT":  GestureSpec("NEXT",  flex_mask=0x10, imu_mask=0x01,
                          motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
-    "EDIT":  GestureSpec("EDIT",  flex_mask=0x05, imu_mask=0x04,
-                         motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
+    # Thumb + Middle only, hold in any position — edit / change gesture
+    "EDIT":  GestureSpec("EDIT",  flex_mask=0x05, imu_mask=0x00,
+                         motion=Motion.STATIC, hold_frames=3, flex_exact=True),
 
     # ── Book Reader playback controls (only acted on inside OCR feature) ──────
     # Pause/resume: Thumb + Ring + Pinky closed, tilt wrist backward, hold.

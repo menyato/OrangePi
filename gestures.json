@@ -10,21 +10,21 @@
   },
   "NEXT": {
     "name": "NEXT",
-    "flex_mask": 9,
-    "imu_mask": 8,
+    "flex_mask": 16,
+    "imu_mask": 1,
     "motion": "flick",
     "hold_frames": 2,
     "flex_exact": true,
-    "_desc": "Thumb + Ring, flick backward"
+    "_desc": "Pinky only, flick right — scroll / next"
   },
   "EDIT": {
     "name": "EDIT",
     "flex_mask": 5,
-    "imu_mask": 4,
-    "motion": "flick",
-    "hold_frames": 2,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
     "flex_exact": true,
-    "_desc": "Thumb + Middle, flick forward"
+    "_desc": "Thumb + Middle only, hold any position — edit / change gesture"
   },
   "OCR_PAUSE": {
     "name": "OCR_PAUSE",
