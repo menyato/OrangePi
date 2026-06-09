@@ -81,6 +81,7 @@ def _ensure_mc(fb) -> bool:
     with _mc_lock:
         if _mc_ready:
             return True
+        # Money recognition may have already loaded everything (vad + Whisper)
         try:
             from features.money_recognition import MoneyRecognition
             if MoneyRecognition._models_ready:
@@ -88,9 +89,16 @@ def _ensure_mc(fb) -> bool:
                 return True
         except (ImportError, AttributeError):
             pass
+        # Full init: init_cues → auto_detect_all → load_models (sets vad + Whisper)
+        # load_models downloads ~150 MB on first run — warn the user
         try:
             mc.init_cues()
             mc.auto_detect_all()
+            fb.speak(
+                "Loading voice model. "
+                "This takes about one minute on first use. Please wait."
+            )
+            mc.load_models()   # initialises vad (webrtcvad) + Whisper
             _mc_ready = True
             return True
         except Exception as e:
