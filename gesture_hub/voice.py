@@ -37,6 +37,19 @@ _COMMAND_MAP = {
     "modify":  "EDIT",
     "start":   "START",
     "stop":    "START",
+    # book reader — scan a page / close the feature
+    "scan":    "OCR_SCAN",
+    "capture": "OCR_SCAN",
+    "take":    "OCR_SCAN",
+    "close":   "OCR_CLOSE",
+    # programmable gesture-recording confirmation
+    # also used in book reader pause: yes = add a page, no = resume
+    "confirm": "PROG_CONFIRM",
+    "yes":     "PROG_CONFIRM",
+    "save":    "PROG_CONFIRM",
+    "discard": "PROG_DISCARD",
+    "cancel":  "PROG_DISCARD",
+    "no":      "PROG_DISCARD",
 }
 
 _QUERY_TRIGGERS = {"gesture", "move", "how", "what"}

@@ -72,6 +72,11 @@ class HubStateMachine:
         # Set in _launch_feature(), cleared in finally.
         self._feature_gesture_q = None
 
+        # Used by _wait_prog_confirm() to receive voice PROG_CONFIRM/PROG_DISCARD
+        # from the VoiceListener thread while the main thread blocks on confirmation.
+        self._prog_confirm_q    = queue.Queue()
+        self._prog_confirm_mode = False
+
     # ═══════════════════════════════════════════════════════════════════════
     # Frame routing  (RX thread)
     # ═══════════════════════════════════════════════════════════════════════
@@ -393,8 +398,13 @@ class HubStateMachine:
         title = feat.title
         key   = self.registry.gesture_key(feat)
 
-        # Wait until the instruction finishes playing so the user hears it fully
-        # before the haptic "go" buzz fires.
+        if in_programmable:
+            self._record_prog_gesture(feat, key, title)
+        else:
+            self._record_enroll_gesture(feat, key, title)
+
+    def _record_enroll_gesture(self, feat, key: str, title: str) -> None:
+        """Enrollment flow: instruction → sample1 → preview → sample2 must match."""
         self.feedback.speak(f"Recording {title}. Hold still, gesture after buzz.")
         self.feedback.wait(timeout=10)
         sample1 = self._capture_sample()
@@ -402,27 +412,64 @@ class HubStateMachine:
         if sample1 is None:
             self.feedback.error()
             self.feedback.speak("Nothing detected. Try again.")
-            if not in_programmable:
-                self._announce_enroll(feat)
-            else:
-                self._announce_prog_feature(feat)
+            self._announce_enroll(feat)
             return
 
         preview = self.recorder.build_spec("preview", sample1)
         self.feedback.confirm()
-        self.feedback.speak(
-            f"Got it: {preview.describe()}. Same gesture after buzz."
-        )
+        self.feedback.speak(f"Got it: {preview.describe()}. Same gesture after buzz.")
         self.feedback.wait(timeout=10)
         sample2 = self._capture_sample()
 
         if sample2 is None or sample1 != sample2:
             self.feedback.error()
             self.feedback.speak("No match. Try again.")
-            if not in_programmable:
-                self._announce_enroll(feat)
-            else:
-                self._announce_prog_feature(feat)
+            self._announce_enroll(feat)
+            return
+
+        spec = self.recorder.build_spec(key, sample1)
+        self.store.set(key, spec)
+        self.store.save()
+        self.engine.set_gestures(self.store.gestures)
+        self.feedback.select()
+        self.feedback.speak(f"Saved for {title}: {spec.describe()}.")
+        self._advance_enroll()
+
+    def _record_prog_gesture(self, feat, key: str, title: str) -> None:
+        """Programmable flow:
+        timer → capture → announce → voice-or-gesture×2 confirm → save → next feature.
+        """
+        # Timer: tell the user to prepare, then a short silent pause before buzz
+        self.feedback.speak(
+            f"Recording {title}. Prepare your move. Buzz in 3 seconds."
+        )
+        self.feedback.wait(timeout=12)
+        time.sleep(2.5)   # silent countdown
+
+        sample1 = self._capture_sample()
+
+        if sample1 is None:
+            self.feedback.error()
+            self.feedback.speak("Nothing detected. Edit to try again.")
+            self._announce_prog_feature(feat)
+            return
+
+        preview = self.recorder.build_spec("preview", sample1)
+        desc    = preview.describe()
+
+        self.feedback.confirm()
+        self.feedback.speak(
+            f"Got: {desc}. "
+            "Say confirm to save, discard to cancel. "
+            "Or do the move twice after the buzzes."
+        )
+        self.feedback.wait(timeout=12)
+
+        confirmed = self._wait_prog_confirm(sample1)
+
+        if not confirmed:
+            self.feedback.speak("Discarded. Edit to try again.")
+            self._announce_prog_feature(feat)
             return
 
         spec = self.recorder.build_spec(key, sample1)
@@ -431,12 +478,98 @@ class HubStateMachine:
         self.engine.set_gestures(self.store.gestures)
 
         self.feedback.select()
-        self.feedback.speak(f"Saved for {title}: {spec.describe()}.")
+        self.feedback.speak(f"Saved: {spec.describe()}.")
+        # Auto-advance to next feature after saving
+        self.registry.advance()
+        self._announce_prog_feature(self.registry.current)
 
-        if not in_programmable:
-            self._advance_enroll()
-        else:
-            self._announce_prog_feature(feat)
+    def _wait_prog_confirm(self, sample1) -> bool:
+        """Block until the user confirms (voice or gesture×2) or discards.
+
+        Voice path  — say 'confirm'/'yes'/'save' or 'discard'/'cancel'/'no'.
+        Gesture path — do the same move twice in a row, once per buzz.
+        Returns True if confirmed, False if discarded/timed-out.
+        """
+        self._prog_confirm_mode = True
+        # Drain any stale voice responses
+        try:
+            while True: self._prog_confirm_q.get_nowait()
+        except queue.Empty:
+            pass
+
+        try:
+            deadline  = time.time() + 30
+            first_try = True
+
+            while time.time() < deadline:
+                # Non-blocking voice check (user may have replied during the speech)
+                try:
+                    resp = self._prog_confirm_q.get_nowait()
+                    return resp == "PROG_CONFIRM"
+                except queue.Empty:
+                    pass
+
+                if not first_try:
+                    self.feedback.speak(
+                        "Do it twice, or say confirm or discard."
+                    )
+                    self.feedback.wait(timeout=8)
+                    # Voice check after re-prompt
+                    try:
+                        resp = self._prog_confirm_q.get_nowait()
+                        return resp == "PROG_CONFIRM"
+                    except queue.Empty:
+                        pass
+
+                first_try = False
+
+                # ── First repetition ─────────────────────────────────────
+                s2 = self._capture_sample()
+
+                try:
+                    resp = self._prog_confirm_q.get_nowait()
+                    return resp == "PROG_CONFIRM"
+                except queue.Empty:
+                    pass
+
+                if s2 is None or s2 != sample1:
+                    self.feedback.error()
+                    self.feedback.speak("Different move.")
+                    self.feedback.wait(timeout=3)
+                    continue
+
+                # ── Second repetition ────────────────────────────────────
+                self.feedback.confirm()
+                self.feedback.speak("One more.")
+                self.feedback.wait(timeout=4)
+
+                try:
+                    resp = self._prog_confirm_q.get_nowait()
+                    return resp == "PROG_CONFIRM"
+                except queue.Empty:
+                    pass
+
+                s3 = self._capture_sample()
+
+                try:
+                    resp = self._prog_confirm_q.get_nowait()
+                    return resp == "PROG_CONFIRM"
+                except queue.Empty:
+                    pass
+
+                if s3 is not None and s3 == sample1:
+                    return True
+
+                self.feedback.error()
+                self.feedback.speak("Second didn't match.")
+                self.feedback.wait(timeout=3)
+
+            # Timed out (30 s)
+            self.feedback.speak("Timed out. Edit to try again.")
+            return False
+
+        finally:
+            self._prog_confirm_mode = False
 
     def _capture_sample(self):
         self.recorder.reset()
@@ -465,9 +598,13 @@ class HubStateMachine:
 
     def on_voice(self, cmd: str) -> None:
         """Called from VoiceListener thread. Queries answered immediately;
+        PROG_CONFIRM/PROG_DISCARD go to the confirmation queue when active;
         all other voice commands are injected as gestures via dispatch()."""
         if cmd.startswith("QUERY:"):
             self._handle_query(cmd[6:])
+            return
+        if cmd in ("PROG_CONFIRM", "PROG_DISCARD") and self._prog_confirm_mode:
+            self._prog_confirm_q.put(cmd)
             return
         self.dispatch(cmd)
 
