@@ -11,17 +11,25 @@ imu_mask   — which bits in SensorFrame.imu_bits must be SET
 
 flex_exact — if True the flex match is EXACT: frame.flex_bits == flex_mask.
              If False (default) it is a SUBSET match: extra bent fingers are
-             allowed.  System gesture START uses exact=True so a fist (all
-             fingers bent) does NOT accidentally trigger it.
+             allowed.
 
 Motion:
     STATIC  — both masks must match and HOLD for `hold_frames` frames.
     FLICK   — imu_mask bits must RISE (0→set) while flex matches.
 
 System gestures (hardcoded, never user-assignable):
-    START : Thumb(0) + Pinky(4)   flex=0x11  imu=0x01  STATIC  exact=True
-    NEXT  : Thumb(0) + Ring(3)    flex=0x09  imu=0x08  FLICK
-    EDIT  : Thumb(0) + Middle(2)  flex=0x05  imu=0x04  FLICK
+    START     : Thumb+Pinky          0x11  tilt_right     STATIC  exact
+    NEXT      : Thumb+Ring           0x09  tilt_backward  FLICK   exact
+    EDIT      : Thumb+Middle         0x05  tilt_forward   FLICK   exact
+
+Book-reader OCR gestures (only acted on while Book Reader is RUNNING):
+    OCR_PAUSE : Thumb+Ring+Pinky     0x19  tilt_backward  STATIC  exact
+    OCR_FWD   : Thumb only           0x01  tilt_right     FLICK   exact
+    OCR_BWD   : Thumb only           0x01  tilt_left      FLICK   exact
+
+All system gestures use flex_exact=True so that extra bent fingers never
+accidentally trigger them.  OCR_PAUSE (0x19) is distinct from NEXT (0x09)
+because NEXT requires exactly Thumb+Ring; adding Pinky changes the byte.
 """
 
 from dataclasses import dataclass, field
@@ -98,15 +106,22 @@ class GestureSpec:
 #   not a full fist or any other superset of those two fingers.
 
 DEFAULT_GESTURES: dict[str, GestureSpec] = {
+    # ── global navigation ─────────────────────────────────────────────────────
     "START": GestureSpec("START", flex_mask=0x11, imu_mask=0x01,
-                         motion=Motion.STATIC, hold_frames=3,
-                         flex_exact=True),   # ← exact: only Thumb+Pinky
+                         motion=Motion.STATIC, hold_frames=3, flex_exact=True),
     "NEXT":  GestureSpec("NEXT",  flex_mask=0x09, imu_mask=0x08,
-                         motion=Motion.FLICK,  hold_frames=2),
+                         motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
     "EDIT":  GestureSpec("EDIT",  flex_mask=0x05, imu_mask=0x04,
-                         motion=Motion.FLICK,  hold_frames=2),
-    # BACK: Thumb + Index, flick tilt_left.
-    # Only used inside Book Reader for "skip backward"; ignored everywhere else.
-    "BACK":  GestureSpec("BACK",  flex_mask=0x03, imu_mask=0x02,
-                         motion=Motion.FLICK,  hold_frames=2),
+                         motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
+
+    # ── Book Reader playback controls (only acted on inside OCR feature) ──────
+    # Pause/resume: Thumb + Ring + Pinky closed, tilt wrist backward, hold.
+    "OCR_PAUSE": GestureSpec("OCR_PAUSE", flex_mask=0x19, imu_mask=0x08,
+                             motion=Motion.STATIC, hold_frames=3, flex_exact=True),
+    # Skip forward ~5 s: Thumb only, flick wrist right.
+    "OCR_FWD":   GestureSpec("OCR_FWD",   flex_mask=0x01, imu_mask=0x01,
+                             motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
+    # Skip backward ~5 s: Thumb only, flick wrist left.
+    "OCR_BWD":   GestureSpec("OCR_BWD",   flex_mask=0x01, imu_mask=0x02,
+                             motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
 }

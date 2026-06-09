@@ -36,8 +36,17 @@ class GestureStore:
                 data = json.load(f)
             loaded = {name: GestureSpec.from_dict(d) for name, d in data.items()}
             if loaded:
-                self.gestures = loaded
-                print(f"[STORE] Loaded {len(loaded)} gestures from {self.path}")
+                # System gestures always come from the current DEFAULT_GESTURES so
+                # renamed / replaced gestures (e.g. BACK → OCR_BWD) never survive
+                # from an old JSON file.  User feature assignments (FEAT:*) come
+                # from the file.
+                merged = dict(DEFAULT_GESTURES)
+                for name, spec in loaded.items():
+                    if name not in DEFAULT_GESTURES:
+                        merged[name] = spec
+                self.gestures = merged
+                print(f"[STORE] Loaded {len(merged)} gestures from {self.path} "
+                      f"({len(merged) - len(DEFAULT_GESTURES)} user-assigned)")
         except Exception as e:
             print(f"[STORE] Load failed ({e}); keeping defaults.")
 

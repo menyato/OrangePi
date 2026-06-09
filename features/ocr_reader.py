@@ -162,10 +162,13 @@ class OCRReader(Feature):
 
         fb.speak(
             "Book reader. "
-            "Hold page flat to camera, filling the frame. "
+            "Hold page flat to camera. "
             "Next to capture. "
-            "Edit to pause when reading. "
-            "Back — Thumb and Index flick left — to rewind."
+            "Edit to rename session. "
+            "While reading: Thumb Ring Pinky tilt back to pause. "
+            "Thumb flick right to skip forward. "
+            "Thumb flick left to skip back. "
+            "Next for next page."
         )
 
         try:
@@ -184,10 +187,13 @@ class OCRReader(Feature):
                     continue
 
                 if g == "EDIT":
-                    # EDIT at top level = cycle session name
                     self._session_counter += 1
                     session_name = f"Reading session {self._session_counter}"
-                    fb.speak(f"Session renamed to: {session_name}. Next to capture.")
+                    fb.speak(f"Session: {session_name}. Next to capture.")
+                    continue
+
+                if g in ("OCR_PAUSE", "OCR_FWD", "OCR_BWD"):
+                    fb.speak("Not reading yet. Next to capture first.")
                     continue
 
                 if g != "NEXT":
@@ -244,10 +250,12 @@ class OCRReader(Feature):
                     continue
 
                 fb.speak(
-                    f"Reading. {len(chunks)} chunks. "
-                    "Edit to pause, Next to skip forward, Back to rewind."
+                    f"Reading page. "
+                    "Thumb Ring Pinky back to pause. "
+                    "Thumb right to skip, Thumb left to rewind. "
+                    "Next for next page."
                 )
-                time.sleep(2.0)   # let the instruction play before first chunk
+                time.sleep(2.5)
 
                 i       = 0
                 paused  = False
@@ -257,21 +265,25 @@ class OCRReader(Feature):
                     if paused:
                         fb.silence()
                         g2 = _wait_for_gesture(ctx, timeout=30)
-                        if g2 == "EDIT":
+                        if g2 == "OCR_PAUSE":
                             paused = False
                             fb.speak("Resuming.")
                             time.sleep(0.8)
                         elif g2 == "NEXT":
-                            # NEXT while paused → leave reading loop, scan next page
                             fb.silence()
                             fb.speak("Next page. Hold page to camera. Next to capture.")
                             break
-                        # BACK while paused → say where we are
-                        elif g2 == "BACK":
+                        elif g2 == "OCR_BWD":
                             i = max(0, i - SKIP_CHUNKS)
                             paused = False
-                            fb.speak(f"Going back. Resuming from chunk {i + 1}.")
-                            time.sleep(1.0)
+                            fb.speak(f"Rewound to chunk {i + 1}. Resuming.")
+                            time.sleep(0.8)
+                        elif g2 == "OCR_FWD":
+                            skip = min(SKIP_CHUNKS, len(chunks) - i)
+                            i = min(i + skip, len(chunks))
+                            paused = False
+                            fb.speak(f"Skipped {skip}. Resuming.")
+                            time.sleep(0.8)
                         continue
 
                     # Speak chunk
@@ -283,23 +295,28 @@ class OCRReader(Feature):
                     deadline = time.time() + wait
                     handled  = False
                     while time.time() < deadline and not ctx.abort.is_set() and not handled:
-                        g2 = _wait_for_gesture(ctx, timeout=min(0.05,
-                                               deadline - time.time()))
-                        if g2 == "EDIT":
+                        g2 = _wait_for_gesture(ctx,
+                                               timeout=min(0.05, deadline - time.time()))
+                        if g2 == "OCR_PAUSE":
                             paused = True
                             fb.silence()
-                            fb.speak("Paused. Edit to resume, Next for next page.")
+                            fb.speak("Paused. Same gesture to resume.")
                             handled = True
-                        elif g2 == "NEXT":
+                        elif g2 == "OCR_FWD":
                             skip = min(SKIP_CHUNKS, len(chunks) - i)
                             i = min(i + skip, len(chunks))
                             fb.silence()
                             fb.speak(f"Skipped {skip}.")
                             handled = True
-                        elif g2 == "BACK":
+                        elif g2 == "OCR_BWD":
                             i = max(0, i - SKIP_CHUNKS - 1)
                             fb.silence()
-                            fb.speak("Going back.")
+                            fb.speak("Rewinding.")
+                            handled = True
+                        elif g2 == "NEXT":
+                            fb.silence()
+                            fb.speak("Next page. Hold page to camera. Next to capture.")
+                            i = len(chunks)  # break out of reading loop
                             handled = True
 
                 # Reading finished (or user broke out)
