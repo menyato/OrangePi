@@ -18,6 +18,7 @@ States
 """
 
 import queue
+import re
 import threading
 import time
 from enum import Enum, auto
@@ -437,3 +438,44 @@ class HubStateMachine:
                 self._queue.get_nowait()
         except queue.Empty:
             pass
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Voice commands  (VoiceListener background thread)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def on_voice(self, cmd: str) -> None:
+        """Called from VoiceListener thread. Queries answered immediately;
+        all other voice commands are injected as gestures via dispatch()."""
+        if cmd.startswith("QUERY:"):
+            self._handle_query(cmd[6:])
+            return
+        self.dispatch(cmd)
+
+    def _handle_query(self, text: str) -> None:
+        """Speak the gesture assigned to whichever feature best matches text.
+
+        Example utterances:
+          "what is the gesture for money"
+          "what is the move for book reader"
+          "how do I use programmable"
+        """
+        words = set(re.findall(r"[a-z]+", text.lower()))
+        # Score each feature by title-word overlap with the spoken query
+        best_feat, best_score = None, 0
+        for feat in self.registry.features:
+            title_words = set(re.findall(r"[a-z]+", feat.title.lower()))
+            score = len(title_words & words)
+            if score > best_score:
+                best_feat, best_score = feat, score
+
+        if best_feat is None or best_score == 0:
+            names = ", ".join(f.title for f in self.registry.features)
+            self.feedback.speak(f"Available features: {names}.")
+            return
+
+        key  = self.registry.gesture_key(best_feat)
+        spec = self.store.gestures.get(key)
+        if spec is None:
+            self.feedback.speak(f"{best_feat.title} has no gesture assigned yet.")
+        else:
+            self.feedback.speak(f"{best_feat.title}: {spec.describe()}.")

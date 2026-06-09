@@ -51,6 +51,7 @@ from gesture_hub.recorder      import GestureRecorder
 from gesture_hub.registry      import FeatureRegistry
 from gesture_hub.feedback      import Feedback
 from gesture_hub.state_machine import HubStateMachine
+from gesture_hub.voice         import VoiceListener
 from gesture_hub               import diagnostics
 from net.client                import ServerLink
 
@@ -130,6 +131,8 @@ def main() -> None:
                     help="Run per-hand flex calibration, save it, then run normally.")
     ap.add_argument("--threshold", type=int, default=None,
                     help="Override firmware bend threshold percent (10-90).")
+    ap.add_argument("--no-voice", action="store_true",
+                    help="Disable voice commands (useful if no microphone).")
     args = ap.parse_args()
 
     # ── Load gesture store + calibration store ─────────────────────────────
@@ -228,6 +231,10 @@ def main() -> None:
 
     link.connect()   # best-effort; features reconnect on demand
 
+    voice = VoiceListener(on_command=sm.on_voice)
+    if not args.no_voice:
+        voice.start()
+
     _probe_devices(feedback, link)
 
     print("[HUB] Running. Ctrl-C to quit.")
@@ -236,6 +243,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[HUB] Shutting down...")
     finally:
+        voice.stop()
         sm.stop()
         controller.stop()
         link.close()
