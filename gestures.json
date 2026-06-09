@@ -5,7 +5,8 @@
     "imu_mask": 1,
     "motion": "static",
     "hold_frames": 3,
-    "_comment": "Thumb(bit0)+Pinky(bit4)=0x11=17, tilt_right=bit0=0x01=1, hold 3 frames"
+    "flex_exact": true,
+    "_desc": "Thumb + Pinky, hold tilt right"
   },
   "NEXT": {
     "name": "NEXT",
@@ -13,7 +14,8 @@
     "imu_mask": 8,
     "motion": "flick",
     "hold_frames": 2,
-    "_comment": "Thumb(bit0)+Ring(bit3)=0x09=9, tilt_backward=bit3=0x08=8, flick"
+    "flex_exact": true,
+    "_desc": "Thumb + Ring, flick backward"
   },
   "EDIT": {
     "name": "EDIT",
@@ -21,6 +23,34 @@
     "imu_mask": 4,
     "motion": "flick",
     "hold_frames": 2,
-    "_comment": "Thumb(bit0)+Middle(bit2)=0x05=5, tilt_forward=bit2=0x04=4, flick"
+    "flex_exact": true,
+    "_desc": "Thumb + Middle, flick forward"
+  },
+  "OCR_PAUSE": {
+    "name": "OCR_PAUSE",
+    "flex_mask": 25,
+    "imu_mask": 8,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Thumb + Ring + Pinky, hold tilt backward — pause / resume reading"
+  },
+  "OCR_FWD": {
+    "name": "OCR_FWD",
+    "flex_mask": 1,
+    "imu_mask": 1,
+    "motion": "flick",
+    "hold_frames": 2,
+    "flex_exact": true,
+    "_desc": "Thumb only, flick right — skip forward"
+  },
+  "OCR_BWD": {
+    "name": "OCR_BWD",
+    "flex_mask": 1,
+    "imu_mask": 2,
+    "motion": "flick",
+    "hold_frames": 2,
+    "flex_exact": true,
+    "_desc": "Thumb only, flick left — skip backward / rewind"
   }
 }

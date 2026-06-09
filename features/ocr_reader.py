@@ -205,14 +205,15 @@ class OCRReader(Feature):
         fb.speak(
             "Book reader. "
             "Hold page flat to camera. "
-            "Next to capture. "
-            "Edit to rename session. "
-            "While reading: Thumb Ring Pinky tilt back to pause. "
+            "Next to scan. "
+            "While reading: "
+            "Thumb Ring Pinky tilt back to pause or resume. "
             "Thumb flick right to skip forward. "
-            "Thumb flick left to skip back. "
-            "Next for next page."
+            "Thumb flick left to rewind. "
+            "Next for next page. "
+            "Edit to rename session."
         )
-        fb.wait(timeout=12)   # let the full opening announcement play
+        fb.wait(timeout=14)   # let the full opening announcement play
 
         try:
             # ── outer scan loop ───────────────────────────────────────────
@@ -240,11 +241,12 @@ class OCRReader(Feature):
                     continue
 
                 if g != "NEXT":
-                    fb.speak("Next to capture page.")
+                    fb.speak("Next to scan page.")
                     continue
 
                 # ── capture ───────────────────────────────────────────────
-                fb.speak("Capturing.")
+                fb.confirm()   # haptic + TTS together, same as money recognition
+                fb.speak("Scanning.")
                 jpeg = _capture_jpeg(cap)
                 if jpeg is None:
                     fb.speak("Camera error. Try again.")

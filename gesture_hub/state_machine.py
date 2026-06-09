@@ -320,13 +320,22 @@ class HubStateMachine:
             self._record_feature_gesture(feat, in_programmable=True)
             return
 
-        self.feedback.speak("Close programmable panel first to use features.")
+        # Silently ignore any gesture that doesn't belong in programmable mode.
 
-    def _announce_prog_feature(self, feat) -> None:
+    def _announce_prog_feature(self, feat, opening: bool = False) -> None:
         key  = self.registry.gesture_key(feat)
         spec = self.store.gestures.get(key)
-        desc = spec.describe() if spec else "no gesture assigned"
-        self.feedback.speak(f"{feat.title}: {desc}. Edit to change.")
+        if spec:
+            desc    = spec.describe()
+            detail  = f"{feat.title}: {desc}. Edit to change."
+        else:
+            detail  = f"{feat.title}: not recorded yet. Edit to record."
+        if opening:
+            self.feedback.speak(
+                f"Programmable. {detail} Next to scroll. Same gesture to close."
+            )
+        else:
+            self.feedback.speak(detail)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Launching a feature
@@ -341,10 +350,10 @@ class HubStateMachine:
         if isinstance(feat, ProgrammableGestures):
             self.state = State.PROGRAMMABLE
             self.feedback.select()
-            self.feedback.speak(
-                "Programmable open. Next scrolls, edit changes, same gesture closes."
-            )
-            self._announce_prog_feature(self.registry.current)
+            # Drain any bounce gestures from the opening gesture before PROGRAMMABLE
+            # state starts processing — otherwise rapid NEXT fires skip features.
+            self._drain_queue()
+            self._announce_prog_feature(self.registry.current, opening=True)
             return
 
         self.feedback.select()

@@ -47,6 +47,12 @@ class GestureStore:
                 self.gestures = merged
                 print(f"[STORE] Loaded {len(merged)} gestures from {self.path} "
                       f"({len(merged) - len(DEFAULT_GESTURES)} user-assigned)")
+                # If the file was missing any system gesture keys (e.g. newly
+                # added OCR_PAUSE/FWD/BWD), rewrite so the file stays up to date.
+                new_sys_keys = set(DEFAULT_GESTURES) - set(loaded)
+                if new_sys_keys:
+                    print(f"[STORE] New system gestures {new_sys_keys} — updating file.")
+                    self.save()
         except Exception as e:
             print(f"[STORE] Load failed ({e}); keeping defaults.")
 
