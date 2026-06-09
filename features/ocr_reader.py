@@ -39,6 +39,8 @@ import json
 import os
 import queue
 import re
+import subprocess
+import tempfile
 import threading
 import time
 
@@ -71,12 +73,14 @@ def _srvspeak(ctx, fb, text: str) -> None:
 
     Sends {"feature": "tts", "text": text} to the server, receives
     {"audio": base64_wav} back, and plays the WAV via fb.play_raw().
-    Falls back to local espeak-ng (fb.speak) if server is unavailable
-    or returns no audio.
+    Falls back to local espeak-ng (fb.speak) if:
+      - server is unreachable
+      - server returns no audio
+      - server returns an error response (resp["ok"] is not True)
     """
     try:
         resp = ctx.link.send("tts", {"text": text})
-        if resp and resp.get("audio"):
+        if resp and resp.get("ok") and resp.get("audio"):
             fb.play_raw(base64.b64decode(resp["audio"]))
             return
     except Exception as e:
@@ -239,6 +243,7 @@ def _classify(text: str) -> "str | None":
 def _voice_worker(abort: threading.Event,
                   voice_q: queue.Queue,
                   stop_ev: threading.Event) -> None:
+    """Fallback voice worker using mc.listen() (used when arecord unavailable)."""
     while not stop_ev.is_set() and not abort.is_set():
         try:
             text, _ = mc.listen()
@@ -252,11 +257,111 @@ def _voice_worker(abort: threading.Event,
         if cmd:
             print(f"[OCR] voice: {text!r} → {cmd}")
             voice_q.put(cmd)
-            # Yield briefly — gives the main thread time to call _voice_off()
-            # BEFORE the loop checks stop_ev and starts another mc.listen().
-            # Without this 150 ms gap the voice thread races back into
-            # mc.listen() holding sounddevice open while aplay tries to start.
             stop_ev.wait(timeout=0.15)
+        else:
+            print(f"[OCR] voice: {text!r} → (unrecognised)")
+
+
+def _voice_worker_v2(abort: threading.Event,
+                     voice_q: queue.Queue,
+                     stop_ev: threading.Event,
+                     proc_ref: list,
+                     fb_ref) -> None:
+    """Interruptible voice worker using arecord subprocess.
+
+    _voice_off() calls proc.terminate() + wait(), releasing the ALSA input
+    device immediately so aplay can start without 'Device unavailable' errors.
+    Falls back to mc.listen() if arecord is not installed.
+    """
+    alsa_in = getattr(mc, "ALSA_OUTPUT_DEVICE", None) or "default"
+    wm      = getattr(mc, "whisper_model", None)
+    if wm is None:
+        _voice_worker(abort, voice_q, stop_ev)
+        return
+
+    while not stop_ev.is_set() and not abort.is_set():
+        # Don't open the mic while TTS audio is playing — prevents ALSA conflict
+        while fb_ref.is_speaking() and not stop_ev.is_set():
+            time.sleep(0.05)
+        if stop_ev.is_set():
+            break
+        time.sleep(0.1)   # small gap for ALSA to fully release after aplay
+        if stop_ev.is_set():
+            break
+
+        try:
+            fd, wav_tmp = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+        except Exception as e:
+            print(f"[OCR] tmpfile: {e}")
+            time.sleep(0.5)
+            continue
+
+        try:
+            proc = subprocess.Popen(
+                ["arecord", "-D", alsa_in, "-f", "S16_LE",
+                 "-r", "16000", "-c", "1", "-d", "4", "-q", wav_tmp],
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            print("[OCR] arecord not found — falling back to mc.listen()")
+            try: os.unlink(wav_tmp)
+            except OSError: pass
+            _voice_worker(abort, voice_q, stop_ev)
+            return
+        except Exception as e:
+            print(f"[OCR] arecord start: {e}")
+            try: os.unlink(wav_tmp)
+            except OSError: pass
+            time.sleep(0.5)
+            continue
+
+        proc_ref[0] = proc
+
+        # Poll 50 ms at a time so stop_ev kills the recording immediately
+        while proc.poll() is None:
+            if stop_ev.is_set() or abort.is_set():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait()
+                except Exception:
+                    pass
+                proc_ref[0] = None
+                try: os.unlink(wav_tmp)
+                except OSError: pass
+                return
+            time.sleep(0.05)
+
+        proc_ref[0] = None
+
+        if stop_ev.is_set() or abort.is_set():
+            try: os.unlink(wav_tmp)
+            except OSError: pass
+            break
+
+        # Transcribe with VAD filter so silence clips return ""
+        text = ""
+        try:
+            segs, _ = wm.transcribe(
+                wav_tmp, language="en", beam_size=5, vad_filter=True
+            )
+            text = " ".join(s.text for s in segs).strip()
+        except Exception as e:
+            print(f"[OCR] transcribe: {e}")
+        finally:
+            try: os.unlink(wav_tmp)
+            except OSError: pass
+
+        if not text or stop_ev.is_set():
+            continue
+
+        cmd = _classify(text)
+        if cmd:
+            print(f"[OCR] voice: {text!r} → {cmd}")
+            voice_q.put(cmd)
+            stop_ev.wait(0.15)
         else:
             print(f"[OCR] voice: {text!r} → (unrecognised)")
 
@@ -437,25 +542,46 @@ class OCRReader(Feature):
         voice_q   = queue.Queue()
         _cur_stop = [threading.Event()]
         _cur_stop[0].set()
+        _cur_proc = [None]   # current arecord subprocess — killed by _voice_off()
 
         def _voice_on() -> None:
             if not mc_ok:
                 return
             _cur_stop[0].set()
+            # Kill any running arecord immediately so ALSA input is free
+            _p = _cur_proc[0]
+            if _p is not None and _p.poll() is None:
+                try:
+                    _p.terminate(); _p.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    _p.kill(); _p.wait()
+                except Exception:
+                    pass
+            _cur_proc[0] = None
+
             stop = threading.Event()
             _cur_stop[0] = stop
             _drain(voice_q)
 
             def _delayed():
-                # Wait for aplay to release ALSA before sounddevice opens the mic
                 time.sleep(1.0)
                 if not stop.is_set():
-                    _voice_worker(ctx.abort, voice_q, stop)
+                    _voice_worker_v2(ctx.abort, voice_q, stop, _cur_proc, fb)
 
             threading.Thread(target=_delayed, daemon=True, name="OCRVoice").start()
 
         def _voice_off() -> None:
             _cur_stop[0].set()
+            # Kill arecord and wait so ALSA input releases before aplay starts
+            _p = _cur_proc[0]
+            _cur_proc[0] = None
+            if _p is not None and _p.poll() is None:
+                try:
+                    _p.terminate(); _p.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    _p.kill(); _p.wait()
+                except Exception:
+                    pass
             _drain(voice_q)
 
         def _get_cmd(ges_timeout: float = 0.1) -> "str | None":
@@ -472,7 +598,12 @@ class OCRReader(Feature):
             "Book reader. "
             "Say scan to capture a page, "
             "load to open a saved session, "
-            "or close to exit."
+            "or close to exit. "
+            "During reading: "
+            "close thumb ring and pinky and tilt hand back to pause or resume. "
+            "Flick thumb right to skip forward. "
+            "Flick thumb left to rewind. "
+            "Flick pinky right to jump to the next page."
         )
         _voice_on()
 
@@ -626,7 +757,10 @@ class OCRReader(Feature):
                     break
                 if cmd is None:
                     if time.time() >= idle_t:
+                        _voice_off()
                         _srvspeak(ctx, fb, "Say scan to capture, load a saved session, or close.")
+                        fb.wait(timeout=10)
+                        _voice_on()
                         idle_t = time.time() + IDLE_REMIND_S
                     continue
 
@@ -661,6 +795,7 @@ class OCRReader(Feature):
                                 order     = _reading_order(pages)
                                 start_key = order[0] if order else None
                                 if start_key:
+                                    if gq: _drain(gq)
                                     result = _read_pages(start_key)
                                     if result == "close":
                                         break
@@ -785,6 +920,7 @@ class OCRReader(Feature):
                     fb.wait(timeout=3)
 
                 # ── READ ──────────────────────────────────────────────────────
+                if gq: _drain(gq)
                 result = _read_pages(key)
                 if result == "close":
                     break
