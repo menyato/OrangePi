@@ -404,9 +404,14 @@ class HubStateMachine:
             self._record_enroll_gesture(feat, key, title)
 
     def _record_enroll_gesture(self, feat, key: str, title: str) -> None:
-        """Enrollment flow: instruction → sample1 → preview → sample2 must match."""
-        self.feedback.speak(f"Recording {title}. Hold still, gesture after buzz.")
-        self.feedback.wait(timeout=10)
+        """Enrollment flow: instruction → 5 s delay → sample1 → preview → sample2."""
+        self.feedback.speak(
+            f"Recording {title}. "
+            "Release your hand completely. "
+            "Perform the gesture after the buzz in 5 seconds."
+        )
+        self.feedback.wait(timeout=12)
+        time.sleep(5.0)   # let the user release the EDIT hand and prepare
         sample1 = self._capture_sample()
 
         if sample1 is None:
@@ -439,12 +444,14 @@ class HubStateMachine:
         """Programmable flow:
         timer → capture → announce → voice-or-gesture×2 confirm → save → next feature.
         """
-        # Timer: tell the user to prepare, then a short silent pause before buzz
+        # Timer: tell the user to prepare, then a 5 s silence before buzz
         self.feedback.speak(
-            f"Recording {title}. Prepare your move. Buzz in 3 seconds."
+            f"Recording {title}. "
+            "Release your hand completely. "
+            "Perform the gesture after the buzz in 5 seconds."
         )
         self.feedback.wait(timeout=12)
-        time.sleep(2.5)   # silent countdown
+        time.sleep(5.0)   # let the user release the EDIT hand and prepare
 
         sample1 = self._capture_sample()
 
