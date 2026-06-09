@@ -67,6 +67,10 @@ class HubStateMachine:
 
         self._last_start_ts: float = 0.0
 
+        # Queue for forwarding gestures to a running feature (e.g. OCR reader).
+        # Set in _launch_feature(), cleared in finally.
+        self._feature_gesture_q = None
+
     # ═══════════════════════════════════════════════════════════════════════
     # Frame routing  (RX thread)
     # ═══════════════════════════════════════════════════════════════════════
@@ -95,6 +99,9 @@ class HubStateMachine:
         if self.state == State.RUNNING:
             if name == self._active_key and self._abort is not None:
                 self._abort.set()
+            elif self._feature_gesture_q is not None:
+                # Forward all other gestures to the running feature's queue
+                self._feature_gesture_q.put(name)
             return
 
         self._queue.put(name)
@@ -332,21 +339,24 @@ class HubStateMachine:
         self.feedback.speak(f"Opening {feat.title}. Same gesture to close.")
         self._abort = threading.Event()
         self.state  = State.RUNNING
+        self._feature_gesture_q = queue.Queue()
         crashed = False
         try:
             feat.run(FeatureContext(link=self.link,
                                     abort=self._abort,
-                                    feedback=self.feedback))
+                                    feedback=self.feedback,
+                                    gesture_queue=self._feature_gesture_q))
         except Exception as e:
             print(f"[SM] Feature crashed: {e}")
             crashed = True
             self.feedback.error()
             self.feedback.speak(f"{feat.title} error. Closed.")
         finally:
-            deactivated      = (self.state != State.RUNNING)
-            self._abort          = None
-            self._active_feature = None
-            self._active_key     = ""
+            deactivated              = (self.state != State.RUNNING)
+            self._abort              = None
+            self._active_feature     = None
+            self._active_key         = ""
+            self._feature_gesture_q  = None
             if not deactivated:
                 self.state = State.ACTIVE
             self._drain_queue()

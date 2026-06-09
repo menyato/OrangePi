@@ -193,6 +193,12 @@ class Feedback:
         """Kill current audio immediately (call before a recording window)."""
         self._stop_audio()
 
+    def is_speaking(self) -> bool:
+        """Return True while an aplay process is still running."""
+        with self._audio_lock:
+            return (self._audio_proc is not None
+                    and self._audio_proc.poll() is None)
+
     def _stop_audio(self) -> None:
         with self._audio_lock:
             proc = self._audio_proc

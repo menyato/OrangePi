@@ -105,4 +105,8 @@ DEFAULT_GESTURES: dict[str, GestureSpec] = {
                          motion=Motion.FLICK,  hold_frames=2),
     "EDIT":  GestureSpec("EDIT",  flex_mask=0x05, imu_mask=0x04,
                          motion=Motion.FLICK,  hold_frames=2),
+    # BACK: Thumb + Index, flick tilt_left.
+    # Only used inside Book Reader for "skip backward"; ignored everywhere else.
+    "BACK":  GestureSpec("BACK",  flex_mask=0x03, imu_mask=0x02,
+                         motion=Motion.FLICK,  hold_frames=2),
 }

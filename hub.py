@@ -55,6 +55,7 @@ from gesture_hub               import diagnostics
 from net.client                import ServerLink
 
 from features.money_recognition import MoneyRecognition
+from features.ocr_reader        import OCRReader
 from features.programmable      import ProgrammableGestures
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,10 +63,10 @@ DEFAULT_GESTURES_PATH = os.path.join(HERE, "gestures.json")
 DEFAULT_CAL_PATH      = os.path.join(HERE, "calibration.json")
 
 # ── Register features here (enrollment + Programmable panel order) ─────────
-# ProgrammableGestures should always be last so it appears naturally at the
-# end of the enrollment walk, but order is otherwise up to you.
+# ProgrammableGestures should always be last.
 FEATURES = [
     MoneyRecognition(),
+    OCRReader(),
     ProgrammableGestures(),
 ]
 
