@@ -314,6 +314,53 @@ class Feedback:
 
         threading.Thread(target=_monitor, args=(proc, tmp), daemon=True).start()
 
+    def play_raw(self, wav_bytes: bytes) -> float:
+        """Play server-generated WAV bytes, non-blocking. Returns audio duration."""
+        import io
+        import wave as _wave
+        self._stop_audio()
+        try:
+            with _wave.open(io.BytesIO(wav_bytes)) as wf:
+                dur = wf.getnframes() / max(1, wf.getframerate())
+        except Exception:
+            dur = max(1.0, len(wav_bytes) / (22050 * 2))
+        fd, tmp = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(wav_bytes)
+        except Exception as e:
+            print(f"[AUDIO] play_raw write: {e}")
+            try: os.unlink(tmp)
+            except OSError: pass
+            return dur
+        if self.alsa:
+            cmd = ["aplay", "-D", self.alsa, "-q", "--buffer-size=32768", tmp]
+        else:
+            cmd = ["aplay", "-q", tmp]
+        try:
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+        except Exception as e:
+            print(f"[AUDIO] play_raw launch: {e}")
+            try: os.unlink(tmp)
+            except OSError: pass
+            return dur
+        with self._audio_lock:
+            self._audio_proc = proc
+            self._audio_tmp  = tmp
+        def _mon(p: "subprocess.Popen", t: str) -> None:
+            try: p.communicate(timeout=60)
+            except Exception: pass
+            finally:
+                with self._audio_lock:
+                    if self._audio_proc is p:
+                        self._audio_proc = None
+                        self._audio_tmp  = None
+                try: os.unlink(t)
+                except OSError: pass
+        threading.Thread(target=_mon, args=(proc, tmp), daemon=True).start()
+        return dur
+
     def wait(self, timeout: float = 12.0) -> None:
         """Block until current speech finishes or timeout expires.
 

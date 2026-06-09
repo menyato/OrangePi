@@ -33,6 +33,7 @@ Voice controls (mc.listen / Whisper — ON during idle, paused, and after page)
   (paused) "close"           → save and exit
 """
 
+import base64
 import contextlib
 import json
 import os
@@ -62,6 +63,35 @@ SKIP_CHUNKS    = 3
 SESSIONS_DIR   = os.path.expanduser("~/ocr_sessions")
 CAMERA_INDICES = [0, 1, 2]
 IDLE_REMIND_S  = 60
+
+# ── server TTS helper ─────────────────────────────────────────────────────────
+
+def _srvspeak(ctx, fb, text: str) -> None:
+    """Speak text using server Windows voice (SAPI/Piper).
+
+    Sends {"feature": "tts", "text": text} to the server, receives
+    {"audio": base64_wav} back, and plays the WAV via fb.play_raw().
+    Falls back to local espeak-ng (fb.speak) if server is unavailable
+    or returns no audio.
+    """
+    try:
+        resp = ctx.link.send("tts", {"text": text})
+        if resp and resp.get("audio"):
+            fb.play_raw(base64.b64decode(resp["audio"]))
+            return
+    except Exception as e:
+        print(f"[OCR] server TTS failed: {e}")
+    fb.speak(text)
+
+
+def _play_wav_b64(fb, b64: str) -> float:
+    """Decode a base64 WAV string and play it; returns duration in seconds."""
+    try:
+        return fb.play_raw(base64.b64decode(b64))
+    except Exception as e:
+        print(f"[OCR] play_wav_b64: {e}")
+        return 0.0
+
 
 # ── mc initialisation ─────────────────────────────────────────────────────────
 _mc_ready = False
@@ -222,6 +252,11 @@ def _voice_worker(abort: threading.Event,
         if cmd:
             print(f"[OCR] voice: {text!r} → {cmd}")
             voice_q.put(cmd)
+            # Yield briefly — gives the main thread time to call _voice_off()
+            # BEFORE the loop checks stop_ev and starts another mc.listen().
+            # Without this 150 ms gap the voice thread races back into
+            # mc.listen() holding sounddevice open while aplay tries to start.
+            stop_ev.wait(timeout=0.15)
         else:
             print(f"[OCR] voice: {text!r} → (unrecognised)")
 
@@ -432,7 +467,8 @@ class OCRReader(Feature):
             return _GMAP.get(g) if g else None
 
         # ── opening ───────────────────────────────────────────────────────────
-        fb.speak(
+        _srvspeak(
+            ctx, fb,
             "Book reader. "
             "Say scan to capture a page, "
             "load to open a saved session, "
@@ -452,11 +488,13 @@ class OCRReader(Feature):
             current_key: "tuple | None" = start_key
 
             while current_key is not None and not ctx.abort.is_set():
-                pdata  = pages[current_key]
-                chunks = _chunk_text(pdata["text"])
+                pdata      = pages[current_key]
+                # Server may have pre-split the text into chunks; fall back to local split
+                chunks     = pdata.get("chunks") or _chunk_text(pdata["text"])
+                wavs_b64   = pdata.get("chunk_wavs")  # list[str|None] or None
 
                 if not chunks:
-                    fb.speak("Page appears blank.")
+                    _srvspeak(ctx, fb, "Page appears blank.")
                     nk = _next_key(pages, current_key)
                     current_key = nk
                     continue
@@ -470,7 +508,8 @@ class OCRReader(Feature):
                     # ── PAUSED ────────────────────────────────────────────────
                     if paused:
                         if not pause_announced:
-                            fb.speak(
+                            _srvspeak(
+                                ctx, fb,
                                 "Paused. "
                                 "Say scan to add a page. "
                                 "Say yes to resume. "
@@ -486,34 +525,31 @@ class OCRReader(Feature):
                         if cmd is None:
                             continue
 
-                        if cmd.startswith("TEXT:"):
-                            # Raw text in pause — ignore (not a command)
-                            continue
-
                         _voice_off()
 
                         if cmd in ("PAUSE", "YES", "NO"):
                             paused = False; pause_announced = False
-                            fb.speak("Resuming.")
+                            _srvspeak(ctx, fb, "Resuming.")
 
                         elif cmd == "SCAN":
                             paused = False; pause_announced = False
                             return "scan"
 
                         elif cmd == "NEXT":
-                            fb.silence(); fb.speak("Next page.")
+                            fb.silence()
+                            _srvspeak(ctx, fb, "Next page.")
                             i = len(chunks); paused = False; pause_announced = False
 
                         elif cmd == "FWD":
                             skip = min(SKIP_CHUNKS, len(chunks) - i)
                             i    = min(i + skip, len(chunks))
                             paused = False; pause_announced = False
-                            fb.speak("Skipped. Resuming.")
+                            _srvspeak(ctx, fb, "Skipped. Resuming.")
 
                         elif cmd == "BWD":
                             i = max(0, i - SKIP_CHUNKS)
                             paused = False; pause_announced = False
-                            fb.speak("Rewound. Resuming.")
+                            _srvspeak(ctx, fb, "Rewound. Resuming.")
 
                         elif cmd == "CLOSE":
                             ctx.abort.set()
@@ -521,10 +557,17 @@ class OCRReader(Feature):
 
                         continue
 
-                    # ── READ CHUNK ────────────────────────────────────────────
-                    fb.speak(chunks[i])
-                    dur = _chunk_dur(chunks[i])
-                    i  += 1
+                    # ── READ CHUNK (server WAV preferred, espeak fallback) ─────
+                    b64 = wavs_b64[i] if (wavs_b64 and i < len(wavs_b64)) else None
+                    if b64:
+                        dur = _play_wav_b64(fb, b64)
+                        if dur < 0.5:        # play_wav_b64 failed → fallback
+                            fb.speak(chunks[i])
+                            dur = _chunk_dur(chunks[i])
+                    else:
+                        fb.speak(chunks[i])
+                        dur = _chunk_dur(chunks[i])
+                    i += 1
 
                     deadline = time.time() + dur
                     while time.time() < deadline and not ctx.abort.is_set():
@@ -534,19 +577,19 @@ class OCRReader(Feature):
 
                         if gcmd == "PAUSE":
                             paused = True; pause_announced = False
-                            fb.silence(); fb.speak("Paused.")
+                            fb.silence(); _srvspeak(ctx, fb, "Paused.")
                             break
                         elif gcmd == "FWD":
                             skip = min(SKIP_CHUNKS, len(chunks) - i)
                             i    = min(i + skip, len(chunks))
-                            fb.silence(); fb.speak(f"Skipped {skip}.")
+                            fb.silence(); _srvspeak(ctx, fb, f"Skipped {skip}.")
                             break
                         elif gcmd == "BWD":
                             i = max(0, i - SKIP_CHUNKS - 1)
-                            fb.silence(); fb.speak("Rewinding.")
+                            fb.silence(); _srvspeak(ctx, fb, "Rewinding.")
                             break
                         elif gcmd in ("NEXT", "SCAN"):
-                            fb.silence(); fb.speak("Next page.")
+                            fb.silence(); _srvspeak(ctx, fb, "Next page.")
                             i = len(chunks); break
                         elif gcmd == "CLOSE":
                             fb.silence(); ctx.abort.set(); return "close"
@@ -556,10 +599,11 @@ class OCRReader(Feature):
                     nk = _next_key(pages, current_key)
                     if nk is not None:
                         label = _page_label(pages[nk])
-                        fb.speak(f"Page done. Next is {label}. Reading.")
+                        _srvspeak(ctx, fb, f"Page done. Next is {label}. Reading.")
                         current_key = nk
                     else:
-                        fb.speak(
+                        _srvspeak(
+                            ctx, fb,
                             "All pages read. "
                             "Say scan to add more pages, "
                             "or say close to save and exit."
@@ -582,7 +626,7 @@ class OCRReader(Feature):
                     break
                 if cmd is None:
                     if time.time() >= idle_t:
-                        fb.speak("Say scan to capture, load for a saved session, or close.")
+                        _srvspeak(ctx, fb, "Say scan to capture, load a saved session, or close.")
                         idle_t = time.time() + IDLE_REMIND_S
                     continue
 
@@ -591,14 +635,13 @@ class OCRReader(Feature):
                     _voice_off()
                     raw_text = ""
 
-                    if not raw_text:
-                        fb.speak("Say the session name.")
-                        fb.wait(timeout=5)
-                        if mc_ok:
-                            try:
-                                raw_text, _ = mc.listen()
-                            except Exception:
-                                raw_text = ""
+                    _srvspeak(ctx, fb, "Say the session name.")
+                    fb.wait(timeout=5)
+                    if mc_ok:
+                        try:
+                            raw_text, _ = mc.listen()
+                        except Exception:
+                            raw_text = ""
 
                     if raw_text:
                         sdata = _find_session(raw_text)
@@ -609,13 +652,14 @@ class OCRReader(Feature):
                                 session_name = session_name or loaded_name
                                 pages.update(loaded_pages)
                                 page_idx = max(page_idx, loaded_idx)
-                                fb.speak(
+                                _srvspeak(
+                                    ctx, fb,
                                     f"Loaded {loaded_name}. "
                                     f"{len(loaded_pages)} pages. Reading now."
                                 )
                                 fb.wait(timeout=5)
-                                order      = _reading_order(pages)
-                                start_key  = order[0] if order else None
+                                order     = _reading_order(pages)
+                                start_key = order[0] if order else None
                                 if start_key:
                                     result = _read_pages(start_key)
                                     if result == "close":
@@ -624,9 +668,9 @@ class OCRReader(Feature):
                                     idle_t = time.time() + IDLE_REMIND_S
                                 continue
                             else:
-                                fb.speak(f"Session {loaded_name} has no pages.")
+                                _srvspeak(ctx, fb, f"Session {loaded_name} has no pages.")
                         else:
-                            fb.speak(f"No session found matching {raw_text!r}.")
+                            _srvspeak(ctx, fb, f"No session found matching {raw_text}.")
                     _voice_on()
                     continue
 
@@ -637,27 +681,28 @@ class OCRReader(Feature):
                 _voice_off()
                 idle_t = time.time() + IDLE_REMIND_S
 
-                fb.speak("Hold the page flat and steady. Capturing now.")
+                _srvspeak(ctx, fb, "Hold the page flat and steady. Capturing now.")
                 jpeg = _capture_frame(fb)
 
                 if jpeg is None:
-                    fb.speak("Camera error. Check USB camera.")
+                    _srvspeak(ctx, fb, "Camera error. Check USB camera.")
                     fb.wait(timeout=4)
                     _voice_on()
                     continue
 
-                fb.speak("Scanning complete. Processing text.")
+                _srvspeak(ctx, fb, "Scanning complete. Processing text.")
                 resp = ctx.link.send("ocr", {"type": "scan", "frame": jpeg})
 
                 if resp is None:
-                    fb.speak("Server not reachable.")
+                    fb.speak("Server not reachable.")   # local only — server is down
                     fb.wait(timeout=4)
                     _voice_on()
                     continue
 
                 text_body = resp.get("text", "").strip()
                 if not text_body:
-                    fb.speak(
+                    _srvspeak(
+                        ctx, fb,
                         "No text found. "
                         "Hold page 30 to 40 centimetres from camera "
                         "with good lighting, then scan again."
@@ -666,18 +711,25 @@ class OCRReader(Feature):
                     _voice_on()
                     continue
 
-                detected_page = resp.get("page")
-                word_count    = len(text_body.split())
+                detected_page  = resp.get("page")
+                word_count     = len(text_body.split())
+                server_chunks  = resp.get("chunks")          # server-split text chunks
+                chunk_wavs_b64 = resp.get("chunk_wavs")      # parallel list of base64 WAVs
 
-                # ── ANNOUNCE RESULT ───────────────────────────────────────────
-                if detected_page is not None:
+                # ── ANNOUNCE RESULT (server WAV preferred) ────────────────────
+                ann_b64 = resp.get("announcement_wav")
+                if ann_b64:
+                    _play_wav_b64(fb, ann_b64)
+                elif detected_page is not None:
                     fb.speak(f"Page {detected_page}. {word_count} words.")
                 else:
                     fb.speak(f"No page number. {word_count} words.")
+
+                if detected_page is None:
                     fb.wait(timeout=5)
                     # Ask user to provide the page number
                     if mc_ok:
-                        fb.speak("Say the page number, or say skip.")
+                        _srvspeak(ctx, fb, "Say the page number, or say skip.")
                         fb.wait(timeout=5)
                         try:
                             vtxt, _ = mc.listen()
@@ -687,7 +739,7 @@ class OCRReader(Feature):
                                     num = _parse_number(vtxt)
                                     if num is not None:
                                         detected_page = num
-                                        fb.speak(f"Page {detected_page}.")
+                                        _srvspeak(ctx, fb, f"Page {detected_page}.")
                                         fb.wait(timeout=3)
                         except Exception:
                             pass
@@ -696,7 +748,7 @@ class OCRReader(Feature):
                 if detected_page is not None:
                     key = ("num", detected_page)
                     if key in pages:
-                        fb.speak(f"Page {detected_page} rescanned. Replacing.")
+                        _srvspeak(ctx, fb, f"Page {detected_page} rescanned. Replacing.")
                 else:
                     key = ("idx", page_idx)
                     page_idx += 1
@@ -705,13 +757,15 @@ class OCRReader(Feature):
                     "page":       detected_page,
                     "text":       text_body,
                     "word_count": word_count,
+                    "chunks":     server_chunks,     # may be None for loaded sessions
+                    "chunk_wavs": chunk_wavs_b64,    # may be None
                 }
 
                 # ── NAME SESSION (first scan) ──────────────────────────────────
                 if session_name is None:
                     fb.wait(timeout=4)
                     if mc_ok:
-                        fb.speak("Say a name for this reading session.")
+                        _srvspeak(ctx, fb, "Say a name for this reading session.")
                         fb.wait(timeout=5)
                         try:
                             vtxt, _ = mc.listen()
@@ -723,11 +777,11 @@ class OCRReader(Feature):
                             pass
                     if not session_name:
                         session_name = f"reading_{self._session_counter}"
-                    fb.speak(f"Session: {session_name}. Reading now.")
+                    _srvspeak(ctx, fb, f"Session: {session_name}. Reading now.")
                     fb.wait(timeout=5)
                 else:
                     fb.wait(timeout=4)
-                    fb.speak("Reading now.")
+                    _srvspeak(ctx, fb, "Reading now.")
                     fb.wait(timeout=3)
 
                 # ── READ ──────────────────────────────────────────────────────
@@ -749,12 +803,13 @@ class OCRReader(Feature):
                 if missing:
                     labels = ", ".join(str(p) for p in missing[:5])
                     more   = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
-                    fb.speak(f"Warning: pages {labels}{more} not scanned.")
+                    _srvspeak(ctx, fb, f"Warning: pages {labels}{more} not scanned.")
 
                 try:
                     path        = _save_session(session_name, pages_list)
                     total_words = sum(p["word_count"] for p in pages_list)
-                    fb.speak(
+                    _srvspeak(
+                        ctx, fb,
                         f"Saved as {session_name}. "
                         f"{len(pages_list)} page{'s' if len(pages_list) > 1 else ''}, "
                         f"{total_words} words."
