@@ -252,8 +252,13 @@ class Feedback:
             except OSError: pass
             return
 
-        cmd = (["aplay", "-D", self.alsa, "-q", tmp] if self.alsa
-               else ["aplay", "-q", tmp])
+        # --buffer-size=32768 gives aplay ~1.5 s of headroom at 22050 Hz, which
+        # prevents the "xrun in PREPARED state" that happens when the USB headset
+        # needs extra time to transition from PREPARED → RUNNING.
+        if self.alsa:
+            cmd = ["aplay", "-D", self.alsa, "-q", "--buffer-size=32768", tmp]
+        else:
+            cmd = ["aplay", "-q", tmp]
 
         # Launch aplay immediately so _stop_audio() can kill it at any point
         try:
@@ -281,11 +286,18 @@ class Feedback:
                     or "Interrupted system call" in err_str
                 )
                 if not is_normal_kill and err_str:
-                    print(f"[AUDIO] aplay: {err_str}")
-                    # Fallback to system default device
+                    # xrun messages are expected on first try — retry on same
+                    # device with a larger buffer instead of falling back to the
+                    # system default (which may be HDMI and inaudible).
+                    if "xrun" not in err_str:
+                        print(f"[AUDIO] aplay: {err_str}")
+                    if self.alsa:
+                        retry = ["aplay", "-D", self.alsa, "-q",
+                                 "--buffer-size=65536", t]
+                    else:
+                        retry = ["aplay", "-q", t]
                     try:
-                        subprocess.run(["aplay", "-q", t],
-                                       stderr=subprocess.DEVNULL, timeout=60)
+                        subprocess.run(retry, stderr=subprocess.DEVNULL, timeout=60)
                     except Exception:
                         pass
             except subprocess.TimeoutExpired:
