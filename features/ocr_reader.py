@@ -522,6 +522,50 @@ def _pages_from_session(data: dict) -> "tuple[dict, int]":
     return pages, idx
 
 
+# ── startup session summary ───────────────────────────────────────────────────
+
+def _startup_summary() -> str:
+    """Return a spoken summary of all saved sessions for the opening announcement."""
+    if not os.path.isdir(SESSIONS_DIR):
+        return ""
+    rows = []
+    for fname in sorted(os.listdir(SESSIONS_DIR)):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(SESSIONS_DIR, fname), encoding="utf-8") as f:
+                data = json.load(f)
+            name       = data.get("name", fname[:-5])
+            plist      = data.get("pages", [])
+            n_pages    = len(plist)
+            if n_pages == 0:
+                continue
+            total_w    = sum(
+                p.get("word_count", len(p.get("text", "").split()))
+                for p in plist
+            )
+            nums = sorted(p["page"] for p in plist if p.get("page") is not None)
+            if nums:
+                if len(nums) == 1:
+                    pg_str = f"page {nums[0]}"
+                elif len(nums) <= 6:
+                    pg_str = "pages " + ", ".join(str(n) for n in nums)
+                else:
+                    pg_str = f"pages {nums[0]} to {nums[-1]}"
+            else:
+                pg_str = f"{n_pages} unnumbered page{'s' if n_pages != 1 else ''}"
+            rows.append(f"{name}: {pg_str}, {total_w} words")
+        except Exception:
+            pass
+
+    if not rows:
+        return ""
+    count = len(rows)
+    out   = f"You have {count} saved session{'s' if count != 1 else ''}. "
+    out  += ". ".join(rows) + ". "
+    return out
+
+
 # ── feature ───────────────────────────────────────────────────────────────────
 
 class OCRReader(Feature):
@@ -603,7 +647,8 @@ class OCRReader(Feature):
         _srvspeak(
             ctx, fb,
             "Book reader. "
-            "Say scan to capture a page, "
+            + _startup_summary()
+            + "Say scan to capture a page, "
             "load to open a saved session, "
             "or close to exit. "
             "During reading: "
@@ -668,26 +713,28 @@ class OCRReader(Feature):
                         if cmd in ("PAUSE", "YES", "NO"):
                             paused = False; pause_announced = False
                             _srvspeak(ctx, fb, "Resuming.")
+                            fb.wait(timeout=4)      # let message finish before chunk plays
 
                         elif cmd == "SCAN":
                             paused = False; pause_announced = False
                             return "scan"
 
                         elif cmd == "NEXT":
-                            fb.silence()
-                            _srvspeak(ctx, fb, "Next page.")
                             i = len(chunks); paused = False; pause_announced = False
+                            # advance-logic block announces the next page — no extra TTS
 
                         elif cmd == "FWD":
                             skip = min(SKIP_CHUNKS, len(chunks) - i)
                             i    = min(i + skip, len(chunks))
                             paused = False; pause_announced = False
                             _srvspeak(ctx, fb, "Skipped. Resuming.")
+                            fb.wait(timeout=4)
 
                         elif cmd == "BWD":
-                            i = max(0, i - SKIP_CHUNKS)
+                            i = max(0, i - SKIP_CHUNKS - 1)   # -1: i already incremented
                             paused = False; pause_announced = False
                             _srvspeak(ctx, fb, "Rewound. Resuming.")
+                            fb.wait(timeout=4)
 
                         elif cmd == "CLOSE":
                             ctx.abort.set()
@@ -715,20 +762,20 @@ class OCRReader(Feature):
 
                         if gcmd == "PAUSE":
                             paused = True; pause_announced = False
-                            fb.silence(); _srvspeak(ctx, fb, "Paused.")
+                            fb.silence()        # pause-state loop announces itself
                             break
                         elif gcmd == "FWD":
                             skip = min(SKIP_CHUNKS, len(chunks) - i)
                             i    = min(i + skip, len(chunks))
-                            fb.silence(); _srvspeak(ctx, fb, f"Skipped {skip}.")
+                            fb.silence()        # new chunk starting is the confirmation
                             break
                         elif gcmd == "BWD":
                             i = max(0, i - SKIP_CHUNKS - 1)
-                            fb.silence(); _srvspeak(ctx, fb, "Rewinding.")
+                            fb.silence()
                             break
                         elif gcmd in ("NEXT", "SCAN"):
-                            fb.silence(); _srvspeak(ctx, fb, "Next page.")
-                            i = len(chunks); break
+                            fb.silence()
+                            i = len(chunks); break   # advance logic announces next page
                         elif gcmd == "CLOSE":
                             fb.silence(); ctx.abort.set(); return "close"
 
