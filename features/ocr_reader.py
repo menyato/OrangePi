@@ -1,11 +1,12 @@
 """
 features/ocr_reader.py — Book Reader feature for the smart glove.
 
-Flow (mirrors money recognition — voice-driven, gestures as backup)
---------------------------------------------------------------------
+Flow (mirrors money recognition — voice-driven scan, gesture-controlled reading)
+---------------------------------------------------------------------------------
 1. Open  → "Book reader ready. Say scan or gesture next to capture."
-2. Scan  → capture frame → server EasyOCR → receive text.
-3. Feedback → "Page N. X words." then read aloud sentence by sentence.
+2. Scan  → mc.capture_best_frame_local() (4 s multi-frame, picks sharpest)
+            → send JPEG to server EasyOCR → receive text.
+3. Feedback → "Page N. X words. Reading now." then read aloud chunk by chunk.
 4. During reading, OCR gestures forwarded by the state machine:
      OCR_PAUSE          → pause; prompt "Say yes to add a page or say no to resume"
      OCR_FWD            → skip forward  ~5 s (3 chunks)
@@ -17,17 +18,17 @@ Flow (mirrors money recognition — voice-driven, gestures as backup)
 6. After page finishes → "Page done. Say scan for next page or say close to exit."
 7. Close gesture / "close" voice → save session and exit.
 
-Voice commands (always active via VoiceListener → feature gesture queue):
+Voice commands (VoiceListener → feature gesture queue — no extra mic thread):
   "scan" / "capture" / "take"  → OCR_SCAN  (same as NEXT gesture)
   "close"                       → OCR_CLOSE (same as close gesture)
-  "yes" / "confirm"             → PROG_CONFIRM (confirm add page when paused)
+  "yes" / "confirm"             → PROG_CONFIRM (add page when paused)
   "no"  / "discard"             → PROG_DISCARD (resume reading when paused)
   "next" / "skip"               → NEXT       (next page when idle or reading)
 
-Hardcoded OCR gesture meanings (only active while Book Reader is running):
-  OCR_PAUSE   — Thumb + Ring + Pinky, tilt back  — pause / resume
-  OCR_FWD     — Thumb only, flick right           — skip forward
-  OCR_BWD     — Thumb only, flick left            — skip backward / rewind
+Frame capture: uses orangepi_client.capture_best_frame_local() which warms up
+the camera for 10 frames then picks the sharpest of the next ~6 frames over 4 s.
+This eliminates the blurry / out-of-focus frames that a 3-frame capture produces.
+Falls back to cv2 if orangepi_client is not available.
 """
 
 import contextlib
@@ -35,7 +36,14 @@ import json
 import os
 import queue
 import re
+import threading
 import time
+
+try:
+    import orangepi_client as mc
+    _MC_OK = True
+except ImportError:
+    _MC_OK = False
 
 try:
     import cv2
@@ -46,20 +54,49 @@ except ImportError:
 from features.base import Feature, FeatureContext
 
 # ── tunables ─────────────────────────────────────────────────────────────────
-WORDS_PER_SEC   = 2.5           # espeak-ng at 150 wpm ≈ 2.5 w/s
-CHUNK_TARGET    = 10            # target words per TTS chunk
-SKIP_CHUNKS     = 3             # chunks to skip per OCR_FWD/BWD
+WORDS_PER_SEC   = 2.5
+CHUNK_TARGET    = 10
+SKIP_CHUNKS     = 3
 SESSIONS_DIR    = os.path.expanduser("~/ocr_sessions")
-CAMERA_INDICES  = [0, 1, 2]    # try these in order until one opens
-SCAN_WAIT_S     = 60            # seconds to wait for scan command before reminding
-PAUSE_WAIT_S    = 60            # seconds to wait in pause before re-prompting
+CAMERA_INDICES  = [0, 1, 2]
+SCAN_WAIT_S     = 60
+PAUSE_WAIT_S    = 60
+
+# ── mc camera initialisation (shared with money recognition) ──────────────────
+_mc_cam_ready = False
+_mc_cam_lock  = threading.Lock()
 
 
-# ── camera helpers ────────────────────────────────────────────────────────────
+def _ensure_mc_camera(fb) -> bool:
+    """Initialise mc's camera detection once.  Whisper model not needed."""
+    global _mc_cam_ready
+    if not _MC_OK:
+        return False
+    with _mc_cam_lock:
+        if _mc_cam_ready:
+            return True
+        # Money recognition may have already fully initialised mc
+        try:
+            from features.money_recognition import MoneyRecognition
+            if MoneyRecognition._models_ready:
+                _mc_cam_ready = True
+                return True
+        except (ImportError, AttributeError):
+            pass
+        try:
+            mc.init_cues()
+            mc.auto_detect_all()   # detects Logitech camera → sets mc.CAM_DEVICE
+            _mc_cam_ready = True
+            return True
+        except Exception as e:
+            print(f"[OCR] mc camera init error: {e}")
+            return False
+
+
+# ── cv2 fallback camera (used only when mc is unavailable) ───────────────────
 
 @contextlib.contextmanager
 def _suppress_cv2_stderr():
-    """Redirect fd 2 to /dev/null while OpenCV probes V4L2 nodes."""
     devnull = os.open(os.devnull, os.O_WRONLY)
     saved   = os.dup(2)
     try:
@@ -71,36 +108,29 @@ def _suppress_cv2_stderr():
         os.close(devnull)
 
 
-def _open_camera():
-    """Return a working cv2.VideoCapture or None.
-
-    Probes V4L2 only; validates with a test read so codec/metadata nodes
-    (which report isOpened()=True but return all-zero frames) are rejected.
-    """
+def _capture_jpeg_cv2() -> "bytes | None":
+    """Fallback: open camera, settle, pick sharpest of 3 frames."""
     if not _CV2_OK:
         return None
     backend = getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)
+    cap = None
     for idx in CAMERA_INDICES:
         with _suppress_cv2_stderr():
-            cap = cv2.VideoCapture(idx, backend)
-        if not cap.isOpened():
+            c = cv2.VideoCapture(idx, backend)
+        if not c.isOpened():
             continue
-        ret, frame = cap.read()
+        ret, frame = c.read()
         if ret and frame is not None and frame.size > 0 and frame.max() > 0:
-            return cap
-        cap.release()
-    return None
-
-
-def _capture_jpeg(cap) -> "bytes | None":
-    """Settle autofocus then grab the sharpest of 3 frames."""
+            cap = c
+            break
+        c.release()
     if cap is None:
         return None
     try:
         cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-        time.sleep(0.6)
+        time.sleep(1.5)
         best_frame, best_var = None, -1.0
-        for _ in range(3):
+        for _ in range(5):
             ret, frame = cap.read()
             if not ret:
                 continue
@@ -108,20 +138,37 @@ def _capture_jpeg(cap) -> "bytes | None":
             var  = cv2.Laplacian(gray, cv2.CV_64F).var()
             if var > best_var:
                 best_var, best_frame = var, frame
-            time.sleep(0.1)
+            time.sleep(0.15)
         if best_frame is None:
             return None
-        _, buf = cv2.imencode(".jpg", best_frame,
-                              [cv2.IMWRITE_JPEG_QUALITY, 92])
+        _, buf = cv2.imencode(".jpg", best_frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
         return buf.tobytes()
-    except Exception:
-        return None
+    finally:
+        cap.release()
+
+
+def _capture_frame(fb) -> "bytes | None":
+    """Capture the best possible frame.
+
+    Uses mc.capture_best_frame_local() when available — it warms up 10 frames,
+    captures ~6 more over 4 s, and returns the sharpest one.  Falls back to
+    a quick cv2 grab when mc is not installed.
+    """
+    if _ensure_mc_camera(fb):
+        jpeg = mc.capture_best_frame_local()
+        if jpeg is not None:
+            try:
+                mc.play_cue(mc._CUE_SHOT)   # satisfying camera click
+            except Exception:
+                pass
+            return jpeg
+    # fallback
+    return _capture_jpeg_cv2()
 
 
 # ── text helpers ──────────────────────────────────────────────────────────────
 
 def _chunk_text(text: str) -> list:
-    """Split text into natural reading chunks of ~CHUNK_TARGET words."""
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     chunks = []
     for s in sentences:
@@ -195,12 +242,11 @@ class OCRReader(Feature):
         pages: list       = []
         last_page: "int | None" = None
 
-        cap = _open_camera()
-        if cap is None:
-            fb.speak("No camera found. Book reader needs a USB camera.")
-            return
+        # Warm up the camera in the background so the first scan is instant
+        def _warm():
+            _ensure_mc_camera(fb)
+        threading.Thread(target=_warm, daemon=True).start()
 
-        # Opening announcement — voice-first, then gestures as backup
         fb.speak(
             "Book reader ready. "
             "Say scan or gesture next to capture a page. "
@@ -229,34 +275,35 @@ class OCRReader(Feature):
                     )
                     continue
 
-                # Voice or gesture close
                 if g == "OCR_CLOSE":
                     break
 
-                # Rename session
                 if g == "EDIT":
                     self._session_counter += 1
                     session_name = f"Reading session {self._session_counter}"
                     fb.speak(f"Session renamed to {session_name}.")
                     continue
 
-                # Stray OCR controls before any reading has started
-                if g in ("OCR_PAUSE", "OCR_FWD", "OCR_BWD", "PROG_CONFIRM",
-                         "PROG_DISCARD"):
-                    fb.speak("Not reading yet. Say scan or gesture next to capture.")
+                if g in ("OCR_PAUSE", "OCR_FWD", "OCR_BWD",
+                         "PROG_CONFIRM", "PROG_DISCARD"):
+                    fb.speak("Not reading yet. Say scan or gesture next.")
                     continue
 
-                # Anything other than scan trigger → prompt
                 if g not in ("NEXT", "OCR_SCAN"):
                     fb.speak("Say scan or gesture next to capture.")
                     continue
 
-                # ── capture ───────────────────────────────────────────────
-                fb.confirm()
-                fb.speak("Scanning.")
-                jpeg = _capture_jpeg(cap)
+                # ── capture — like money: hold steady, multi-frame, click ──
+                fb.speak("Hold the page flat and steady. Capturing now.")
+                fb.wait(timeout=6)
+                # mc.capture_best_frame_local() takes ~4 s internally
+                jpeg = _capture_frame(fb)
+
                 if jpeg is None:
-                    fb.speak("Camera error. Try again.")
+                    fb.speak(
+                        "Camera error. "
+                        "Make sure the USB camera is connected and try again."
+                    )
                     continue
 
                 fb.speak("Processing, please wait.")
@@ -269,8 +316,9 @@ class OCRReader(Feature):
                 text = resp.get("text", "").strip()
                 if not text:
                     fb.speak(
-                        "No text found on this page. "
-                        "Hold the page flat and closer, then say scan again."
+                        "No text found. "
+                        "Hold the page flat, ensure good lighting, "
+                        "and say scan again."
                     )
                     continue
 
@@ -278,7 +326,6 @@ class OCRReader(Feature):
                 skipped       = resp.get("skipped_pages", [])
                 word_count    = len(text.split())
 
-                # Page number feedback
                 if skipped:
                     labels = ", ".join(str(p) for p in skipped)
                     fb.speak(
@@ -292,7 +339,8 @@ class OCRReader(Feature):
                         if missing:
                             labels = ", ".join(str(p) for p in missing)
                             fb.speak(
-                                f"Skipped page{'s' if len(missing) > 1 else ''} {labels}."
+                                f"Skipped page"
+                                f"{'s' if len(missing) > 1 else ''} {labels}."
                             )
                     last_page = detected_page
                     fb.speak(f"Page {detected_page}. {word_count} words. Reading now.")
@@ -311,11 +359,11 @@ class OCRReader(Feature):
                     fb.speak("Page appears blank.")
                     continue
 
-                fb.wait(timeout=5)   # let the page announcement finish
+                fb.wait(timeout=6)
 
-                i      = 0
-                paused = False
-                pause_announced = False  # speak pause prompt only once per pause
+                i               = 0
+                paused          = False
+                pause_announced = False
 
                 while i < len(chunks) and not ctx.abort.is_set():
 
@@ -324,7 +372,7 @@ class OCRReader(Feature):
                             fb.speak(
                                 "Paused. "
                                 "Say yes to add another page. "
-                                "Say no or resume gesture to continue reading. "
+                                "Say no or resume gesture to continue. "
                                 "Say next or gesture next for next page."
                             )
                             pause_announced = True
@@ -332,47 +380,37 @@ class OCRReader(Feature):
                         g2 = _wait_for_gesture(ctx, timeout=PAUSE_WAIT_S)
 
                         if g2 is None:
-                            # Re-prompt after timeout
                             pause_announced = False
                             continue
 
                         if g2 in ("OCR_PAUSE", "PROG_DISCARD"):
-                            # Resume reading
-                            paused          = False
-                            pause_announced = False
+                            paused = False; pause_announced = False
                             fb.speak("Resuming.")
                             time.sleep(0.8)
 
                         elif g2 == "PROG_CONFIRM":
-                            # User said "yes" — go scan next page
                             fb.speak(
                                 "Okay. Hold the next page to the camera. "
                                 "Say scan or gesture next when ready."
                             )
-                            i = len(chunks)   # exit reading loop → back to scan loop
-                            paused          = False
-                            pause_announced = False
+                            i = len(chunks); paused = False; pause_announced = False
 
                         elif g2 in ("NEXT", "OCR_SCAN"):
                             fb.silence()
                             fb.speak("Next page.")
-                            i = len(chunks)   # exit reading loop
-                            paused          = False
-                            pause_announced = False
+                            i = len(chunks); paused = False; pause_announced = False
 
                         elif g2 == "OCR_BWD":
-                            i               = max(0, i - SKIP_CHUNKS)
-                            paused          = False
-                            pause_announced = False
-                            fb.speak(f"Rewound. Resuming.")
+                            i = max(0, i - SKIP_CHUNKS)
+                            paused = False; pause_announced = False
+                            fb.speak("Rewound. Resuming.")
                             time.sleep(0.8)
 
                         elif g2 == "OCR_FWD":
-                            skip            = min(SKIP_CHUNKS, len(chunks) - i)
-                            i               = min(i + skip, len(chunks))
-                            paused          = False
-                            pause_announced = False
-                            fb.speak(f"Skipped forward. Resuming.")
+                            skip = min(SKIP_CHUNKS, len(chunks) - i)
+                            i    = min(i + skip, len(chunks))
+                            paused = False; pause_announced = False
+                            fb.speak("Skipped forward. Resuming.")
                             time.sleep(0.8)
 
                         elif g2 == "OCR_CLOSE":
@@ -385,7 +423,6 @@ class OCRReader(Feature):
                     wait    = _chunk_duration(chunks[i])
                     i      += 1
 
-                    # Poll gestures while chunk plays
                     deadline = time.time() + wait
                     handled  = False
                     while (time.time() < deadline
@@ -395,33 +432,25 @@ class OCRReader(Feature):
                             ctx, timeout=min(0.05, deadline - time.time())
                         )
                         if g2 == "OCR_PAUSE":
-                            paused          = True
-                            pause_announced = False
+                            paused = True; pause_announced = False
                             fb.silence()
                             fb.speak("Paused.")
                             handled = True
                         elif g2 == "OCR_FWD":
                             skip = min(SKIP_CHUNKS, len(chunks) - i)
                             i    = min(i + skip, len(chunks))
-                            fb.silence()
-                            fb.speak(f"Skipped {skip}.")
+                            fb.silence(); fb.speak(f"Skipped {skip}.")
                             handled = True
                         elif g2 == "OCR_BWD":
                             i = max(0, i - SKIP_CHUNKS - 1)
-                            fb.silence()
-                            fb.speak("Rewinding.")
+                            fb.silence(); fb.speak("Rewinding.")
                             handled = True
                         elif g2 in ("NEXT", "OCR_SCAN"):
-                            fb.silence()
-                            fb.speak("Next page.")
-                            i       = len(chunks)   # exit reading loop
-                            handled = True
+                            fb.silence(); fb.speak("Next page.")
+                            i = len(chunks); handled = True
                         elif g2 == "OCR_CLOSE":
-                            fb.silence()
-                            ctx.abort.set()
-                            handled = True
+                            fb.silence(); ctx.abort.set(); handled = True
 
-                # Reading finished (natural end)
                 if not ctx.abort.is_set() and i >= len(chunks):
                     page_label = (f"Page {detected_page}" if detected_page
                                   else "Page")
@@ -432,7 +461,6 @@ class OCRReader(Feature):
                     )
 
         finally:
-            cap.release()
             if pages:
                 try:
                     path = _save_session(session_name, pages)
