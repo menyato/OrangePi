@@ -197,6 +197,7 @@ def _capture_frame(fb) -> "bytes | None":
 
 _SCAN_W  = {"scan", "capture", "take", "photo", "scam", "skan", "skun", "scanned"}
 _LOAD_W  = {"load", "recall", "open", "read"}
+_ADD_W   = {"add", "append", "insert"}
 _NEXT_W  = {"next", "skip", "forward"}
 _CLOSE_W = {"close", "stop", "quit", "finish", "exit", "done"}
 _YES_W   = {"yes", "yeah", "resume", "continue", "ok", "yep", "sure"}
@@ -232,6 +233,7 @@ def _parse_number(text: str) -> "int | None":
 def _classify(text: str) -> "str | None":
     words = set(re.findall(r"[a-z]+", text.lower()))
     if words & _LOAD_W:   return "LOAD"
+    if words & _ADD_W:    return "ADD"
     if words & _SCAN_W:   return "SCAN"
     if words & _NEXT_W:   return "NEXT"
     if words & _YES_W:    return "YES"
@@ -690,20 +692,24 @@ class OCRReader(Feature):
             return False
 
         # ── opening ───────────────────────────────────────────────────────────
+        _voice_on()   # start early so 1-second init overlaps with TTS
         _srvspeak(
             ctx, fb,
             "Book reader. "
             + _startup_summary()
-            + "Say scan to capture a page, "
-            "load to open a saved session, "
-            "or close to exit. "
+            + "Say scan to capture a new page. "
+            "Say load to read a saved book. "
+            "Say add to add pages to a saved book. "
+            "Or say close to exit. "
             "During reading: "
             "close thumb ring and pinky and tilt hand back to pause or resume. "
             "Flick thumb right to skip forward. "
             "Flick thumb left to rewind. "
             "Flick pinky right to jump to the next page."
         )
-        _voice_on()
+        fb.wait(timeout=30)   # ensure announcement finishes before the loop polls gestures
+        if gq:
+            _drain(gq)        # discard any gesture that triggered the feature open
 
         # ── nested reading loop ───────────────────────────────────────────────
         def _read_pages(start_key: tuple) -> str:
@@ -907,6 +913,65 @@ class OCRReader(Feature):
                                 _srvspeak(ctx, fb, f"Session {loaded_name} has no pages.")
                         else:
                             _srvspeak(ctx, fb, f"No session found matching {raw_text}.")
+                    _voice_on()
+                    continue
+
+                # ── ADD (load a session for editing, not for reading) ─────────
+                if cmd == "ADD":
+                    _voice_off()
+                    if not os.path.isdir(SESSIONS_DIR) or not os.listdir(SESSIONS_DIR):
+                        _srvspeak(ctx, fb,
+                            "No saved books found. Say scan to start a new one.")
+                        fb.wait(timeout=4)
+                        _voice_on()
+                        continue
+
+                    # Announce the available session names so the user can pick one
+                    saved = []
+                    for fname in sorted(os.listdir(SESSIONS_DIR)):
+                        if not fname.endswith(".json"):
+                            continue
+                        try:
+                            with open(os.path.join(SESSIONS_DIR, fname),
+                                      encoding="utf-8") as _f:
+                                saved.append(json.load(_f))
+                        except Exception:
+                            pass
+
+                    names_str = ", ".join(
+                        s.get("name", "?") for s in saved[:5]
+                    )
+                    extra = f" and {len(saved) - 5} more" if len(saved) > 5 else ""
+                    _srvspeak(ctx, fb,
+                        f"Saved books: {names_str}{extra}. Say the book name.")
+                    fb.wait(timeout=6)
+
+                    raw_text = ""
+                    if mc_ok:
+                        try:
+                            raw_text, _ = mc.listen()
+                        except Exception:
+                            raw_text = ""
+
+                    if raw_text:
+                        sdata = _find_session(raw_text)
+                        if sdata:
+                            loaded_name  = sdata["name"]
+                            loaded_pages, loaded_idx = _pages_from_session(sdata)
+                            session_name = loaded_name
+                            pages.update(loaded_pages)
+                            page_idx     = max(page_idx, loaded_idx)
+                            n_loaded     = len(loaded_pages)
+                            _srvspeak(ctx, fb,
+                                f"Ready to add to {loaded_name}. "
+                                f"{n_loaded} page{'s' if n_loaded != 1 else ''} "
+                                "already saved. Say scan to capture a new page.")
+                        else:
+                            _srvspeak(ctx, fb,
+                                f"No book found matching {raw_text}.")
+                    else:
+                        _srvspeak(ctx, fb, "No name heard.")
+                    fb.wait(timeout=5)
                     _voice_on()
                     continue
 

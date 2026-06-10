@@ -57,6 +57,7 @@ from net.client                import ServerLink
 
 from features.money_recognition import MoneyRecognition
 from features.ocr_reader        import OCRReader
+from features.env_awareness     import EnvAwareness
 from features.programmable      import ProgrammableGestures
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -68,6 +69,7 @@ DEFAULT_CAL_PATH      = os.path.join(HERE, "calibration.json")
 FEATURES = [
     MoneyRecognition(),
     OCRReader(),
+    EnvAwareness(),
     ProgrammableGestures(),
 ]
 
