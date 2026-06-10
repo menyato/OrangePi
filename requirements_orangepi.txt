@@ -1,41 +1,52 @@
 # requirements_orangepi.txt
-# OrangePi 2W Zero — glove hub + voice client (gesture engine, STT, TTS, camera)
+# OrangePi Zero 2W — glove hub + voice client (gesture engine, STT, TTS, camera)
 # ──────────────────────────────────────────────────────────────────────────────
-# Install:
+# System packages first (run once):
 #   sudo apt update
-#   sudo apt install -y espeak-ng portaudio19-dev libsndfile1 \
+#   sudo apt install -y espeak-ng alsa-utils portaudio19-dev libsndfile1 \
 #                       python3-pip python3-dev build-essential python3-opencv
+#
+# Then install Python packages:
 #   pip3 install --break-system-packages -r requirements_orangepi.txt
 #
-# NOTE on OpenCV: install it with apt (python3-opencv) as shown above, NOT pip —
-# building opencv-python from source on a 512 MB ARM board is painfully slow and
-# usually OOMs. If you must use pip, use the headless wheel: opencv-python-headless
+# NOTE on OpenCV: always install via apt (python3-opencv) as shown above — do
+# NOT use pip on a 512 MB ARM board (builds from source, OOMs).  Only fall back
+# to the pip headless wheel if apt is unavailable:
+#   # opencv-python-headless==4.10.0.84
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Glove UART driver (glove_controller.py)
+# ── Serial / glove hardware ───────────────────────────────────────────────────
+# UART driver used by glove_controller.py
 pyserial==3.5
 
-# Voice activity detection — tiny C ext, replaces silero-vad + torch
-webrtcvad==2.0.10
-
-# STT — faster-whisper 'base' int8 on CPU (pulls ctranslate2, NOT torch)
+# ── Speech-to-text ────────────────────────────────────────────────────────────
+# faster-whisper: CTranslate2-backed Whisper, runs int8 on CPU — no PyTorch
 faster-whisper==1.1.1
 
-# Audio I/O — PortAudio bindings (mic capture + earcons)
+# ── Voice activity detection ──────────────────────────────────────────────────
+# Lightweight C extension; replaces the heavier silero-vad + torch stack
+webrtcvad==2.0.10
+
+# ── Audio I/O ─────────────────────────────────────────────────────────────────
+# PortAudio Python bindings (mic capture, earcon playback)
 sounddevice==0.5.1
 
-# Numerics (often pre-installed on Pi images, pinned anyway)
+# ── Numerics ──────────────────────────────────────────────────────────────────
+# Required by faster-whisper, cv2 keyframe extraction, and audio processing
 numpy>=1.24,<3.0
 
-# HTTP (kept from the original environment)
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+# Used by ServerLink (net/client.py) for the money / OCR server connection
 requests
 
-# ── OPTIONAL ──────────────────────────────────────────────────────────────────
-# Software noise cancellation before STT. Improves accuracy in noisy rooms.
-#   pip3 install --break-system-packages noisereduce
-# noisereduce
+# ── Environmental Awareness (Gemini vision API) ───────────────────────────────
+# google-genai is the official Google AI Python SDK (replaces google-generativeai)
+# Used by features/env_awareness.py to send keyframes to Gemini 2.5 Flash.
+# Requires a GEMINI_API_KEY — see README or add to ~/.env on the Pi.
+google-genai>=1.0.0
 
-# Camera frames: provided by OpenCV. Prefer apt 'python3-opencv' (see header).
-# If installing via pip instead, uncomment ONE of:
-# opencv-python-headless==4.10.0.84
-# opencv-python==4.10.0.84
+# ── OPTIONAL: noise cancellation ─────────────────────────────────────────────
+# Runs a spectral-gating filter before Whisper transcription.
+# Improves accuracy in noisy environments at the cost of ~100 ms extra latency.
+# Uncomment to enable:
+# noisereduce
