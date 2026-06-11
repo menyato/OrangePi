@@ -45,8 +45,6 @@ import json
 import os
 import queue
 import re
-import subprocess
-import tempfile
 import threading
 import time
 
@@ -398,144 +396,7 @@ def _ensure_mc(fb) -> bool:
             return False
 
 
-# ── voice worker ──────────────────────────────────────────────────────────────
-
-def _env_voice_worker(abort: threading.Event,
-                      voice_q: queue.Queue,
-                      stop_ev: threading.Event,
-                      proc_ref: list,
-                      fb_ref) -> None:
-    """
-    Interruptible voice worker: arecord subprocess + faster-whisper.
-    Puts the raw transcript string into voice_q so the outer loop can
-    handle both keyword commands and free-form questions to Gemini.
-    _voice_off() calls proc.terminate() + wait() to release the ALSA
-    input device immediately before TTS playback starts.
-    Falls back to mc.listen() when arecord is unavailable.
-    """
-    alsa_in = (getattr(mc, "ALSA_OUTPUT_DEVICE", None) or "default") if _MC_OK else "default"
-    wm      = getattr(mc, "whisper_model", None) if _MC_OK else None
-
-    # ── fallback: mc.listen() ────────────────────────────────────────────────
-    def _mc_fallback():
-        while not stop_ev.is_set() and not abort.is_set():
-            try:
-                if _MC_OK:
-                    text, _ = mc.listen()
-                    if text and not stop_ev.is_set():
-                        print(f"[ENV] voice (mc): {text!r}")
-                        voice_q.put(text.strip())
-                else:
-                    time.sleep(1.0)
-            except Exception:
-                time.sleep(0.5)
-
-    if wm is None:
-        _mc_fallback()
-        return
-
-    # ── main loop: arecord + Whisper ─────────────────────────────────────────
-    while not stop_ev.is_set() and not abort.is_set():
-        # Don't open the mic while TTS is playing — prevents ALSA conflict
-        while fb_ref.is_speaking() and not stop_ev.is_set():
-            time.sleep(0.05)
-        if stop_ev.is_set():
-            break
-        time.sleep(0.1)   # brief gap so ALSA fully releases after aplay
-        if stop_ev.is_set():
-            break
-
-        try:
-            fd, wav_tmp = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-        except Exception:
-            time.sleep(0.5)
-            continue
-
-        try:
-            proc = subprocess.Popen(
-                ["arecord", "-D", alsa_in, "-f", "S16_LE",
-                 "-r", "16000", "-c", "1", "-d", "4", "-q", wav_tmp],
-                stderr=subprocess.DEVNULL,
-            )
-        except FileNotFoundError:
-            try:
-                os.unlink(wav_tmp)
-            except OSError:
-                pass
-            print("[ENV] arecord not found — falling back to mc.listen()")
-            _mc_fallback()
-            return
-        except Exception as e:
-            print(f"[ENV] arecord start: {e}")
-            try:
-                os.unlink(wav_tmp)
-            except OSError:
-                pass
-            time.sleep(0.5)
-            continue
-
-        proc_ref[0] = proc
-
-        # Poll every 50 ms so stop_ev kills recording immediately
-        while proc.poll() is None:
-            if stop_ev.is_set() or abort.is_set():
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=0.5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                except Exception:
-                    pass
-                proc_ref[0] = None
-                try:
-                    os.unlink(wav_tmp)
-                except OSError:
-                    pass
-                return
-            time.sleep(0.05)
-
-        proc_ref[0] = None
-
-        if stop_ev.is_set() or abort.is_set():
-            try:
-                os.unlink(wav_tmp)
-            except OSError:
-                pass
-            break
-
-        text = ""
-        try:
-            segs, _ = wm.transcribe(
-                wav_tmp,
-                language="en",
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters={
-                    "threshold": 0.25,
-                    "min_speech_duration_ms": 100,
-                    "min_silence_duration_ms": 200,
-                },
-                initial_prompt=(
-                    "Commands: describe, scan, load, close, stop. "
-                    "Or ask any question about the environment."
-                ),
-                condition_on_previous_text=False,
-            )
-            text = " ".join(s.text for s in segs).strip()
-        except Exception as e:
-            print(f"[ENV] transcribe: {e}")
-        finally:
-            try:
-                os.unlink(wav_tmp)
-            except OSError:
-                pass
-
-        if text and not stop_ev.is_set():
-            print(f"[ENV] voice: {text!r}")
-            voice_q.put(text)
-            stop_ev.wait(0.15)
+# (voice worker is mc.voice_listen_loop — defined in orangepi_client.py)
 
 
 # ── classify ──────────────────────────────────────────────────────────────────
@@ -579,7 +440,6 @@ class EnvAwareness(Feature):
         gq      = ctx.gesture_queue
         voice_q = queue.Queue()
         stop_ev = threading.Event()
-        cur_proc: list = [None]
 
         history: list        = []
         session_name: "str | None" = None
@@ -611,30 +471,17 @@ class EnvAwareness(Feature):
 
         def _voice_on() -> None:
             nonlocal stop_ev
-            _kill_proc()
             stop_ev = threading.Event()
+            _drain()
             def _start():
                 time.sleep(1.0)
                 if not stop_ev.is_set() and not ctx.abort.is_set():
-                    _env_voice_worker(ctx.abort, voice_q, stop_ev, cur_proc, fb)
+                    if _MC_OK:
+                        mc.voice_listen_loop(voice_q, stop_ev, ctx.abort)
             threading.Thread(target=_start, daemon=True).start()
-
-        def _kill_proc() -> None:
-            proc = cur_proc[0]
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=0.5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                except Exception:
-                    pass
-                cur_proc[0] = None
 
         def _voice_off() -> None:
             stop_ev.set()
-            _kill_proc()
 
         def _drain() -> None:
             while True:

@@ -766,13 +766,14 @@ def listen(retries: int = 5) -> tuple[str, dict]:
 
         if corrected.strip():
             play_cue(_CUE_ACK)   # tells the blind user: heard you, working on it
+            _short = " ".join(corrected.split()[:4])
             print("\n" + "─" * 50)
             if corrections:
-                fixes = ", ".join(f"{a}→{b}" for a, b in corrections)
-                print(f"  RAW       →  {raw_text}")
-                print(f"  CORRECTED →  {corrected}   [{fixes}]")
+                fixes = ", ".join(f"{a}→{b}" for a, b in corrections[:4])
+                print(f"  RAW       →  {' '.join(raw_text.split()[:4])}")
+                print(f"  CORRECTED →  {_short}   [{fixes}]")
             else:
-                print(f"  YOU SAID  →  {corrected}")
+                print(f"  YOU SAID  →  {_short}")
             conf = audit["avg_logprob"]
             if conf is not None:
                 print(f"  confidence (avg_logprob) = {conf}")
@@ -789,6 +790,26 @@ def listen(retries: int = 5) -> tuple[str, dict]:
 
     return "", {"t_record": 0, "t_transcribe": 0, "raw_text": "",
                 "corrected_text": "", "corrections": [], "attempt": retries}
+
+
+def voice_listen_loop(voice_q, stop_ev, abort_ev) -> None:
+    """Shared blocking voice worker for features (OCR, Environmental Awareness, …).
+
+    Loops calling listen() and puts the corrected transcript into voice_q.
+    Returns when stop_ev or abort_ev is set.
+    Features start this in a daemon thread; stop_ev.set() ends it after the
+    current listen() call completes (listen() itself is not interruptible, but
+    each call is at most a few seconds).
+    """
+    while not stop_ev.is_set() and not abort_ev.is_set():
+        try:
+            text, _ = listen()
+        except Exception as e:
+            print(f"[VOICE] listen error: {e}")
+            import time as _t; _t.sleep(0.5)
+            continue
+        if text and not stop_ev.is_set():
+            voice_q.put(text.strip())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
