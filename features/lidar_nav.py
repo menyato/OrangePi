@@ -254,17 +254,25 @@ def _match_room(spoken: str, rooms: list) -> Optional[str]:
 class _LidarVoice:
     """
     Always-on background voice listener.
-    Uses sounddevice for mic capture, webrtcvad for VAD, faster-whisper for STT.
-    All three are in requirements_orangepi.txt — no PyAudio needed.
+    Uses sounddevice (mic), webrtcvad (VAD), faster-whisper/tiny (STT).
+    All in requirements_orangepi.txt — no PyAudio needed.
+
+    Architecture: audio callback is non-blocking — it only accumulates
+    PCM frames and posts completed utterances to a queue.  A separate
+    worker thread runs Whisper (0.3–1 s) so the mic never misses audio
+    while transcribing.
     """
     SAMPLERATE   = 16000
-    FRAME_MS     = 30           # webrtcvad supports 10 / 20 / 30 ms
-    SPEECH_LEAD  = 4            # consecutive speech frames to start recording
-    SILENCE_TAIL = 25           # consecutive silent frames to end utterance (~0.75 s)
-    MAX_FRAMES   = 300          # hard cap ~9 s
+    FRAME_MS     = 30          # webrtcvad supports 10/20/30 ms
+    SPEECH_LEAD  = 4           # speech frames needed to start recording
+    SILENCE_TAIL = 25          # silent frames to end utterance  (~0.75 s)
+    MAX_FRAMES   = 333         # hard cap ~10 s
 
     def __init__(self, cmd_q: queue.Queue):
-        self._q, self._stop, self._t = cmd_q, threading.Event(), None
+        self._q      = cmd_q
+        self._stop   = threading.Event()
+        self._utt_q  = queue.Queue()   # raw PCM bytes → ASR worker
+        self._t      = None
 
     def start(self) -> None:
         self._stop.clear()
@@ -274,12 +282,32 @@ class _LidarVoice:
     def stop(self) -> None:
         self._stop.set()
 
+    # ── ASR worker (runs Whisper in its own thread) ───────────────────────────
+    def _asr_worker(self, whisper) -> None:
+        import numpy as np
+        while not self._stop.is_set():
+            try:
+                pcm = self._utt_q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            try:
+                segs, _ = whisper.transcribe(arr, language="en", beam_size=1)
+                text = " ".join(s.text for s in segs).strip()
+                if text:
+                    print(f"[LIDAR VOICE] heard: {text!r}")
+                    cmd = _parse_voice(text)
+                    if cmd:
+                        self._q.put(cmd)
+            except Exception as exc:
+                print(f"[LIDAR VOICE] ASR error: {exc}")
+
+    # ── main thread: open mic stream, feed VAD ────────────────────────────────
     def _run(self) -> None:
         try:
             import sounddevice as sd
-            import numpy as np
         except ImportError as e:
-            print(f"[LIDAR VOICE] sounddevice not installed ({e}) — voice disabled.")
+            print(f"[LIDAR VOICE] sounddevice missing ({e}) — voice disabled.")
             return
 
         try:
@@ -291,20 +319,24 @@ class _LidarVoice:
 
         try:
             import webrtcvad
-            vad = webrtcvad.Vad(2)   # aggressiveness 0-3
+            vad = webrtcvad.Vad(2)
         except ImportError:
             vad = None
-            print("[LIDAR VOICE] webrtcvad not installed — VAD disabled, will record continuously.")
 
-        FRAME_SAMP = self.SAMPLERATE * self.FRAME_MS // 1000   # 480
+        # Start ASR worker before opening mic
+        asr_t = threading.Thread(target=self._asr_worker, args=(whisper,),
+                                 daemon=True, name="lidar-voice-asr")
+        asr_t.start()
 
-        ring         : list = []
+        FRAME_SAMP = self.SAMPLERATE * self.FRAME_MS // 1000   # 480 samples
+
+        ring         : list = []   # rolling pre-roll buffer (never cleared between utterances)
         speech       : list = []
         silent_count = 0
         speech_count = 0
         in_speech    = False
 
-        def _cb(data, frames, t_info, status):
+        def _cb(data, frames, _t, _s):
             nonlocal silent_count, speech_count, in_speech
             if self._stop.is_set():
                 raise sd.CallbackStop()
@@ -313,18 +345,21 @@ class _LidarVoice:
             frame = (_np.squeeze(data) * 32767).astype(_np.int16).tobytes()
             is_speech = vad.is_speech(frame, self.SAMPLERATE) if vad else True
 
+            # ── waiting for speech start ──────────────────────────────────────
             if not in_speech:
                 ring.append(frame)
-                if len(ring) > self.SPEECH_LEAD * 3:
-                    ring.pop(0)
+                if len(ring) > self.SPEECH_LEAD * 4:
+                    ring.pop(0)   # keep ring rolling — don't clear between utterances
                 if is_speech:
                     speech_count += 1
                     if speech_count >= self.SPEECH_LEAD:
                         in_speech = True
-                        speech[:] = list(ring)
+                        speech[:] = list(ring)   # include pre-roll
                         silent_count = 0
                 else:
                     speech_count = 0
+
+            # ── inside utterance ──────────────────────────────────────────────
             else:
                 speech.append(frame)
                 if is_speech:
@@ -333,26 +368,17 @@ class _LidarVoice:
                     silent_count += 1
 
                 if silent_count >= self.SILENCE_TAIL or len(speech) >= self.MAX_FRAMES:
-                    import numpy as _np
-                    pcm = b"".join(speech)
-                    arr = _np.frombuffer(pcm, dtype=_np.int16).astype(_np.float32) / 32768.0
                     try:
-                        segs, _ = whisper.transcribe(arr, language="en", beam_size=1)
-                        text = " ".join(s.text for s in segs).strip()
-                        if text:
-                            print(f"[LIDAR VOICE] heard: {text!r}")
-                            cmd = _parse_voice(text)
-                            if cmd:
-                                self._q.put(cmd)
-                    except Exception as exc:
-                        print(f"[LIDAR VOICE] transcribe error: {exc}")
+                        self._utt_q.put_nowait(b"".join(speech))
+                    except queue.Full:
+                        pass   # ASR busy; drop this utterance rather than block
                     speech.clear()
-                    ring.clear()
+                    # keep ring rolling — do NOT clear it here
                     in_speech    = False
                     speech_count = 0
                     silent_count = 0
 
-        print("[LIDAR VOICE] Ready (sounddevice+whisper) — say 'save kitchen', 'stop'…")
+        print("[LIDAR VOICE] Ready — say 'save kitchen', 'take me to bathroom', 'stop'…")
         try:
             with sd.InputStream(samplerate=self.SAMPLERATE, channels=1,
                                 dtype="float32", blocksize=FRAME_SAMP,
