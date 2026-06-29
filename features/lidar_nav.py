@@ -361,61 +361,83 @@ class _LidarVoice:
 
 # ─── radar PNG (obstacle live view) ──────────────────────────────────────────
 
-def _make_radar_png(front_m: float, left_m: float, right_m: float) -> Optional[bytes]:
+def _make_radar_png(scan) -> Optional[bytes]:
     """
-    400×400 top-down radar image showing obstacle distances.
-    Front = up, Left = left, Right = right.
-    Colours: red <0.3m, orange 0.3-0.6, yellow 0.6-1.0, green 1.0-1.5, grey >1.5.
+    Full 360° polar radar from a raw LaserScan.
+
+    Physical direction mapping (sensor is 90° rotated on the glove):
+      sensor  0° = physical LEFT   → appears LEFT  on screen
+      sensor 90° = physical FRONT  → appears TOP   on screen
+      sensor180° = physical RIGHT  → appears RIGHT on screen
+      sensor270° = physical BACK   → appears BOTTOM on screen
+
+    Colour = urgency: red <0.3m · orange <0.6m · yellow <1.0m · green <1.5m · grey beyond
     """
     try:
-        import cv2
-        import numpy as np
+        import cv2, numpy as np
     except ImportError:
         return None
 
-    SZ  = 400
-    CX  = CY = SZ // 2
-    SCL = 100   # pixels per metre; 1.5 m → 150 px fits in 200 px radius
+    SZ = 400; CX = CY = SZ // 2
+    DISP_MAX_M = 1.5
+    SCL = (SZ // 2 - 28) / DISP_MAX_M   # ~115 px/m, 28 px border margin
 
-    img = np.full((SZ, SZ, 3), 20, dtype=np.uint8)   # dark background
+    # subtract 90° so sensor 90° (physical FRONT) appears at the top
+    ROT = -math.pi / 2
+
+    img = np.full((SZ, SZ, 3), 18, dtype=np.uint8)
+
+    # faint compass spokes every 30°
+    for a_deg in range(0, 360, 30):
+        a = math.radians(a_deg)
+        ex = CX + int((SZ // 2 - 6) * math.sin(a))
+        ey = CY - int((SZ // 2 - 6) * math.cos(a))
+        cv2.line(img, (CX, CY), (ex, ey), (35, 35, 35), 1)
 
     # distance rings
-    for d, c in [(0.30, (0,0,140)), (0.60, (0,80,160)),
-                 (1.00, (0,150,150)), (1.50, (0,130,0))]:
-        cv2.circle(img, (CX, CY), int(d * SCL), c, 1)
-        cv2.putText(img, f"{d}m",
-                    (CX + int(d * SCL) + 3, CY - 3),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (100, 100, 100), 1)
+    for d_m, col in [(0.30, (80, 0, 0)), (0.60, (0, 60, 110)),
+                     (1.00, (0, 100, 100)), (1.50, (0, 90, 0))]:
+        r = int(d_m * SCL)
+        cv2.circle(img, (CX, CY), r, col, 1)
+        cv2.putText(img, f"{d_m}m", (CX + r + 2, CY - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (75, 75, 75), 1)
 
-    def _color(d):
-        if d < 0.30: return (0,   0, 255)
-        if d < 0.60: return (0, 100, 255)
-        if d < 1.00: return (0, 220, 255)
-        if d < 1.50: return (0, 255, 100)
-        return (70, 70, 70)
+    # plot every scan point
+    for ang_rad, dist_m in zip(scan.angles_rad, scan.ranges_m):
+        if dist_m <= 0:
+            continue
+        display_d = min(dist_m, DISP_MAX_M)
+        pa = ang_rad + ROT
+        px = CX + int(math.sin(pa) * display_d * SCL)
+        py = CY - int(math.cos(pa) * display_d * SCL)
 
-    def _draw(dist, dx, dy, label, lx, ly):
-        cap  = min(dist, 1.55)
-        px   = CX + int(dx * cap * SCL)
-        py   = CY + int(dy * cap * SCL)
-        col  = _color(dist)
-        cv2.line(img, (CX, CY), (px, py), col, 7)
-        cv2.circle(img, (px, py), 9, col, -1)
-        if dist < 10.0:
-            cv2.putText(img, f"{dist:.2f}m",
-                        (px + 6, py + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
-        cv2.putText(img, label, (lx, ly),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        if   dist_m < 0.30: col, r = (0,   0, 255), 4
+        elif dist_m < 0.60: col, r = (0,  80, 255), 3
+        elif dist_m < 1.00: col, r = (0, 200, 255), 2
+        elif dist_m < 1.50: col, r = (0, 255, 120), 2
+        else:                col, r = (50,  50,  50), 1   # beyond display range
 
-    # Front = up  (dy=-1), Left = left (dx=-1), Right = right (dx=+1)
-    _draw(front_m,  0, -1, "FRONT", CX - 25,  16)
-    _draw(left_m,  -1,  0, "LEFT",   8, CY + 5)
-    _draw(right_m,  1,  0, "RIGHT", SZ - 55, CY + 5)
+        cv2.circle(img, (px, py), r, col, -1)
 
-    # sensor dot
-    cv2.circle(img, (CX, CY), 8, (255, 255, 255), -1)
-    cv2.circle(img, (CX, CY), 11, (180, 180, 180), 1)
+    # sector minimums for text (corrected physical mapping)
+    def _d(v): return f"{v:.2f}m" if v < 9.9 else u"—"
+    front_m = _sector_min(scan,  90)   # sensor  90° = physical FRONT
+    back_m  = _sector_min(scan, 270)   # sensor 270° = physical BACK
+    left_m  = _sector_min(scan,   0)   # sensor   0° = physical LEFT
+    right_m = _sector_min(scan, 180)   # sensor 180° = physical RIGHT
+
+    cv2.putText(img, "FRONT",     (CX - 30,  14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,200), 1)
+    cv2.putText(img, _d(front_m), (CX - 24,  30), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,100), 1)
+    cv2.putText(img, "BACK",      (CX - 22, SZ - 6),  cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,200), 1)
+    cv2.putText(img, _d(back_m),  (CX - 22, SZ - 19), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,100), 1)
+    cv2.putText(img, "LEFT",      (4,  CY -  8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,200), 1)
+    cv2.putText(img, _d(left_m),  (4,  CY +  9), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,100), 1)
+    cv2.putText(img, "RIGHT",     (SZ - 60, CY -  8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,200), 1)
+    cv2.putText(img, _d(right_m), (SZ - 54, CY +  9), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,100), 1)
+
+    # sensor origin dot
+    cv2.circle(img, (CX, CY), 5, (255, 255, 255), -1)
+    cv2.circle(img, (CX, CY), 9, (150, 150, 150), 1)
 
     ok, buf = cv2.imencode(".png", img)
     return buf.tobytes() if ok else None
@@ -686,7 +708,7 @@ class LidarObstacleTest(Feature):
 
                 # live radar → server every 1 s
                 if ctx.link and now - last_radar_up >= 1.0:
-                    radar = _make_radar_png(front_m, left_m, right_m)
+                    radar = _make_radar_png(scan)
                     if radar:
                         ctx.link.send("lidar", {
                             "action": "map_update", "room_name": "live_obstacles",
