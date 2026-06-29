@@ -290,7 +290,8 @@ def main() -> None:
                 abort.set()
 
         voice = VoiceListener(on_command=_voice_abort)
-        if not args.no_voice:
+        # lidar_nav starts its own speech listener (mic conflict if both run)
+        if not args.no_voice and bypass_name != "lidar":
             voice.start()
 
         feedback.speak(
