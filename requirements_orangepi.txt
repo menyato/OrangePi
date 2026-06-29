@@ -45,6 +45,22 @@ requests
 # Requires a GEMINI_API_KEY — see README or add to ~/.env on the Pi.
 google-genai>=1.0.0
 
+# ── LiDAR (MS200) + SLAM ──────────────────────────────────────────────────────
+# pyserial already listed above — used by both GloveController and MS200Adapter.
+#
+# scipy: medfilt (lidar_adapter.py), least_squares + KDTree (slam_engine.py).
+# Install the pre-built ARMv8 wheel from piwheels — do NOT build from source
+# on a 512 MB board (it will OOM or take 30+ minutes):
+#   pip3 install --break-system-packages \
+#       --extra-index-url https://www.piwheels.org/simple scipy
+scipy>=1.11
+
+# OPTIONAL — GPU acceleration via CuPy (ICP + ScanContext distance).
+# OrangePi Zero 2W has no CUDA; slam_engine.py falls back to scipy/CPU
+# automatically when cupy is not importable.  Only install if you attach
+# a CUDA-capable co-processor or use a different board:
+# cupy-cuda12x
+
 # ── OPTIONAL: noise cancellation ─────────────────────────────────────────────
 # Runs a spectral-gating filter before Whisper transcription.
 # Improves accuracy in noisy environments at the cost of ~100 ms extra latency.
