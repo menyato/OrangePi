@@ -53,11 +53,6 @@ try:
 except ImportError:
     _LIDAR_OK = False
 
-try:
-    import speech_recognition as sr
-    _SR_OK = True
-except ImportError:
-    _SR_OK = False
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 DEFAULT_PORT      = "auto"
@@ -250,16 +245,24 @@ def _match_room(spoken: str, rooms: list) -> Optional[str]:
     return rooms[flat.index(matches[0])] if matches else None
 
 
-# ─── internal voice listener ──────────────────────────────────────────────────
+# ─── internal voice listener (sounddevice + faster-whisper, no PyAudio) ───────
 
 class _LidarVoice:
+    """
+    Always-on background voice listener.
+    Uses sounddevice for mic capture, webrtcvad for VAD, faster-whisper for STT.
+    All three are in requirements_orangepi.txt — no PyAudio needed.
+    """
+    SAMPLERATE   = 16000
+    FRAME_MS     = 30           # webrtcvad supports 10 / 20 / 30 ms
+    SPEECH_LEAD  = 4            # consecutive speech frames to start recording
+    SILENCE_TAIL = 25           # consecutive silent frames to end utterance (~0.75 s)
+    MAX_FRAMES   = 300          # hard cap ~9 s
+
     def __init__(self, cmd_q: queue.Queue):
         self._q, self._stop, self._t = cmd_q, threading.Event(), None
 
     def start(self) -> None:
-        if not _SR_OK:
-            print("[LIDAR VOICE] SpeechRecognition not installed — voice disabled.")
-            return
         self._stop.clear()
         self._t = threading.Thread(target=self._run, daemon=True, name="lidar-voice")
         self._t.start()
@@ -268,37 +271,92 @@ class _LidarVoice:
         self._stop.set()
 
     def _run(self) -> None:
-        r = sr.Recognizer()
-        r.energy_threshold = 3000
-        r.dynamic_energy_threshold = True
-        r.pause_threshold  = 0.6
         try:
-            mic = sr.Microphone()
-        except Exception as e:
-            print(f"[LIDAR VOICE] cannot open mic: {e}")
-            print("[LIDAR VOICE] install PyAudio:  "
-                  "pip install --extra-index-url https://www.piwheels.org/simple pyaudio")
+            import sounddevice as sd
+            import numpy as np
+        except ImportError as e:
+            print(f"[LIDAR VOICE] sounddevice not installed ({e}) — voice disabled.")
             return
-        with mic as source:
-            r.adjust_for_ambient_noise(source, duration=1.5)
-            print("[LIDAR VOICE] Ready — 'save kitchen', 'take me to bathroom', 'stop'.")
-            while not self._stop.is_set():
-                try:
-                    audio = r.listen(source, timeout=5, phrase_time_limit=8)
-                except sr.WaitTimeoutError:
-                    continue
-                except Exception:
-                    continue
-                try:
-                    text = r.recognize_google(audio).lower().strip()
-                    print(f"[LIDAR VOICE] heard: {text!r}")
-                    cmd = _parse_voice(text)
-                    if cmd:
-                        self._q.put(cmd)
-                except sr.UnknownValueError:
-                    pass
-                except Exception as e:
-                    print(f"[LIDAR VOICE] error: {e}")
+
+        try:
+            from faster_whisper import WhisperModel
+            whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
+        except Exception as e:
+            print(f"[LIDAR VOICE] faster-whisper unavailable ({e}) — voice disabled.")
+            return
+
+        try:
+            import webrtcvad
+            vad = webrtcvad.Vad(2)   # aggressiveness 0-3
+        except ImportError:
+            vad = None
+            print("[LIDAR VOICE] webrtcvad not installed — VAD disabled, will record continuously.")
+
+        FRAME_SAMP = self.SAMPLERATE * self.FRAME_MS // 1000   # 480
+
+        ring         : list = []
+        speech       : list = []
+        silent_count = 0
+        speech_count = 0
+        in_speech    = False
+
+        def _cb(data, frames, t_info, status):
+            nonlocal silent_count, speech_count, in_speech
+            if self._stop.is_set():
+                raise sd.CallbackStop()
+
+            import numpy as _np
+            frame = (_np.squeeze(data) * 32767).astype(_np.int16).tobytes()
+            is_speech = vad.is_speech(frame, self.SAMPLERATE) if vad else True
+
+            if not in_speech:
+                ring.append(frame)
+                if len(ring) > self.SPEECH_LEAD * 3:
+                    ring.pop(0)
+                if is_speech:
+                    speech_count += 1
+                    if speech_count >= self.SPEECH_LEAD:
+                        in_speech = True
+                        speech[:] = list(ring)
+                        silent_count = 0
+                else:
+                    speech_count = 0
+            else:
+                speech.append(frame)
+                if is_speech:
+                    silent_count = 0
+                else:
+                    silent_count += 1
+
+                if silent_count >= self.SILENCE_TAIL or len(speech) >= self.MAX_FRAMES:
+                    import numpy as _np
+                    pcm = b"".join(speech)
+                    arr = _np.frombuffer(pcm, dtype=_np.int16).astype(_np.float32) / 32768.0
+                    try:
+                        segs, _ = whisper.transcribe(arr, language="en", beam_size=1)
+                        text = " ".join(s.text for s in segs).strip()
+                        if text:
+                            print(f"[LIDAR VOICE] heard: {text!r}")
+                            cmd = _parse_voice(text)
+                            if cmd:
+                                self._q.put(cmd)
+                    except Exception as exc:
+                        print(f"[LIDAR VOICE] transcribe error: {exc}")
+                    speech.clear()
+                    ring.clear()
+                    in_speech    = False
+                    speech_count = 0
+                    silent_count = 0
+
+        print("[LIDAR VOICE] Ready (sounddevice+whisper) — say 'save kitchen', 'stop'…")
+        try:
+            with sd.InputStream(samplerate=self.SAMPLERATE, channels=1,
+                                dtype="float32", blocksize=FRAME_SAMP,
+                                callback=_cb):
+                while not self._stop.is_set():
+                    time.sleep(0.05)
+        except Exception as e:
+            print(f"[LIDAR VOICE] stream error: {e}")
 
 
 # ─── radar PNG (obstacle live view) ──────────────────────────────────────────
