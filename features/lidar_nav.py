@@ -274,8 +274,10 @@ class _LidarVoice:
         r.pause_threshold  = 0.6
         try:
             mic = sr.Microphone()
-        except OSError as e:
-            print(f"[LIDAR VOICE] mic error: {e}")
+        except Exception as e:
+            print(f"[LIDAR VOICE] cannot open mic: {e}")
+            print("[LIDAR VOICE] install PyAudio:  "
+                  "pip install --extra-index-url https://www.piwheels.org/simple pyaudio")
             return
         with mic as source:
             r.adjust_for_ambient_noise(source, duration=1.5)
@@ -297,6 +299,68 @@ class _LidarVoice:
                     pass
                 except Exception as e:
                     print(f"[LIDAR VOICE] error: {e}")
+
+
+# ─── radar PNG (obstacle live view) ──────────────────────────────────────────
+
+def _make_radar_png(front_m: float, left_m: float, right_m: float) -> Optional[bytes]:
+    """
+    400×400 top-down radar image showing obstacle distances.
+    Front = up, Left = left, Right = right.
+    Colours: red <0.3m, orange 0.3-0.6, yellow 0.6-1.0, green 1.0-1.5, grey >1.5.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+
+    SZ  = 400
+    CX  = CY = SZ // 2
+    SCL = 100   # pixels per metre; 1.5 m → 150 px fits in 200 px radius
+
+    img = np.full((SZ, SZ, 3), 20, dtype=np.uint8)   # dark background
+
+    # distance rings
+    for d, c in [(0.30, (0,0,140)), (0.60, (0,80,160)),
+                 (1.00, (0,150,150)), (1.50, (0,130,0))]:
+        cv2.circle(img, (CX, CY), int(d * SCL), c, 1)
+        cv2.putText(img, f"{d}m",
+                    (CX + int(d * SCL) + 3, CY - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (100, 100, 100), 1)
+
+    def _color(d):
+        if d < 0.30: return (0,   0, 255)
+        if d < 0.60: return (0, 100, 255)
+        if d < 1.00: return (0, 220, 255)
+        if d < 1.50: return (0, 255, 100)
+        return (70, 70, 70)
+
+    def _draw(dist, dx, dy, label, lx, ly):
+        cap  = min(dist, 1.55)
+        px   = CX + int(dx * cap * SCL)
+        py   = CY + int(dy * cap * SCL)
+        col  = _color(dist)
+        cv2.line(img, (CX, CY), (px, py), col, 7)
+        cv2.circle(img, (px, py), 9, col, -1)
+        if dist < 10.0:
+            cv2.putText(img, f"{dist:.2f}m",
+                        (px + 6, py + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+        cv2.putText(img, label, (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+    # Front = up  (dy=-1), Left = left (dx=-1), Right = right (dx=+1)
+    _draw(front_m,  0, -1, "FRONT", CX - 25,  16)
+    _draw(left_m,  -1,  0, "LEFT",   8, CY + 5)
+    _draw(right_m,  1,  0, "RIGHT", SZ - 55, CY + 5)
+
+    # sensor dot
+    cv2.circle(img, (CX, CY), 8, (255, 255, 255), -1)
+    cv2.circle(img, (CX, CY), 11, (180, 180, 180), 1)
+
+    ok, buf = cv2.imencode(".png", img)
+    return buf.tobytes() if ok else None
 
 
 # ─── report helpers ───────────────────────────────────────────────────────────
@@ -469,6 +533,8 @@ class LidarNavigation(Feature):
                 if mode == "mapping" and result.room_match:
                     ctx.feedback.speak(f"Recognised: {result.room_match.replace('_',' ')}.")
 
+        except KeyboardInterrupt:
+            ctx.abort.set()
         finally:
             ctx.abort.set()
             voice.stop()
@@ -516,7 +582,7 @@ class LidarObstacleTest(Feature):
         ctx.feedback.speak("Obstacle test. Walk around. Say stop to finish.")
         session_id  = time.strftime("%Y%m%d_%H%M%S")
         t0          = time.time()
-        last_haptic = 0.0
+        last_haptic = last_radar_up = 0.0
         events: list = []
 
         try:
@@ -560,6 +626,18 @@ class LidarObstacleTest(Feature):
                     "motor_ms" : motor[1] if motor else None,
                 })
 
+                # live radar → server every 1 s
+                if ctx.link and now - last_radar_up >= 1.0:
+                    radar = _make_radar_png(front_m, left_m, right_m)
+                    if radar:
+                        ctx.link.send("lidar", {
+                            "action": "map_update", "room_name": "live_obstacles",
+                            "frame": radar,
+                        })
+                    last_radar_up = now
+
+        except KeyboardInterrupt:
+            ctx.abort.set()
         finally:
             voice.stop()
             scan_t.join(timeout=2.0)
@@ -638,6 +716,7 @@ class LidarMappingTest(Feature):
         t0          = time.time()
         last_haptic = last_map_up = 0.0
         loop_closures = 0
+        _report_sent = False
 
         ctx.feedback.speak(
             "Mapping test. Walk to build the map. "
@@ -661,6 +740,7 @@ class LidarMappingTest(Feature):
                             if ok:
                                 _send_mapping_report(slam, ctx, session_id, t0,
                                                      loop_closures, name)
+                                _report_sent = True
                         elif tag == "list":
                             rooms = slam.list_rooms()
                             ctx.feedback.speak(
@@ -680,6 +760,7 @@ class LidarMappingTest(Feature):
                             if ok:
                                 _send_mapping_report(slam, ctx, session_id, t0,
                                                      loop_closures, name)
+                                _report_sent = True
                     except queue.Empty:
                         pass
 
@@ -703,10 +784,16 @@ class LidarMappingTest(Feature):
                 # obstacle detection always on
                 last_haptic = _obstacle_haptics(scan, ctx, last_haptic)
 
+        except KeyboardInterrupt:
+            ctx.abort.set()
         finally:
             voice.stop()
             scan_t.join(timeout=2.0)
             adapter.stop()
+            _send_map(ctx, "live_map", slam, action="map_update")
+            if not _report_sent and len(slam.keyframes) >= MIN_KF_TO_SAVE:
+                _send_mapping_report(slam, ctx, session_id, t0,
+                                     loop_closures, "unsaved_session")
 
 
 def _send_mapping_report(slam, ctx, session_id, t0, loop_closures, room_name):
@@ -869,6 +956,8 @@ class LidarNavigateTest(Feature):
                     )
                     last_nav_spk = now
 
+        except KeyboardInterrupt:
+            ctx.abort.set()
         finally:
             voice.stop()
             scan_t.join(timeout=2.0)
