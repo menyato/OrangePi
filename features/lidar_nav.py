@@ -100,10 +100,22 @@ class LidarNavigation(Feature):
             )
             return
 
+        # ── Resolve port (auto-detect if not set explicitly) ──────────────────
+        port = self.port
+        if port == "auto":
+            ctx.feedback.speak("Searching for lidar.")
+            port = MS200Adapter.find_port(baud=LIDAR_BAUD, timeout=2.0)
+            if port is None:
+                ctx.feedback.speak(
+                    "Lidar not found. Check the USB cable and try again."
+                )
+                return
+            ctx.feedback.speak(f"Lidar found.")
+
         # ── Open serial adapter ───────────────────────────────────────────────
         try:
             adapter = MS200Adapter(
-                port          = self.port,
+                port          = port,
                 baud          = LIDAR_BAUD,
                 median_kernel = 5,
                 max_jump_m    = 0.5,

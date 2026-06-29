@@ -31,6 +31,10 @@ webrtcvad==2.0.10
 # PortAudio Python bindings (mic capture, earcon playback)
 sounddevice==0.5.1
 
+# ── Speech recognition ────────────────────────────────────────────────────────
+# Used by gesture_hub/voice.py for the voice command listener
+SpeechRecognition>=3.10
+
 # ── Numerics ──────────────────────────────────────────────────────────────────
 # Required by faster-whisper, cv2 keyframe extraction, and audio processing
 numpy>=1.24,<3.0

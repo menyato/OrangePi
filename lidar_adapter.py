@@ -116,6 +116,56 @@ class MS200Adapter:
             "points_total": 0, "points_filtered": 0,
         }
 
+    # ── auto-detect ───────────────────────────────────────────────────────────
+    @staticmethod
+    def find_port(baud: int = 230400, timeout: float = 2.0) -> Optional[str]:
+        """
+        Scan all USB/ACM serial ports and return the first one that streams
+        valid MS200 frames (0x54 0x2C header) within `timeout` seconds.
+        Returns None if nothing found.
+
+        Usage:
+            port = MS200Adapter.find_port()
+            if port:
+                adapter = MS200Adapter(port)
+        """
+        import glob
+        candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        if not candidates:
+            print("[MS200] find_port: no USB/ACM serial devices found.")
+            return None
+
+        print(f"[MS200] find_port: probing {candidates}")
+        for port in candidates:
+            try:
+                s = serial.Serial(port, baud, timeout=0.1)
+                s.reset_input_buffer()
+                deadline = time.time() + timeout
+                found = False
+                buf = bytearray()
+                while time.time() < deadline:
+                    chunk = s.read(256)
+                    if chunk:
+                        buf.extend(chunk)
+                    # look for 0x54 0x2C anywhere in buffer
+                    for i in range(len(buf) - 1):
+                        if buf[i] == 0x54 and buf[i + 1] == 0x2C:
+                            found = True
+                            break
+                    if found:
+                        break
+                s.close()
+                if found:
+                    print(f"[MS200] find_port: MS200 detected on {port}")
+                    return port
+                else:
+                    print(f"[MS200] find_port: no MS200 frames on {port}")
+            except Exception as e:
+                print(f"[MS200] find_port: {port} error — {e}")
+
+        print("[MS200] find_port: MS200 not found on any port.")
+        return None
+
     def start(self) -> None:
         self._ser = serial.Serial(self.port, self.baud, timeout=0.05)
         self._ser.reset_input_buffer()

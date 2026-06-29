@@ -158,8 +158,10 @@ def main() -> None:
                            help="Launch Lidar Navigation directly (no gesture needed).")
 
     # ── lidar-specific ────────────────────────────────────────────────────────
-    ap.add_argument("--lidar-port", default="/dev/ttyUSB0",
-                    help="Serial port for the MS200 LiDAR (default: /dev/ttyUSB0).")
+    ap.add_argument("--lidar-port", default="auto",
+                    help="Serial port for the MS200 LiDAR. "
+                         "Default 'auto' scans all /dev/ttyUSB* and /dev/ttyACM* "
+                         "and picks the first that streams MS200 frames.")
 
     # ── gesture management ────────────────────────────────────────────────────
     ap.add_argument("--reset-gestures", action="store_true",
