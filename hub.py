@@ -35,11 +35,22 @@ Modes:
   python3 hub.py --monitor       live ATmega feed + gesture match view
   python3 hub.py --calibrate     run per-hand calibration, save, then run
   python3 hub.py --threshold 35  override bend threshold %, then run
+
+Feature bypass (no gesture needed — for testing only):
+  python3 hub.py --money         launch Money Recognition directly
+  python3 hub.py --ocr           launch OCR Reader directly
+  python3 hub.py --env           launch Environment Awareness directly
+  python3 hub.py --lidar         launch Lidar Navigation directly
+
+Gesture management:
+  python3 hub.py --reset-gestures   clear all user-assigned feature gestures
+                                    (forces re-enrollment on next boot)
 """
 
 import argparse
 import os
 import sys
+import threading
 import time
 
 from glove_controller import GloveController
@@ -59,19 +70,12 @@ from features.money_recognition import MoneyRecognition
 from features.ocr_reader        import OCRReader
 from features.env_awareness     import EnvAwareness
 from features.programmable      import ProgrammableGestures
+from features.lidar_nav         import LidarNavigation
+from features.base              import FeatureContext
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GESTURES_PATH = os.path.join(HERE, "gestures.json")
 DEFAULT_CAL_PATH      = os.path.join(HERE, "calibration.json")
-
-# ── Register features here (enrollment + Programmable panel order) ─────────
-# ProgrammableGestures should always be last.
-FEATURES = [
-    MoneyRecognition(),
-    OCRReader(),
-    EnvAwareness(),
-    ProgrammableGestures(),
-]
 
 
 def _probe_devices(feedback, link) -> None:
@@ -117,27 +121,66 @@ def _probe_devices(feedback, link) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="OrangePi gesture hub")
+
+    # ── connectivity ──────────────────────────────────────────────────────────
     ap.add_argument("--host",      default="10.254.249.159", help="Server IP")
     ap.add_argument("--port",      default=9000, type=int,   help="Server port")
     ap.add_argument("--uart",      default="/dev/ttyS5",     help="ATmega UART device")
     ap.add_argument("--baud",      default=115200, type=int, help="UART baud rate")
     ap.add_argument("--alsa",      default=None,
                     help="ALSA device for hub speech, e.g. plughw:0,0")
+
+    # ── paths ─────────────────────────────────────────────────────────────────
     ap.add_argument("--gestures",  default=DEFAULT_GESTURES_PATH,
                     help="Path to gestures.json")
     ap.add_argument("--cal",       default=DEFAULT_CAL_PATH,
                     help="Path to calibration.json")
+
+    # ── standard modes ────────────────────────────────────────────────────────
     ap.add_argument("--monitor",   action="store_true",
                     help="Show live ATmega feed + gesture matches, then exit.")
     ap.add_argument("--calibrate", action="store_true",
                     help="Run per-hand flex calibration, save it, then run normally.")
     ap.add_argument("--threshold", type=int, default=None,
                     help="Override firmware bend threshold percent (10-90).")
-    ap.add_argument("--no-voice", action="store_true",
+    ap.add_argument("--no-voice",  action="store_true",
                     help="Disable voice commands (useful if no microphone).")
+
+    # ── feature bypass (testing — skips gesture recognition entirely) ─────────
+    feat_grp = ap.add_mutually_exclusive_group()
+    feat_grp.add_argument("--money", action="store_true",
+                           help="Launch Money Recognition directly (no gesture needed).")
+    feat_grp.add_argument("--ocr",   action="store_true",
+                           help="Launch OCR Reader directly (no gesture needed).")
+    feat_grp.add_argument("--env",   action="store_true",
+                           help="Launch Environment Awareness directly (no gesture needed).")
+    feat_grp.add_argument("--lidar", action="store_true",
+                           help="Launch Lidar Navigation directly (no gesture needed).")
+
+    # ── lidar-specific ────────────────────────────────────────────────────────
+    ap.add_argument("--lidar-port", default="/dev/ttyUSB0",
+                    help="Serial port for the MS200 LiDAR (default: /dev/ttyUSB0).")
+
+    # ── gesture management ────────────────────────────────────────────────────
+    ap.add_argument("--reset-gestures", action="store_true",
+                    help="Clear all user-assigned feature gestures and exit. "
+                         "Forces full re-enrollment on the next boot.")
+
     args = ap.parse_args()
 
-    # ── Load gesture store + calibration store ─────────────────────────────
+    # ── Feature list (built here so --lidar-port is available) ───────────────
+    lidar_feat = LidarNavigation()
+    lidar_feat.port = args.lidar_port
+
+    FEATURES = [
+        MoneyRecognition(),
+        OCRReader(),
+        EnvAwareness(),
+        lidar_feat,
+        ProgrammableGestures(),  # always last
+    ]
+
+    # ── Load gesture store + calibration store ────────────────────────────────
     store     = GestureStore(args.gestures)
     cal_store = CalStore(args.cal)
 
@@ -148,7 +191,17 @@ def main() -> None:
               f"  (flex=0x{spec.flex_mask:02X} imu=0x{spec.imu_mask:02X}"
               f" {spec.motion.value})")
 
-    # ── Open glove ─────────────────────────────────────────────────────────
+    # ── --reset-gestures: wipe FEAT:* keys, save, exit ───────────────────────
+    if args.reset_gestures:
+        feat_keys = [k for k in store.gestures if k.startswith("FEAT:")]
+        for k in feat_keys:
+            del store.gestures[k]
+        store.save()
+        print(f"[HUB] Reset {len(feat_keys)} user gesture(s): {feat_keys}")
+        print("[HUB] Re-enrollment will run on next boot. Exiting.")
+        return
+
+    # ── Open glove ────────────────────────────────────────────────────────────
     controller = GloveController(port=args.uart, baud=args.baud)
     feedback   = Feedback(controller, alsa=args.alsa)
 
@@ -157,7 +210,7 @@ def main() -> None:
         sys.exit(1)
     time.sleep(0.5)   # let first frames arrive
 
-    # ── MONITOR mode ────────────────────────────────────────────────────────
+    # ── MONITOR mode ──────────────────────────────────────────────────────────
     if args.monitor:
         if cal_store.has_calibration():
             print("[HUB] Restoring saved calibration before monitor...")
@@ -170,7 +223,7 @@ def main() -> None:
             controller.stop()
         return
 
-    # ── Threshold override ──────────────────────────────────────────────────
+    # ── Threshold override ────────────────────────────────────────────────────
     if args.threshold is not None:
         try:
             controller.set_threshold(args.threshold)
@@ -179,7 +232,7 @@ def main() -> None:
         except ValueError as e:
             print(f"[HUB] Threshold error: {e}")
 
-    # ── Calibration ─────────────────────────────────────────────────────────
+    # ── Calibration ───────────────────────────────────────────────────────────
     # Always save after a successful calibration so the next boot auto-restores.
     if args.calibrate:
         result = diagnostics.run_calibration(controller, say=feedback.speak)
@@ -208,7 +261,55 @@ def main() -> None:
     else:
         print("[HUB] No saved calibration. Run with --calibrate to set one.")
 
-    # ── Build engine with ALL known gestures ────────────────────────────────
+    # ── Feature bypass (--money / --ocr / --env / --lidar) ───────────────────
+    # Bypasses the state machine entirely; runs the feature directly.
+    # Voice "stop" (→ START) sets the abort event to exit cleanly.
+    bypass_name = (
+        "money" if args.money else
+        "ocr"   if args.ocr   else
+        "env"   if args.env   else
+        "lidar" if args.lidar else
+        None
+    )
+    if bypass_name:
+        feat_map = {f.name: f for f in FEATURES}
+        feat = feat_map.get(bypass_name)
+        if feat is None:
+            print(f"[HUB] Feature {bypass_name!r} not in registry.")
+            controller.stop()
+            return
+
+        abort = threading.Event()
+        link  = ServerLink(args.host, args.port)
+        link.connect()
+
+        def _voice_abort(cmd: str) -> None:
+            if cmd in ("START", "OCR_CLOSE"):
+                abort.set()
+
+        voice = VoiceListener(on_command=_voice_abort)
+        if not args.no_voice:
+            voice.start()
+
+        feedback.speak(
+            f"Test mode: {feat.title}. Say stop or press Ctrl-C to quit."
+        )
+        try:
+            feat.run(FeatureContext(
+                link          = link,
+                abort         = abort,
+                feedback      = feedback,
+                gesture_queue = None,
+            ))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            voice.stop()
+            controller.stop()
+            link.close()
+        return
+
+    # ── Normal run — build engine + state machine ─────────────────────────────
     # The engine always knows the full store (system gestures + feature gestures
     # that have already been assigned).  The state machine decides which fired
     # gesture names to act on based on the current state.
