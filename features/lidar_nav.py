@@ -63,6 +63,8 @@ SLAM_SIZE_M       = 30.0
 SECTOR_HALF_DEG   = 45.0
 _DIST_LEVELS      = [(0.30, 420), (0.60, 300), (1.00, 160), (1.50, 70)]
 HAPTIC_INTERVAL   = 0.22
+# LiDAR is inside a stabilizer — ignore returns closer than this (own housing)
+MIN_OBSTACLE_M    = 0.10      # 10 cm; raise if motors still fire on housing
 NAV_SPEAK_S       = 6.0
 MIN_KF_TO_SAVE    = 5
 POSE_UPDATE_S     = 2.0
@@ -110,11 +112,13 @@ def _scan_worker(adapter, scan_q: queue.Queue, abort):
 
 # ─── geometry ─────────────────────────────────────────────────────────────────
 
-def _sector_min(scan, center_deg: float, half_deg: float = SECTOR_HALF_DEG) -> float:
+def _sector_min(scan, center_deg: float,
+                half_deg: float = SECTOR_HALF_DEG,
+                min_m: float = 0.0) -> float:
     lo = math.radians((center_deg - half_deg) % 360)
     hi = math.radians((center_deg + half_deg) % 360)
     a, r = scan.angles_rad, scan.ranges_m
-    mask = ((a >= lo) & (a <= hi) if lo <= hi else (a >= lo) | (a <= hi)) & (r > 0)
+    mask = ((a >= lo) & (a <= hi) if lo <= hi else (a >= lo) | (a <= hi)) & (r > min_m)
     return float(r[mask].min()) if mask.any() else float("inf")
 
 
@@ -149,9 +153,9 @@ def _obstacle_haptics(scan, ctx, last_haptic: float,
     if now - last_haptic < HAPTIC_INTERVAL:
         return last_haptic
 
-    front_ms = _dist_ms(_sector_min(scan,   0))
-    left_ms  = _dist_ms(_sector_min(scan,  90))
-    right_ms = _dist_ms(_sector_min(scan, 270))
+    front_ms = _dist_ms(_sector_min(scan,   0, min_m=MIN_OBSTACLE_M))
+    left_ms  = _dist_ms(_sector_min(scan,  90, min_m=MIN_OBSTACLE_M))
+    right_ms = _dist_ms(_sector_min(scan, 270, min_m=MIN_OBSTACLE_M))
 
     if front_ms:
         ctx.feedback._pulse(3, front_ms)
@@ -402,9 +406,9 @@ def _make_radar_png(scan) -> Optional[bytes]:
         cv2.putText(img, f"{d_m}m", (CX + r + 2, CY - 3),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.28, (75, 75, 75), 1)
 
-    # plot every scan point
+    # plot every scan point (skip stabilizer housing returns)
     for ang_rad, dist_m in zip(scan.angles_rad, scan.ranges_m):
-        if dist_m <= 0:
+        if dist_m <= MIN_OBSTACLE_M:
             continue
         display_d = min(dist_m, DISP_MAX_M)
         pa = ang_rad + ROT
@@ -419,12 +423,12 @@ def _make_radar_png(scan) -> Optional[bytes]:
 
         cv2.circle(img, (px, py), r, col, -1)
 
-    # sector minimums for text (corrected physical mapping)
+    # sector minimums for text (corrected physical mapping, housing filtered)
     def _d(v): return f"{v:.2f}m" if v < 9.9 else u"—"
-    front_m = _sector_min(scan,  90)   # sensor  90° = physical FRONT
-    back_m  = _sector_min(scan, 270)   # sensor 270° = physical BACK
-    left_m  = _sector_min(scan,   0)   # sensor   0° = physical LEFT
-    right_m = _sector_min(scan, 180)   # sensor 180° = physical RIGHT
+    front_m = _sector_min(scan,  90, min_m=MIN_OBSTACLE_M)
+    back_m  = _sector_min(scan, 270, min_m=MIN_OBSTACLE_M)
+    left_m  = _sector_min(scan,   0, min_m=MIN_OBSTACLE_M)
+    right_m = _sector_min(scan, 180, min_m=MIN_OBSTACLE_M)
 
     cv2.putText(img, "FRONT",     (CX - 30,  14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,200), 1)
     cv2.putText(img, _d(front_m), (CX - 24,  30), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,100), 1)
