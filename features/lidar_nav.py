@@ -1,27 +1,43 @@
 """
-features/lidar_nav.py — LiDAR mapping, localization, and navigation.
+features/lidar_nav.py — LiDAR SLAM: mapping, saving, navigation, obstacle avoidance.
 
-Motor vibration for directions (called from Feedback._pulse):
-  MT 1 (right)  — turn right
-  MT 2 (left)   — turn left
-  MT 3 (bottom) — obstacle / proximity warning
+Motor vibration
+  MT 1 (right)  — obstacle on the RIGHT side  /  turn-right navigation cue
+  MT 2 (left)   — obstacle on the LEFT side   /  turn-left  navigation cue
+  MT 3 (bottom) — obstacle straight AHEAD     /  proximity danger
+
+Obstacle sectors (each ±45° wide)
+  Front  0°   → MT3
+  Left   90°  → MT2
+  Right  270° → MT1
+  Back   180° → ignored (no motor)
+
+Pulse strength scales with distance:
+  > 1.5 m  → silent
+  1.0–1.5  → 70 ms  (light)
+  0.6–1.0  → 160 ms (medium)
+  0.3–0.6  → 300 ms (strong)
+  < 0.3 m  → 420 ms (danger)
 
 Modes
-  MAPPING    : builds occupancy map via SLAM; NEXT saves the room; EDIT
-               switches to navigation if saved rooms exist.
-  NAVIGATING : loaded a saved room; continuous haptic + periodic TTS
-               guides the user toward the target origin.
+  MAPPING    : SLAM builds occupancy map.
+               NEXT  → save room + send map image to server.
+               After save → auto-transition to NAVIGATION.
+  NAVIGATION : directional haptics + periodic TTS guide to target.
+               NEXT  → cycle saved rooms as target.
+               EDIT  → return to MAPPING.
 
-Gesture controls (via ctx.gesture_queue while feature is RUNNING)
-  NEXT  → (mapping) save current map as "room_N"
-        → (navigating) cycle to next saved room as target
-  EDIT  → (mapping) switch to navigation mode (first saved room)
-        → (navigating) switch back to mapping mode
+Gesture controls (ctx.gesture_queue)
+  NEXT  → (mapping)    save current map
+        → (navigation) next target room
+  EDIT  → (navigation) back to mapping mode
 
-Port is set by hub.py via the --lidar-port argument and stored in the
-class attribute LidarNavigation.port before the feature runs.
+Port defaults to "auto" — scans /dev/ttyUSB* and /dev/ttyACM* and uses the
+first that streams valid MS200 frames (same strategy as audio/camera probing).
+Override with --lidar-port /dev/ttyACM0.
 """
 
+import io
 import math
 import queue
 import threading
@@ -38,49 +54,90 @@ except ImportError:
     _LIDAR_OK = False
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-DEFAULT_LIDAR_PORT   = "/dev/ttyUSB0"
-LIDAR_BAUD           = 230400
+DEFAULT_PORT    = "auto"
+LIDAR_BAUD      = 230400
+SLAM_RES        = 0.05    # m per grid cell
+SLAM_SIZE_M     = 30.0
 
-SLAM_RESOLUTION      = 0.05   # metres per grid cell
-SLAM_SIZE_M          = 30.0   # map extent
+SECTOR_HALF_DEG = 45.0    # half-angle of each obstacle sector
 
-# Front arc for obstacle detection (radians either side of 0)
-FORWARD_ARC_RAD      = math.radians(45.0)
+# Distance → motor pulse duration (ms).  0 = silent.
+_DIST_LEVELS = [
+    (0.30, 420),
+    (0.60, 300),
+    (1.00, 160),
+    (1.50,  70),
+]
 
-# Proximity thresholds (metres)
-PROX_DANGER_M        = 0.50   # MT3 strong pulse
-PROX_CLOSE_M         = 0.80   # MT3 medium pulse
-PROX_WARN_M          = 1.50   # MT3 light pulse
+# Minimum time between haptic pulses (seconds)
+HAPTIC_INTERVAL = 0.22
 
-# Direction dead-zone: inside ±BEARING_DZ degrees no lateral vibration fires
-BEARING_DZ_DEG       = 15.0
+# Seconds between spoken navigation updates
+NAV_SPEAK_S = 6.0
 
-# How often to speak a navigation status update
-NAV_ANNOUNCE_S       = 6.0
-
-# Minimum interval between any haptic pulse (seconds)
-HAPTIC_MIN_INTERVAL  = 0.25
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _front_min_range(scan) -> float:
-    """Minimum valid range in the forward ±45° arc of a LaserScan."""
-    mask = (
-        (scan.angles_rad <= FORWARD_ARC_RAD) |
-        (scan.angles_rad >= 2 * math.pi - FORWARD_ARC_RAD)
-    ) & (scan.ranges_m > 0.0)
-    if not mask.any():
-        return float("inf")
-    return float(scan.ranges_m[mask].min())
+# Min keyframes before a save is meaningful
+MIN_KF_TO_SAVE = 5
 
 
-def _bearing_to_words(bearing_deg: float) -> str:
-    if bearing_deg > BEARING_DZ_DEG:
-        return "turn left"
-    if bearing_deg < -BEARING_DZ_DEG:
-        return "turn right"
+# ─── geometry helpers ─────────────────────────────────────────────────────────
+
+def _sector_min(scan, center_deg: float, half_deg: float = SECTOR_HALF_DEG) -> float:
+    """Minimum valid range (m) inside [center ± half_deg] sector."""
+    lo = math.radians((center_deg - half_deg) % 360)
+    hi = math.radians((center_deg + half_deg) % 360)
+    a  = scan.angles_rad
+    r  = scan.ranges_m
+    if lo <= hi:
+        mask = (a >= lo) & (a <= hi) & (r > 0)
+    else:                            # sector wraps around 0°
+        mask = ((a >= lo) | (a <= hi)) & (r > 0)
+    return float(r[mask].min()) if mask.any() else float("inf")
+
+
+def _dist_ms(dist_m: float) -> int:
+    """Convert obstacle distance to motor pulse length (ms). 0 = no pulse."""
+    for threshold, ms in _DIST_LEVELS:
+        if dist_m < threshold:
+            return ms
+    return 0
+
+
+def _bearing_str(deg: float) -> str:
+    if deg > 15:  return "turn left"
+    if deg < -15: return "turn right"
     return "straight ahead"
+
+
+def _bearing_ms(abs_deg: float) -> int:
+    if abs_deg >= 60: return 220
+    if abs_deg >= 30: return 130
+    return 70
+
+
+# ─── map → PNG bytes ──────────────────────────────────────────────────────────
+
+def _map_to_png(slam: "SLAMEngine") -> Optional[bytes]:
+    """Convert the occupancy grid to PNG bytes for server upload."""
+    img = slam.occ_map.to_image()          # (N, N) uint8
+    # try cv2 first (already in venv as symlink), fall back to PIL
+    try:
+        import cv2
+        ok, buf = cv2.imencode(".png", img)
+        if ok:
+            return buf.tobytes()
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+        out = io.BytesIO()
+        Image.fromarray(img, mode="L").save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        pass
+    # last resort: raw PGM bytes (server can still handle as image)
+    h, w = img.shape
+    header = f"P5\n{w} {h}\n255\n".encode()
+    return header + img.tobytes()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,8 +146,8 @@ class LidarNavigation(Feature):
     name  = "lidar"
     title = "Lidar Navigation"
 
-    # Set from hub.py --lidar-port before run() is called
-    port: str = DEFAULT_LIDAR_PORT
+    # Overridden by hub.py --lidar-port
+    port: str = DEFAULT_PORT
 
     def run(self, ctx: FeatureContext) -> None:
         if not _LIDAR_OK:
@@ -100,7 +157,7 @@ class LidarNavigation(Feature):
             )
             return
 
-        # ── Resolve port (auto-detect if not set explicitly) ──────────────────
+        # ── Port resolution ───────────────────────────────────────────────────
         port = self.port
         if port == "auto":
             ctx.feedback.speak("Searching for lidar.")
@@ -110,15 +167,13 @@ class LidarNavigation(Feature):
                     "Lidar not found. Check the USB cable and try again."
                 )
                 return
-            ctx.feedback.speak(f"Lidar found.")
+            ctx.feedback.speak("Lidar found.")
 
-        # ── Open serial adapter ───────────────────────────────────────────────
+        # ── Open adapter ──────────────────────────────────────────────────────
         try:
             adapter = MS200Adapter(
-                port          = port,
-                baud          = LIDAR_BAUD,
-                median_kernel = 5,
-                max_jump_m    = 0.5,
+                port=port, baud=LIDAR_BAUD,
+                median_kernel=5, max_jump_m=0.5,
             )
             adapter.start()
         except Exception as e:
@@ -127,42 +182,40 @@ class LidarNavigation(Feature):
 
         # ── SLAM engine ───────────────────────────────────────────────────────
         slam = SLAMEngine(
-            map_resolution = SLAM_RESOLUTION,
-            map_size_m     = SLAM_SIZE_M,
-            db_dir         = ROOMS_DIR,
-            debug          = False,
+            map_resolution=SLAM_RES,
+            map_size_m=SLAM_SIZE_M,
+            db_dir=ROOMS_DIR,
+            debug=False,
         )
 
-        # ── Mutable state ─────────────────────────────────────────────────────
-        mode          = "mapping"
-        nav_target    = None        # name of room we're navigating toward
-        last_announce = 0.0
-        last_haptic   = 0.0
+        # ── State ─────────────────────────────────────────────────────────────
+        mode         = "mapping"
+        nav_target   = None
+        last_haptic  = 0.0
+        last_nav_spk = 0.0
 
-        # Background scan queue — adapter thread pushes, main loop pops
-        scan_q: "queue.Queue" = queue.Queue(maxsize=2)
+        # Background scan thread
+        scan_q: queue.Queue = queue.Queue(maxsize=2)
 
         def _scan_thread():
             while not ctx.abort.is_set():
-                scan = adapter.get_scan(timeout=1.0)
-                if scan is not None and not scan_q.full():
-                    scan_q.put_nowait(scan)
+                s = adapter.get_scan(timeout=1.0)
+                if s is not None and not scan_q.full():
+                    scan_q.put_nowait(s)
 
         t = threading.Thread(target=_scan_thread, daemon=True)
         t.start()
 
         saved = slam.list_rooms()
-        mode_hint = (
-            "Next to save a room. Edit to switch to navigation."
-            if not saved else
-            f"{len(saved)} rooms saved. Edit to navigate."
+        ctx.feedback.speak(
+            f"Lidar mapping. {len(saved)} rooms saved. "
+            "Next to save this room. Edit to navigate."
         )
-        ctx.feedback.speak(f"Lidar navigation. Mapping mode. {mode_hint}")
 
         try:
             while not ctx.abort.is_set():
 
-                # ── Gesture commands ──────────────────────────────────────────
+                # ── Gestures ──────────────────────────────────────────────────
                 gesture = None
                 if ctx.gesture_queue:
                     try:
@@ -172,45 +225,33 @@ class LidarNavigation(Feature):
 
                 if gesture == "NEXT":
                     if mode == "mapping":
-                        if len(slam.keyframes) < 3:
-                            ctx.feedback.speak(
-                                "Not enough data yet. Walk around to build the map."
-                            )
-                        else:
-                            n = len(slam.list_rooms()) + 1
-                            room_name = f"room_{n}"
-                            slam.save_room(room_name)
-                            ctx.feedback.speak(f"Room {n} saved.")
-                    else:
-                        # Cycle to next saved room
+                        _do_save(slam, ctx, port)
+                        # transition to navigation after first save
                         rooms = slam.list_rooms()
                         if rooms:
-                            idx = (rooms.index(nav_target) + 1) % len(rooms) if nav_target in rooms else 0
-                            nav_target = rooms[idx]
+                            mode       = "navigation"
+                            nav_target = rooms[-1]   # just-saved room
                             slam.load_room(nav_target)
-                            last_announce = 0.0
-                            ctx.feedback.speak(f"Navigating to {nav_target}.")
-
-                elif gesture == "EDIT":
-                    if mode == "mapping":
-                        rooms = slam.list_rooms()
-                        if not rooms:
+                            last_nav_spk = 0.0
                             ctx.feedback.speak(
-                                "No saved rooms. Save a map first with Next."
-                            )
-                        else:
-                            mode = "navigation"
-                            nav_target = rooms[0]
-                            slam.load_room(nav_target)
-                            last_announce = 0.0
-                            ctx.feedback.speak(
-                                f"Navigation mode. Navigating to {nav_target}. "
+                                f"Navigating to {nav_target}. "
                                 "Next to cycle targets. Edit to return to mapping."
                             )
                     else:
-                        mode = "mapping"
+                        rooms = slam.list_rooms()
+                        if rooms:
+                            idx        = (rooms.index(nav_target) + 1) % len(rooms) \
+                                         if nav_target in rooms else 0
+                            nav_target = rooms[idx]
+                            slam.load_room(nav_target)
+                            last_nav_spk = 0.0
+                            ctx.feedback.speak(f"Navigating to {nav_target}.")
+
+                elif gesture == "EDIT":
+                    if mode == "navigation":
+                        mode       = "mapping"
                         nav_target = None
-                        ctx.feedback.speak("Mapping mode.")
+                        ctx.feedback.speak("Mapping mode. Next to save.")
 
                 # ── SLAM update ───────────────────────────────────────────────
                 try:
@@ -222,49 +263,49 @@ class LidarNavigation(Feature):
                 result = slam.update(pts, rpm=scan.rpm)
                 now    = time.time()
 
-                # ── Proximity haptic (MT3 — bottom) ───────────────────────────
-                if now - last_haptic >= HAPTIC_MIN_INTERVAL:
-                    min_front = _front_min_range(scan)
+                # ── Obstacle detection — all three sectors ────────────────────
+                if now - last_haptic >= HAPTIC_INTERVAL:
+                    front_m = _sector_min(scan,   0)
+                    left_m  = _sector_min(scan,  90)
+                    right_m = _sector_min(scan, 270)
 
-                    if min_front < PROX_DANGER_M:
-                        ctx.feedback._pulse(3, 350)
-                        last_haptic = now
-                    elif min_front < PROX_CLOSE_M:
-                        ctx.feedback._pulse(3, 180)
-                        last_haptic = now
-                    elif min_front < PROX_WARN_M:
-                        ctx.feedback._pulse(3, 80)
-                        last_haptic = now
-                    else:
-                        # No proximity issue → direction vibration can fire
-                        if mode == "navigation" and nav_target:
-                            d = slam.direction_to_room(nav_target)
-                            if d:
-                                _, _, dist_m, bearing_deg = d
+                    # Priority: front > left > right
+                    front_ms = _dist_ms(front_m)
+                    left_ms  = _dist_ms(left_m)
+                    right_ms = _dist_ms(right_m)
 
-                                if bearing_deg > BEARING_DZ_DEG:
-                                    # Need to turn left → MT2
-                                    ms = _bearing_to_ms(bearing_deg)
-                                    ctx.feedback._pulse(2, ms)
-                                    last_haptic = now
-                                elif bearing_deg < -BEARING_DZ_DEG:
-                                    # Need to turn right → MT1
-                                    ms = _bearing_to_ms(abs(bearing_deg))
-                                    ctx.feedback._pulse(1, ms)
-                                    last_haptic = now
+                    if front_ms:
+                        ctx.feedback._pulse(3, front_ms)   # MT3 — front
+                        last_haptic = now
+                    elif left_ms:
+                        ctx.feedback._pulse(2, left_ms)    # MT2 — left
+                        last_haptic = now
+                    elif right_ms:
+                        ctx.feedback._pulse(1, right_ms)   # MT1 — right
+                        last_haptic = now
+                    elif mode == "navigation" and nav_target:
+                        # No obstacle — fire direction cue
+                        d = slam.direction_to_room(nav_target)
+                        if d:
+                            _, _, _, bearing = d
+                            if bearing > 15:
+                                ctx.feedback._pulse(2, _bearing_ms(abs(bearing)))
+                                last_haptic = now
+                            elif bearing < -15:
+                                ctx.feedback._pulse(1, _bearing_ms(abs(bearing)))
+                                last_haptic = now
 
-                # ── Periodic TTS status (navigation mode only) ────────────────
-                if mode == "navigation" and nav_target and now - last_announce >= NAV_ANNOUNCE_S:
+                # ── Navigation TTS ────────────────────────────────────────────
+                if mode == "navigation" and nav_target and now - last_nav_spk >= NAV_SPEAK_S:
                     d = slam.direction_to_room(nav_target)
                     if d:
-                        _, _, dist_m, bearing_deg = d
-                        direction = _bearing_to_words(bearing_deg)
+                        _, _, dist_m, bearing = d
                         ctx.feedback.speak(
-                            f"{nav_target}: {dist_m:.1f} meters, {direction}."
+                            f"{nav_target}: {dist_m:.1f} meters, {_bearing_str(bearing)}."
                         )
-                    last_announce = now
+                    last_nav_spk = now
 
-                # ── Room recognition TTS (mapping mode) ───────────────────────
+                # ── Room auto-recognition (mapping only) ──────────────────────
                 if mode == "mapping" and result.room_match:
                     ctx.feedback.speak(f"Recognised: {result.room_match}.")
 
@@ -274,10 +315,31 @@ class LidarNavigation(Feature):
             adapter.stop()
 
 
-def _bearing_to_ms(abs_bearing_deg: float) -> int:
-    """Convert bearing magnitude to haptic pulse duration (ms)."""
-    if abs_bearing_deg >= 60:
-        return 220
-    if abs_bearing_deg >= 30:
-        return 130
-    return 70
+# ─── save helper ─────────────────────────────────────────────────────────────
+
+def _do_save(slam: "SLAMEngine", ctx: "FeatureContext", port: str) -> None:
+    """Save current map, speak result, upload PNG to server."""
+    if len(slam.keyframes) < MIN_KF_TO_SAVE:
+        ctx.feedback.speak(
+            f"Not enough data yet — only {len(slam.keyframes)} keyframes. "
+            "Walk more to build the map."
+        )
+        return
+
+    n         = len(slam.list_rooms()) + 1
+    room_name = f"room_{n}"
+    slam.save_room(room_name)
+    ctx.feedback.speak(f"Room {n} saved.")
+
+    # Send map image to server (best-effort)
+    png = _map_to_png(slam)
+    if png and ctx.link:
+        reply = ctx.link.send("lidar", {
+            "action"    : "map_save",
+            "room_name" : room_name,
+            "frame"     : png,          # ServerLink base64-encodes bytes
+        })
+        if reply:
+            print(f"[LIDAR] Server reply: {reply}")
+        else:
+            print("[LIDAR] Map sent but no reply (server may not handle lidar yet).")

@@ -34,6 +34,10 @@ sounddevice==0.5.1
 # ── Speech recognition ────────────────────────────────────────────────────────
 # Used by gesture_hub/voice.py for the voice command listener
 SpeechRecognition>=3.10
+# PyAudio: microphone backend required by SpeechRecognition
+# Install the pre-built wheel from piwheels (building from source requires PortAudio headers):
+#   pip install --extra-index-url https://www.piwheels.org/simple pyaudio
+PyAudio
 
 # ── Numerics ──────────────────────────────────────────────────────────────────
 # Required by faster-whisper, cv2 keyframe extraction, and audio processing
