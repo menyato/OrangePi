@@ -189,10 +189,11 @@ class LidarNavigation(Feature):
         )
 
         # ── State ─────────────────────────────────────────────────────────────
-        mode         = "mapping"
-        nav_target   = None
-        last_haptic  = 0.0
-        last_nav_spk = 0.0
+        mode           = "mapping"
+        nav_target     = None
+        last_haptic    = 0.0
+        last_nav_spk   = 0.0
+        last_pose_send = 0.0
 
         # Background scan thread
         scan_q: queue.Queue = queue.Queue(maxsize=2)
@@ -294,6 +295,17 @@ class LidarNavigation(Feature):
                             elif bearing < -15:
                                 ctx.feedback._pulse(1, _bearing_ms(abs(bearing)))
                                 last_haptic = now
+
+                # ── Pose update → server (navigation only) ────────────────────
+                if (mode == "navigation" and nav_target and ctx.link
+                        and now - last_pose_send >= 2.0):
+                    ctx.link.send("lidar", {
+                        "action"    : "pose_update",
+                        "room_name" : nav_target,
+                        "x"         : float(result.pose.x),
+                        "y"         : float(result.pose.y),
+                    })
+                    last_pose_send = now
 
                 # ── Navigation TTS ────────────────────────────────────────────
                 if mode == "navigation" and nav_target and now - last_nav_spk >= NAV_SPEAK_S:
