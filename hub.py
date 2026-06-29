@@ -70,7 +70,8 @@ from features.money_recognition import MoneyRecognition
 from features.ocr_reader        import OCRReader
 from features.env_awareness     import EnvAwareness
 from features.programmable      import ProgrammableGestures
-from features.lidar_nav         import LidarNavigation
+from features.lidar_nav         import (LidarNavigation, LidarObstacleTest,
+                                        LidarMappingTest, LidarNavigateTest)
 from features.base              import FeatureContext
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -148,20 +149,27 @@ def main() -> None:
 
     # ── feature bypass (testing — skips gesture recognition entirely) ─────────
     feat_grp = ap.add_mutually_exclusive_group()
-    feat_grp.add_argument("--money", action="store_true",
-                           help="Launch Money Recognition directly (no gesture needed).")
-    feat_grp.add_argument("--ocr",   action="store_true",
-                           help="Launch OCR Reader directly (no gesture needed).")
-    feat_grp.add_argument("--env",   action="store_true",
-                           help="Launch Environment Awareness directly (no gesture needed).")
-    feat_grp.add_argument("--lidar", action="store_true",
-                           help="Launch Lidar Navigation directly (no gesture needed).")
+    feat_grp.add_argument("--money",     action="store_true",
+                           help="Launch Money Recognition directly.")
+    feat_grp.add_argument("--ocr",       action="store_true",
+                           help="Launch OCR Reader directly.")
+    feat_grp.add_argument("--env",       action="store_true",
+                           help="Launch Environment Awareness directly.")
+    feat_grp.add_argument("--lidar",     action="store_true",
+                           help="Full LiDAR: mapping + voice save + navigation.")
+    feat_grp.add_argument("--obstacles", action="store_true",
+                           help="LiDAR obstacle-detection test only (no SLAM).")
+    feat_grp.add_argument("--mapping",   action="store_true",
+                           help="LiDAR mapping test: build map, live server view, save.")
+    feat_grp.add_argument("--navigate",  action="store_true",
+                           help="LiDAR navigation test: navigate to a saved room.")
 
     # ── lidar-specific ────────────────────────────────────────────────────────
     ap.add_argument("--lidar-port", default="auto",
                     help="Serial port for the MS200 LiDAR. "
-                         "Default 'auto' scans all /dev/ttyUSB* and /dev/ttyACM* "
-                         "and picks the first that streams MS200 frames.")
+                         "Default 'auto' scans /dev/ttyUSB* and /dev/ttyACM*.")
+    ap.add_argument("--navigate-room", default="",
+                    help="Room name to navigate to (used with --navigate).")
 
     # ── gesture management ────────────────────────────────────────────────────
     ap.add_argument("--reset-gestures", action="store_true",
@@ -174,11 +182,24 @@ def main() -> None:
     lidar_feat = LidarNavigation()
     lidar_feat.port = args.lidar_port
 
+    obs_feat = LidarObstacleTest()
+    obs_feat.port = args.lidar_port
+
+    map_feat = LidarMappingTest()
+    map_feat.port = args.lidar_port
+
+    nav_feat = LidarNavigateTest()
+    nav_feat.port      = args.lidar_port
+    nav_feat.room_name = args.navigate_room
+
     FEATURES = [
         MoneyRecognition(),
         OCRReader(),
         EnvAwareness(),
         lidar_feat,
+        obs_feat,
+        map_feat,
+        nav_feat,
         ProgrammableGestures(),  # always last
     ]
 
@@ -267,10 +288,13 @@ def main() -> None:
     # Bypasses the state machine entirely; runs the feature directly.
     # Voice "stop" (→ START) sets the abort event to exit cleanly.
     bypass_name = (
-        "money" if args.money else
-        "ocr"   if args.ocr   else
-        "env"   if args.env   else
-        "lidar" if args.lidar else
+        "money"     if args.money     else
+        "ocr"       if args.ocr       else
+        "env"       if args.env       else
+        "lidar"     if args.lidar     else
+        "obstacles" if args.obstacles else
+        "mapping"   if args.mapping   else
+        "navigate"  if args.navigate  else
         None
     )
     if bypass_name:
@@ -290,8 +314,9 @@ def main() -> None:
                 abort.set()
 
         voice = VoiceListener(on_command=_voice_abort)
-        # lidar_nav starts its own speech listener (mic conflict if both run)
-        if not args.no_voice and bypass_name != "lidar":
+        # All lidar modes manage their own speech listener — skip hub's to avoid mic conflict
+        _lidar_modes = {"lidar", "obstacles", "mapping", "navigate"}
+        if not args.no_voice and bypass_name not in _lidar_modes:
             voice.start()
 
         feedback.speak(
