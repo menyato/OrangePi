@@ -59,7 +59,12 @@ class ServerLink:
                 if raw is None:
                     self._reset()
                     return None
-                return json.loads(raw.decode("utf-8"))
+                try:
+                    return json.loads(raw.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    print(f"[LINK] Bad response JSON: {e}")
+                    self._reset()
+                    return None
             except (OSError, TimeoutError) as e:
                 print(f"[LINK] Send error: {e}")
                 self._reset()

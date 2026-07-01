@@ -467,6 +467,16 @@ class EnvAwareness(Feature):
             fb.speak(f"Gemini init error. {e}")
             return
 
+        # Notify server that env feature is now active
+        try:
+            ctx.link.send("lidar", {
+                "action": "feature_state",
+                "feature_name": "env",
+                "state": "started",
+            })
+        except Exception:
+            pass
+
         # ── voice thread helpers ──────────────────────────────────────────────
 
         def _voice_on() -> None:
@@ -677,6 +687,17 @@ class EnvAwareness(Feature):
                     _append("user", user_msg)
                     _append("assistant", reply)
                     _autosave()
+                    try:
+                        ctx.link.send("lidar", {
+                            "action":       "feature_state",
+                            "feature_name": "env",
+                            "state":        "scan_done",
+                            "session":      session_name,
+                            "reply_words":  len(reply.split()),
+                            "keyframes":    len(keyframes),
+                        })
+                    except Exception:
+                        pass
                     _voice_on()
                     continue
 
@@ -712,6 +733,16 @@ class EnvAwareness(Feature):
 
         finally:
             _voice_off()
+            try:
+                ctx.link.send("lidar", {
+                    "action":       "feature_state",
+                    "feature_name": "env",
+                    "state":        "stopped",
+                    "session":      session_name,
+                    "exchanges":    len(history) // 2,
+                })
+            except Exception:
+                pass
             if history and session_name:
                 try:
                     path = _save_session(session_name, history)

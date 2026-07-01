@@ -203,13 +203,17 @@ def _map_to_png(slam) -> Optional[bytes]:
     return f"P5\n{w} {h}\n255\n".encode() + img.tobytes()
 
 
-def _send_map(ctx, room_name: str, slam, action: str = "map_save") -> None:
+def _send_map(ctx, room_name: str, slam, action: str = "map_save",
+              connected_to: "str | None" = None) -> None:
     """Upload current occupancy grid PNG to server."""
     if not ctx.link:
         return
     png = _map_to_png(slam)
     if png:
-        ctx.link.send("lidar", {"action": action, "room_name": room_name, "frame": png})
+        msg = {"action": action, "room_name": room_name, "frame": png}
+        if connected_to:
+            msg["connected_to"] = connected_to
+        ctx.link.send("lidar", msg)
 
 
 # ─── voice parsing ────────────────────────────────────────────────────────────
@@ -273,6 +277,8 @@ class _LidarVoice:
         self._stop   = threading.Event()
         self._utt_q  = queue.Queue()   # raw PCM bytes → ASR worker
         self._t      = None
+        self._ready  = threading.Event()   # set when voice is up (or has failed)
+        self.failed  = False               # True if init error
 
     def start(self) -> None:
         self._stop.clear()
@@ -308,6 +314,7 @@ class _LidarVoice:
             import sounddevice as sd
         except ImportError as e:
             print(f"[LIDAR VOICE] sounddevice missing ({e}) — voice disabled.")
+            self.failed = True; self._ready.set()
             return
 
         try:
@@ -315,6 +322,7 @@ class _LidarVoice:
             whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
         except Exception as e:
             print(f"[LIDAR VOICE] faster-whisper unavailable ({e}) — voice disabled.")
+            self.failed = True; self._ready.set()
             return
 
         try:
@@ -383,10 +391,13 @@ class _LidarVoice:
             with sd.InputStream(samplerate=self.SAMPLERATE, channels=1,
                                 dtype="float32", blocksize=FRAME_SAMP,
                                 callback=_cb):
+                self._ready.set()   # mic is open, voice is fully operational
                 while not self._stop.is_set():
                     time.sleep(0.05)
         except Exception as e:
             print(f"[LIDAR VOICE] stream error: {e}")
+            self.failed = True
+            self._ready.set()
 
 
 # ─── radar PNG (obstacle live view) ──────────────────────────────────────────
@@ -490,15 +501,17 @@ def _send_report(ctx, mode: str, session_id: str, data: dict) -> None:
 
 # ─── save helper ─────────────────────────────────────────────────────────────
 
-def _do_save(slam, ctx: "FeatureContext", room_name: str) -> bool:
+def _do_save(slam, ctx: "FeatureContext", room_name: str,
+             prev_room: "str | None" = None) -> bool:
     if len(slam.keyframes) < MIN_KF_TO_SAVE:
         ctx.feedback.speak(
             f"Not enough data — {len(slam.keyframes)} keyframes. Walk more."
         )
         return False
     slam.save_room(room_name)
-    ctx.feedback.speak(f"{room_name.replace('_', ' ')} saved.")
-    _send_map(ctx, room_name, slam, action="map_save")
+    link_msg = f" Connected to {prev_room.replace('_',' ')}." if prev_room else ""
+    ctx.feedback.speak(f"{room_name.replace('_', ' ')} saved.{link_msg}")
+    _send_map(ctx, room_name, slam, action="map_save", connected_to=prev_room)
     return True
 
 
@@ -530,6 +543,7 @@ class LidarNavigation(Feature):
 
         mode, nav_target = "mapping", None
         last_haptic = last_nav_spk = last_pose_send = 0.0
+        t0 = time.time()
 
         scan_q     : queue.Queue = queue.Queue(maxsize=2)
         voice_cmd_q: queue.Queue = queue.Queue()
@@ -540,10 +554,16 @@ class LidarNavigation(Feature):
         voice = _LidarVoice(voice_cmd_q)
         voice.start()
 
+        # Wait up to 10 s for voice model to load then report status
+        voice._ready.wait(timeout=10.0)
+        voice_status = "Voice ready." if not voice.failed else "Voice unavailable. Use gestures."
+
         saved = slam.list_rooms()
+        _session_rooms: list = []   # rooms saved this session — for room connections
         ctx.feedback.speak(
             f"Lidar mapping. {len(saved)} rooms saved. "
-            "Say save kitchen to save. Say take me to kitchen to navigate."
+            "Say save kitchen to save. Say take me to kitchen to navigate. "
+            + voice_status
         )
 
         try:
@@ -570,7 +590,9 @@ class LidarNavigation(Feature):
 
                     elif tag == "save":
                         name = vcmd[1] if len(vcmd)>1 and vcmd[1] else f"room_{len(slam.list_rooms())+1}"
-                        _do_save(slam, ctx, name)
+                        prev = _session_rooms[-1] if _session_rooms else None
+                        if _do_save(slam, ctx, name, prev_room=prev):
+                            _session_rooms.append(name)
 
                     elif tag == "navigate":
                         spoken = vcmd[1] if len(vcmd)>1 else ""
@@ -582,7 +604,6 @@ class LidarNavigation(Feature):
                             if matched:
                                 mode = "navigation"; nav_target = matched
                                 last_nav_spk = 0.0
-                                slam.load_room(nav_target)
                                 ctx.feedback.speak(f"Navigating to {nav_target.replace('_',' ')}.")
                             else:
                                 ctx.feedback.speak(
@@ -596,13 +617,15 @@ class LidarNavigation(Feature):
                         g = ctx.gesture_queue.get_nowait()
                         if g == "NEXT":
                             if mode == "mapping":
-                                _do_save(slam, ctx, f"room_{len(slam.list_rooms())+1}")
+                                name = f"room_{len(slam.list_rooms())+1}"
+                                prev = _session_rooms[-1] if _session_rooms else None
+                                if _do_save(slam, ctx, name, prev_room=prev):
+                                    _session_rooms.append(name)
                             else:
                                 rooms = slam.list_rooms()
                                 if rooms:
                                     idx = (rooms.index(nav_target)+1)%len(rooms) if nav_target in rooms else 0
                                     nav_target = rooms[idx]; last_nav_spk = 0.0
-                                    slam.load_room(nav_target)
                                     ctx.feedback.speak(f"Navigating to {nav_target.replace('_',' ')}.")
                         elif g == "EDIT" and mode == "navigation":
                             mode = "mapping"; nav_target = None
@@ -650,6 +673,21 @@ class LidarNavigation(Feature):
             voice.stop()
             scan_t.join(timeout=2.0)
             adapter.stop()
+            # Send a session summary so the server always gets a report
+            if ctx.link and len(slam.keyframes) >= MIN_KF_TO_SAVE:
+                sid = time.strftime("%Y%m%d_%H%M%S")
+                kf_log = [{"kf_id": kf.id, "t": round(kf.timestamp, 2),
+                           "x": round(kf.pose.x, 3), "y": round(kf.pose.y, 3)}
+                          for kf in slam.keyframes]
+                report_mode = "mapping" if mode == "mapping" else "navigate"
+                _send_report(ctx, report_mode, sid, {
+                    "room_name":     nav_target or "unsaved",
+                    "keyframes":     len(slam.keyframes),
+                    "distance_m":    round(_path_length(kf_log, "x", "y"), 2),
+                    "keyframe_log":  kf_log,
+                    "duration_s":    round(time.time() - t0, 1),
+                    "session_rooms": _session_rooms,
+                })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -711,9 +749,9 @@ class LidarObstacleTest(Feature):
                     continue
 
                 now     = time.time()
-                front_m = _sector_min(scan,   0)
-                left_m  = _sector_min(scan,  90)
-                right_m = _sector_min(scan, 270)
+                front_m = _sector_min(scan,   0, min_m=MIN_OBSTACLE_M)
+                left_m  = _sector_min(scan,  90, min_m=MIN_OBSTACLE_M)
+                right_m = _sector_min(scan, 270, min_m=MIN_OBSTACLE_M)
                 front_ms = _dist_ms(front_m)
                 left_ms  = _dist_ms(left_m)
                 right_ms = _dist_ms(right_m)
