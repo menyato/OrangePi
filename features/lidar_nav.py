@@ -45,6 +45,7 @@ import time
 from typing import Optional
 
 from features.base import Feature, FeatureContext
+import metrics
 
 try:
     from lidar_adapter import MS200Adapter
@@ -272,8 +273,9 @@ class _LidarVoice:
     SILENCE_TAIL = 25          # silent frames to end utterance  (~0.75 s)
     MAX_FRAMES   = 333         # hard cap ~10 s
 
-    def __init__(self, cmd_q: queue.Queue):
+    def __init__(self, cmd_q: queue.Queue, link=None):
         self._q      = cmd_q
+        self._link   = link                # ServerLink, for load-time metrics only
         self._stop   = threading.Event()
         self._utt_q  = queue.Queue()   # raw PCM bytes → ASR worker
         self._t      = None
@@ -318,8 +320,12 @@ class _LidarVoice:
             return
 
         try:
+            t0 = time.time()
             from faster_whisper import WhisperModel
             whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
+            if self._link is not None:
+                metrics.report_load(self._link, "lidar", (time.time() - t0) * 1000,
+                                    component="whisper_tiny")
         except Exception as e:
             print(f"[LIDAR VOICE] faster-whisper unavailable ({e}) — voice disabled.")
             self.failed = True; self._ready.set()
@@ -551,7 +557,7 @@ class LidarNavigation(Feature):
         scan_t = threading.Thread(target=_scan_worker,
                                   args=(adapter, scan_q, ctx.abort), daemon=True)
         scan_t.start()
-        voice = _LidarVoice(voice_cmd_q)
+        voice = _LidarVoice(voice_cmd_q, ctx.link)
         voice.start()
 
         # Wait up to 10 s for voice model to load then report status
@@ -724,7 +730,7 @@ class LidarObstacleTest(Feature):
         scan_t  = threading.Thread(target=_scan_worker,
                                    args=(adapter, scan_q, ctx.abort), daemon=True)
         scan_t.start()
-        voice = _LidarVoice(voice_q)
+        voice = _LidarVoice(voice_q, ctx.link)
         voice.start()
 
         ctx.feedback.speak("Obstacle test. Walk around. Say stop to finish.")
@@ -857,7 +863,7 @@ class LidarMappingTest(Feature):
         scan_t  = threading.Thread(target=_scan_worker,
                                    args=(adapter, scan_q, ctx.abort), daemon=True)
         scan_t.start()
-        voice = _LidarVoice(voice_q)
+        voice = _LidarVoice(voice_q, ctx.link)
         voice.start()
 
         session_id  = time.strftime("%Y%m%d_%H%M%S")
@@ -1033,7 +1039,7 @@ class LidarNavigateTest(Feature):
         scan_t  = threading.Thread(target=_scan_worker,
                                    args=(adapter, scan_q, ctx.abort), daemon=True)
         scan_t.start()
-        voice = _LidarVoice(voice_q)
+        voice = _LidarVoice(voice_q, ctx.link)
         voice.start()
 
         session_id  = time.strftime("%Y%m%d_%H%M%S")

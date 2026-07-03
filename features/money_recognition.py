@@ -13,6 +13,7 @@ import time
 
 import orangepi_client as mc          # your existing, UNCHANGED client, used as a library
 from features.base import Feature, FeatureContext
+import metrics
 
 
 class MoneyRecognition(Feature):
@@ -20,16 +21,19 @@ class MoneyRecognition(Feature):
     title = "Money recognition"
     _models_ready = False              # load Whisper/cues/devices once per process
 
-    def _ensure_ready(self) -> None:
+    def _ensure_ready(self, link=None) -> None:
         if MoneyRecognition._models_ready:
             return
+        t0 = time.time()
         mc.init_cues()
         mc.auto_detect_all()
         mc.load_models()
         MoneyRecognition._models_ready = True
+        if link is not None:
+            metrics.report_load(link, self.name, (time.time() - t0) * 1000)
 
     def run(self, ctx: FeatureContext) -> None:
-        self._ensure_ready()
+        self._ensure_ready(ctx.link)
         link, abort = ctx.link, ctx.abort
 
         resp = link.send(self.name, {"type": "hello"})

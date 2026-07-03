@@ -40,6 +40,7 @@ Feature bypass (no gesture needed — for testing only):
   python3 hub.py --money         launch Money Recognition directly
   python3 hub.py --ocr           launch OCR Reader directly
   python3 hub.py --env           launch Environment Awareness directly
+  python3 hub.py --home          launch Home Automation directly
   python3 hub.py --lidar         launch Lidar Navigation directly
 
 Gesture management:
@@ -69,6 +70,7 @@ from net.client                import ServerLink
 from features.money_recognition import MoneyRecognition
 from features.ocr_reader        import OCRReader
 from features.env_awareness     import EnvAwareness
+from features.home_automation   import HomeAutomation, RelaySwitch
 from features.programmable      import ProgrammableGestures
 from features.lidar_nav         import (LidarNavigation, LidarObstacleTest,
                                         LidarMappingTest, LidarNavigateTest)
@@ -155,6 +157,8 @@ def main() -> None:
                            help="Launch OCR Reader directly.")
     feat_grp.add_argument("--env",       action="store_true",
                            help="Launch Environment Awareness directly.")
+    feat_grp.add_argument("--home",      action="store_true",
+                           help="Launch Home Automation directly.")
     feat_grp.add_argument("--lidar",     action="store_true",
                            help="Full LiDAR: mapping + voice save + navigation.")
     feat_grp.add_argument("--obstacles", action="store_true",
@@ -196,6 +200,9 @@ def main() -> None:
         MoneyRecognition(),
         OCRReader(),
         EnvAwareness(),
+        HomeAutomation(),
+        RelaySwitch(1, "Relay 1"),
+        RelaySwitch(2, "Relay 2"),
         lidar_feat,
         obs_feat,
         map_feat,
@@ -291,6 +298,7 @@ def main() -> None:
         "money"     if args.money     else
         "ocr"       if args.ocr       else
         "env"       if args.env       else
+        "home"      if args.home      else
         "lidar"     if args.lidar     else
         "obstacles" if args.obstacles else
         "mapping"   if args.mapping   else

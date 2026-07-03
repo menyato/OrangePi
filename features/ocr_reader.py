@@ -100,7 +100,7 @@ _mc_ready = False
 _mc_lock  = threading.Lock()
 
 
-def _ensure_mc(fb) -> bool:
+def _ensure_mc(fb, link=None) -> bool:
     global _mc_ready
     if not _MC_OK:
         return False
@@ -115,11 +115,15 @@ def _ensure_mc(fb) -> bool:
         except (ImportError, AttributeError):
             pass
         try:
+            t0 = time.time()
             mc.init_cues()
             mc.auto_detect_all()
             fb.speak("Loading voice model. Please wait about one minute.")
             mc.load_models()
             _mc_ready = True
+            if link is not None:
+                import metrics
+                metrics.report_load(link, "ocr", (time.time() - t0) * 1000)
             return True
         except Exception as e:
             print(f"[OCR] mc init error: {e}")
@@ -460,7 +464,7 @@ class OCRReader(Feature):
         if gq:
             _drain(gq)
 
-        mc_ok = _ensure_mc(fb)
+        mc_ok = _ensure_mc(fb, ctx.link)
 
         self._session_counter += 1
         session_name: "str | None" = None

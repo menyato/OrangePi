@@ -74,3 +74,12 @@ scipy>=1.11
 # Improves accuracy in noisy environments at the cost of ~100 ms extra latency.
 # Uncomment to enable:
 # noisereduce
+
+# ── Home automation (ESP32 relay boards) ──────────────────────────────────────
+# features/home_automation.py decodes the setup QR with cv2 (already listed
+# above via python3-opencv) — no extra Python package needed for that.
+# It DOES require the `nmcli` CLI (NetworkManager) to be present on the OS to
+# briefly join the ESP32's setup WiFi network during pairing and switch back
+# afterward. This ships by default on most Armbian/Debian desktop images; if
+# missing:
+#   sudo apt install -y network-manager

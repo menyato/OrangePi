@@ -49,6 +49,7 @@ import threading
 import time
 
 from features.base import Feature, FeatureContext
+import metrics
 
 # ── optional imports ─────────────────────────────────────────────────────────
 
@@ -86,6 +87,18 @@ GEMINI_MODEL      = "gemini-2.5-flash"
 MAX_HISTORY_TURNS = 16      # keep last N conversation turns in session context
 IDLE_REMIND_S     = 60
 _KEY_ENV          = "GEMINI_API_KEY"
+
+# ── Hardcoded API key (optional) ──────────────────────────────────────────────
+# If you don't want to rely on GEMINI_API_KEY / ~/.env / ~/keys.env — e.g.
+# because hub.py runs as a systemd service and doesn't inherit your shell's
+# environment — paste your key here instead. Get one at
+# https://aistudio.google.com/apikey
+#
+# SECURITY NOTE: a key pasted here lives in plain text in this source file.
+# Do not commit/push this file to a shared or public repo with a real key in
+# it; if this repo is ever made public, rotate the key immediately.
+# Leave empty ("") to keep using the environment-variable / file lookup below.
+GEMINI_API_KEY_HARDCODED = ""
 
 # ── gesture → synthetic voice token ──────────────────────────────────────────
 
@@ -128,6 +141,8 @@ DESCRIPTION RULES:
 # ── API key loading ───────────────────────────────────────────────────────────
 
 def _load_api_key() -> str:
+    if GEMINI_API_KEY_HARDCODED.strip():
+        return GEMINI_API_KEY_HARDCODED.strip()
     key = os.environ.get(_KEY_ENV, "").strip()
     if key:
         return key
@@ -368,8 +383,11 @@ def _ask_gemini(client, history: list, user_text: str, frames: list) -> str:
 _mc_ready = False
 _mc_lock  = threading.Lock()
 
+# ── Gemini self-test (once per process, not once per activation) ──────────────
+_gemini_tested = False
 
-def _ensure_mc(fb) -> bool:
+
+def _ensure_mc(fb, link=None) -> bool:
     """Load Whisper model once per process; reuse if already loaded."""
     global _mc_ready
     if not _MC_OK:
@@ -385,11 +403,14 @@ def _ensure_mc(fb) -> bool:
         except (ImportError, AttributeError):
             pass
         try:
+            t0 = time.time()
             mc.init_cues()
             mc.auto_detect_all()
             fb.speak("Loading voice model. Please wait.")
             mc.load_models()
             _mc_ready = True
+            if link is not None:
+                metrics.report_load(link, "env", (time.time() - t0) * 1000)
             return True
         except Exception as e:
             print(f"[ENV] mc init error: {e}")
@@ -436,7 +457,7 @@ class EnvAwareness(Feature):
 
     def run(self, ctx: FeatureContext) -> None:
         fb      = ctx.feedback
-        mc_ok   = _ensure_mc(fb)
+        mc_ok   = _ensure_mc(fb, ctx.link)
         gq      = ctx.gesture_queue
         voice_q = queue.Queue()
         stop_ev = threading.Event()
@@ -457,15 +478,45 @@ class EnvAwareness(Feature):
         if not api_key:
             fb.speak(
                 "No Gemini API key found. "
-                "Add GEMINI_API_KEY equals your key to the file dot env in your home folder."
+                "Either paste it into GEMINI_API_KEY_HARDCODED at the top of "
+                "env_awareness dot py, or add GEMINI_API_KEY equals your key "
+                "to the file dot env in your home folder."
             )
+            print("[ENV] No API key: checked GEMINI_API_KEY_HARDCODED, "
+                  "$GEMINI_API_KEY, ~/.env, ~/keys.env — all empty.")
             return
 
+        t0 = time.time()
         try:
             client = genai.Client(api_key=api_key)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             fb.speak(f"Gemini init error. {e}")
             return
+        metrics.report_load(ctx.link, "env", (time.time() - t0) * 1000, component="genai_client")
+
+        # One-time connectivity self-test (once per process, not every
+        # activation — a real Gemini call has latency and uses quota) so a
+        # bad key / no internet / wrong model name is caught immediately with
+        # a clear spoken message, rather than silently failing on the user's
+        # first real scan.
+        global _gemini_tested
+        if not _gemini_tested:
+            try:
+                _probe = client.models.generate_content(
+                    model=GEMINI_MODEL, contents="Reply with the single word OK.",
+                )
+                print(f"[ENV] Gemini self-test OK: {(_probe.text or '').strip()!r}")
+                _gemini_tested = True
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                fb.speak(
+                    f"Could not reach Gemini: {e}. "
+                    "Check your internet connection and API key, then try again."
+                )
+                return
 
         # Notify server that env feature is now active
         try:
@@ -650,9 +701,10 @@ class EnvAwareness(Feature):
                     try:
                         reply = _ask_gemini(client, history, user_msg, keyframes)
                     except Exception as e:
-                        print(f"[ENV] Gemini error: {e}")
+                        import traceback
+                        traceback.print_exc()
                         fb.speak(
-                            "Could not reach Gemini. Check your internet connection."
+                            f"Could not reach Gemini. {e}"
                         )
                         fb.wait(timeout=4)
                         _voice_on()
@@ -717,8 +769,9 @@ class EnvAwareness(Feature):
                 try:
                     reply = _ask_gemini(client, history, raw, [])
                 except Exception as e:
-                    print(f"[ENV] Gemini error: {e}")
-                    fb.speak("Gemini did not respond. Please try again.")
+                    import traceback
+                    traceback.print_exc()
+                    fb.speak(f"Gemini did not respond. {e}")
                     fb.wait(timeout=4)
                     _voice_on()
                     continue

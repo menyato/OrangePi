@@ -12,6 +12,7 @@ import json
 import socket
 import struct
 import threading
+import time
 
 
 class ServerLink:
@@ -43,6 +44,7 @@ class ServerLink:
 
             payload = dict(msg)
             payload["feature"] = feature
+            payload["_t_sent"] = time.time()   # lets the server compute network+queue latency
             frame = payload.get("frame")
             if isinstance(frame, (bytes, bytearray)):
                 payload["frame"] = base64.b64encode(frame).decode("ascii")
