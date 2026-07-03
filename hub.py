@@ -159,6 +159,10 @@ def main() -> None:
                            help="Launch Environment Awareness directly.")
     feat_grp.add_argument("--home",      action="store_true",
                            help="Launch Home Automation directly.")
+    feat_grp.add_argument("--relay1",    action="store_true",
+                           help="Fire Relay 1 toggle directly (no gesture needed).")
+    feat_grp.add_argument("--relay2",    action="store_true",
+                           help="Fire Relay 2 toggle directly (no gesture needed).")
     feat_grp.add_argument("--lidar",     action="store_true",
                            help="Full LiDAR: mapping + voice save + navigation.")
     feat_grp.add_argument("--obstacles", action="store_true",
