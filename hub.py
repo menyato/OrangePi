@@ -186,6 +186,20 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    # ── Connect early: needed to ask the server how many relays are actually
+    #    paired, so we build exactly that many gesture-bindable RelaySwitch
+    #    features below (instead of a hardcoded count). This same link is
+    #    reused for the rest of main() — no second ServerLink is created.
+    link = ServerLink(args.host, args.port)
+    link.connect()
+    relay_count = 2   # fallback if unreachable / nothing paired yet
+    resp = link.send("home", {"action": "get_relay_count"})
+    if resp and "relay_count" in resp:
+        relay_count = int(resp["relay_count"])
+    relay_features = [RelaySwitch(i, f"Relay {i}") for i in range(1, relay_count + 1)]
+    print(f"[HUB] Home automation: {relay_count} relay(s) — "
+          f"{', '.join(f.title for f in relay_features)}")
+
     # ── Feature list (built here so --lidar-port is available) ───────────────
     lidar_feat = LidarNavigation()
     lidar_feat.port = args.lidar_port
@@ -205,8 +219,7 @@ def main() -> None:
         OCRReader(),
         EnvAwareness(),
         HomeAutomation(),
-        RelaySwitch(1, "Relay 1"),
-        RelaySwitch(2, "Relay 2"),
+        *relay_features,
         lidar_feat,
         obs_feat,
         map_feat,
@@ -318,8 +331,8 @@ def main() -> None:
             return
 
         abort = threading.Event()
-        link  = ServerLink(args.host, args.port)
-        link.connect()
+        # link is already connected — created early, before FEATURES, so we
+        # could ask the server how many relays are paired (see above).
 
         def _voice_abort(cmd: str) -> None:
             if cmd in ("START", "OCR_CLOSE"):
@@ -356,7 +369,8 @@ def main() -> None:
     engine   = GestureEngine(store.gestures, on_event=None)
     recorder = GestureRecorder()
     registry = FeatureRegistry(FEATURES)
-    link     = ServerLink(args.host, args.port)
+    # link is already connected — created early, before FEATURES, so we could
+    # ask the server how many relays are paired (see top of main()).
 
     sm = HubStateMachine(
         controller=controller,
@@ -372,7 +386,8 @@ def main() -> None:
     engine.on_event     = sm.dispatch
     controller.on_frame = sm.on_frame
 
-    link.connect()   # best-effort; features reconnect on demand
+    # link is already connected (or will reconnect on demand via ServerLink's
+    # own lazy-reconnect logic) — see the early connect at the top of main().
 
     voice = VoiceListener(on_command=sm.on_voice)
     if not args.no_voice:

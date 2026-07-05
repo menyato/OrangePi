@@ -18,6 +18,7 @@ only two jobs here are:
 import json
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 
 import orangepi_client as mc            # reused unchanged, exactly like money_recognition.py
@@ -65,7 +66,32 @@ def _ensure_mc() -> None:
     MoneyRecognition._models_ready = True
 
 
-def _scan_qr(timeout_s: float = QR_SCAN_TIMEOUT_S) -> dict | None:
+def _parse_provision_data(data: str) -> "dict | None":
+    """The server's QR now encodes a URL (http://192.168.4.1/provision?...)
+    so a plain phone camera app can offer "open in browser" directly — see
+    handlers/home.py's build_provision_url(). Accept that form here, but
+    also fall back to legacy raw JSON in case an older QR is scanned."""
+    try:
+        payload = json.loads(data)
+        if payload.get("type") == "esp_relay_provision":
+            return payload
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        parsed = urllib.parse.urlparse(data)
+        if parsed.path == "/provision":
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+            if q.get("type") == "esp_relay_provision":
+                q["server_home_port"] = int(q.get("server_home_port", 8090))
+                q["relay_count"] = int(q.get("relay_count", 2))
+                return q
+    except Exception:
+        pass
+    return None
+
+
+def _scan_qr(timeout_s: float = QR_SCAN_TIMEOUT_S) -> "dict | None":
     """Open the camera and look for the setup QR for up to timeout_s.
     Returns the decoded provisioning dict, or None if nothing legible was
     found in time (camera missing, no QR in view, or QR isn't ours)."""
@@ -91,11 +117,8 @@ def _scan_qr(timeout_s: float = QR_SCAN_TIMEOUT_S) -> dict | None:
             data, _points, _straight = detector.detectAndDecode(frame)
             if not data:
                 continue
-            try:
-                payload = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            if payload.get("type") == "esp_relay_provision":
+            payload = _parse_provision_data(data)
+            if payload is not None:
                 return payload
     finally:
         cap.release()
