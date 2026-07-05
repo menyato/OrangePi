@@ -1,13 +1,13 @@
 """
 features/lidar_nav.py — LiDAR SLAM: mapping, saving, navigation, obstacle avoidance.
 
-Motor vibration
-  MT 1 (right)  — obstacle RIGHT  / turn-right navigation cue
-  MT 2 (left)   — obstacle LEFT   / turn-left  navigation cue
-  MT 3 (bottom) — obstacle FRONT  / proximity danger
+Motor vibration (hand distribution: MT1 bottom, MT2 right, MT3 left)
+  MT 1 (bottom) — obstacle FRONT  / proximity danger
+  MT 2 (right)  — obstacle RIGHT  / turn-right navigation cue
+  MT 3 (left)   — obstacle LEFT   / turn-left  navigation cue
 
 Obstacle sectors (each ±45°, always active)
-  Front  0°  → MT3    Left  90°  → MT2    Right 270° → MT1
+  Front  0°  → MT1    Left  90°  → MT3    Right 270° → MT2
 
 Pulse strength ← distance:
   > 1.5 m  → silent   1.0–1.5 → 70 ms   0.6–1.0 → 160 ms
@@ -159,13 +159,13 @@ def _obstacle_haptics(scan, ctx, last_haptic: float,
     right_ms = _dist_ms(_sector_min(scan, 270, min_m=MIN_OBSTACLE_M))
 
     if front_ms:
-        ctx.feedback._pulse(3, front_ms)
+        ctx.feedback._pulse(1, front_ms)
         return now
     if left_ms:
-        ctx.feedback._pulse(2, left_ms)
+        ctx.feedback._pulse(3, left_ms)
         return now
     if right_ms:
-        ctx.feedback._pulse(1, right_ms)
+        ctx.feedback._pulse(2, right_ms)
         return now
 
     if nav_target and slam:
@@ -173,10 +173,10 @@ def _obstacle_haptics(scan, ctx, last_haptic: float,
         if d:
             _, _, _, bearing = d
             if   bearing >  15:
-                ctx.feedback._pulse(2, _bearing_ms(abs(bearing)))
+                ctx.feedback._pulse(3, _bearing_ms(abs(bearing)))
                 return now
             elif bearing < -15:
-                ctx.feedback._pulse(1, _bearing_ms(abs(bearing)))
+                ctx.feedback._pulse(2, _bearing_ms(abs(bearing)))
                 return now
 
     return last_haptic
@@ -765,11 +765,11 @@ class LidarObstacleTest(Feature):
                 motor = None
                 if now - last_haptic >= HAPTIC_INTERVAL:
                     if front_ms:
-                        ctx.feedback._pulse(3, front_ms); motor = ("MT3", front_ms); last_haptic = now
+                        ctx.feedback._pulse(1, front_ms); motor = ("MT1", front_ms); last_haptic = now
                     elif left_ms:
-                        ctx.feedback._pulse(2, left_ms);  motor = ("MT2", left_ms);  last_haptic = now
+                        ctx.feedback._pulse(3, left_ms);  motor = ("MT3", left_ms);  last_haptic = now
                     elif right_ms:
-                        ctx.feedback._pulse(1, right_ms); motor = ("MT1", right_ms); last_haptic = now
+                        ctx.feedback._pulse(2, right_ms); motor = ("MT2", right_ms); last_haptic = now
 
                 events.append({
                     "t"        : round(now - t0, 2),
