@@ -50,6 +50,7 @@ Gesture management:
 
 import argparse
 import os
+import queue
 import sys
 import threading
 import time
@@ -324,6 +325,8 @@ def main() -> None:
         "ocr"       if args.ocr       else
         "env"       if args.env       else
         "home"      if args.home      else
+        "relay1"    if args.relay1    else
+        "relay2"    if args.relay2    else
         "lidar"     if args.lidar     else
         "obstacles" if args.obstacles else
         "mapping"   if args.mapping   else
@@ -338,13 +341,35 @@ def main() -> None:
             controller.stop()
             return
 
-        abort = threading.Event()
+        abort         = threading.Event()
+        gesture_queue = queue.Queue()
         # link is already connected — created early, before FEATURES, so we
         # could ask the server how many relays are paired (see above).
+
+        # In the normal (non-bypass) flow, HubStateMachine.dispatch() forwards
+        # every recognized gesture/voice token into the running feature's own
+        # gesture_queue (see gesture_hub/state_machine.py) — that's how OCR's
+        # pause/skip/scan controls and Home's relay toggles work in practice.
+        # The bypass path used to skip all of this (gesture_queue=None, no
+        # GestureEngine wired to the glove at all), so a feature launched via
+        # --money/--ocr/etc. only ever heard its own internal voice loop and
+        # never got hand-gesture or global-voice commands. Replicate the same
+        # forwarding here so bypass mode behaves like the real thing.
+        active_key = FeatureRegistry.gesture_key(feat)
+
+        def _forward(name: str) -> None:
+            if name in ("START", active_key):
+                abort.set()
+                return
+            gesture_queue.put(name)
+
+        engine = GestureEngine(store.gestures, on_event=_forward)
+        controller.on_frame = engine.feed
 
         def _voice_abort(cmd: str) -> None:
             if cmd in ("START", "OCR_CLOSE"):
                 abort.set()
+            _forward(cmd)
 
         voice = VoiceListener(on_command=_voice_abort)
         # All lidar modes manage their own speech listener — skip hub's to avoid mic conflict
@@ -360,7 +385,7 @@ def main() -> None:
                 link          = link,
                 abort         = abort,
                 feedback      = feedback,
-                gesture_queue = None,
+                gesture_queue = gesture_queue,
             ))
         except KeyboardInterrupt:
             pass
