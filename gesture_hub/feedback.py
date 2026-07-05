@@ -167,6 +167,8 @@ class Feedback:
             pass
 
     # ── haptics ──────────────────────────────────────────────────────────────
+    # Hand wiring: motor 1 = bottom, motor 2 = right, motor 3 = left
+    # (see features/lidar_nav.py's module docstring for the same mapping).
     def _pulse(self, motor: int, ms: int) -> None:
         try:
             self.ctrl.vibrate(motor, ms)
@@ -174,19 +176,19 @@ class Feedback:
             pass
 
     def confirm(self) -> None:
-        self._pulse(1, 120)
+        self._pulse(1, 120)   # bottom — positive/completion cue
 
     def tick(self) -> None:
-        self._pulse(2, 60)
+        self._pulse(2, 60)    # right — neutral menu-scroll cue
 
     def select(self) -> None:
-        self._pulse(1, 90); time.sleep(0.12); self._pulse(1, 90)
+        self._pulse(1, 90); time.sleep(0.12); self._pulse(1, 90)   # bottom, double-pulse
 
     def error(self) -> None:
-        self._pulse(3, 400)
+        self._pulse(3, 400)   # left — alert cue
 
     def beep(self) -> None:
-        self._pulse(2, 150)
+        self._pulse(2, 150)   # right — "go" cue
 
     # ── audio control ────────────────────────────────────────────────────────
     def silence(self) -> None:
