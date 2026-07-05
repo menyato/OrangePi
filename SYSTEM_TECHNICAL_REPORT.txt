@@ -50,8 +50,8 @@ TABLE OF CONTENTS
                handlers/__init__.py, tts.py, handlers/tts_handler.py)
   SECTION 7  — Server-Side Feature Handlers: LiDAR, OCR, Money Recognition
                (handlers/lidar.py, handlers/ocr.py, handlers/money.py)
-  SECTION 8  — Home Automation Feature (ESP32 relays + QR-code WiFi
-               provisioning) (server_app/handlers/home.py,
+  SECTION 8  — Home Automation Feature (ESP-01/ESP8266 relays + QR-code WiFi
+               provisioning, dynamic relay count) (server_app/handlers/home.py,
                server_app/esp_relay_firmware/, features/home_automation.py)
   SECTION 9  — Performance Metrics: Load Time, Latency, Response Time
                (all features) (net/client.py, feature_server.py,
@@ -196,20 +196,21 @@ Process start (line 1-76): imports `argparse`, `os`, `sys`, `threading`, `time` 
 
 `_probe_devices(feedback, link)` (line 82-120) is a helper invoked once at normal-mode boot. It checks `link.sock is not None` to report server reachability, attempts to open `cv2.VideoCapture(0)` to test the camera, queries `sounddevice.query_devices()` for a microphone with `max_input_channels > 0`, and finally calls `feedback.speak(...)` with a single combined status sentence — this is the audible self-test a blind user hears at every boot.
 
-`main()` (line 123-384) is the entry point invoked from `if __name__ == "__main__"` (line 383-384). Execution order:
-1. Build an `argparse.ArgumentParser` with connectivity flags (`--host` default `10.254.249.159`, `--port` default `9000`, `--uart` default `/dev/ttyS5`, `--baud` default `115200`, `--alsa`), path flags (`--gestures`, `--cal`), mode flags (`--monitor`, `--calibrate`, `--threshold`, `--no-voice`), a mutually-exclusive feature-bypass group (`--money`, `--ocr`, `--env`, `--lidar`, `--obstacles`, `--mapping`, `--navigate`), LiDAR-specific flags (`--lidar-port` default `"auto"`, `--navigate-room`), and `--reset-gestures`.
-2. Constructs the `FEATURES` list (line 195-204): `MoneyRecognition()`, `OCRReader()`, `EnvAwareness()`, four LiDAR feature instances (`LidarNavigation`, `LidarObstacleTest`, `LidarMappingTest`, `LidarNavigateTest`, each given `.port = args.lidar_port`, and the navigate test additionally given `.room_name`), and `ProgrammableGestures()` (deliberately last).
-3. Loads `GestureStore(args.gestures)` and `CalStore(args.cal)`, then prints the loaded gesture table with flex/IMU bitmasks.
-4. `--reset-gestures` path: deletes all `store.gestures` keys prefixed `"FEAT:"`, calls `store.save()`, prints a summary, and returns — process exits without ever opening the glove.
-5. Opens the glove: `controller = GloveController(port=args.uart, baud=args.baud)`; `feedback = Feedback(controller, alsa=args.alsa)`; `controller.start(wait_ready=False)` — on failure (`False` return, e.g. serial port missing) prints an error and calls `sys.exit(1)`. Sleeps 0.5 s to let first UART frames arrive.
-6. `--monitor` mode: restores calibration if present (`cal_store.restore(controller)`), calls `diagnostics.run_monitor(controller, store.gestures, say=feedback.speak)` (blocking live view), then `controller.stop()` in a `finally` and returns — process exits after monitor session ends.
-7. `--threshold` override: `controller.set_threshold(args.threshold)` (validated 10-90 inside `GloveController`); catches `ValueError`.
-8. Calibration branch: if `--calibrate`, runs `diagnostics.run_calibration(controller, say=feedback.speak)`; on success saves via `cal_store.save(rest=..., bent=..., thresh_pct=...)`, speaks confirmation, and immediately calls `cal_store.restore(controller)`. On abort, falls back to restoring any previously saved calibration. If not calibrating, restores saved calibration automatically if `cal_store.has_calibration()` is true, else prints a warning that no calibration exists.
-9. Feature-bypass branch (line 287-338): if any of `--money/--ocr/--env/--lidar/--obstacles/--mapping/--navigate` was passed, hub looks up the matching `Feature` instance by `.name` in a dict built from `FEATURES`, creates a `threading.Event()` named `abort`, opens a fresh `ServerLink(args.host, args.port)` and calls `link.connect()`, starts a `VoiceListener(on_command=_voice_abort)` (unless `--no-voice` or the feature is one of the LiDAR modes, which manage their own listener to avoid a microphone conflict), speaks a test-mode announcement, and calls `feat.run(FeatureContext(link=link, abort=abort, feedback=feedback, gesture_queue=None))`. This is a direct, gesture-free invocation used purely for testing individual features. `KeyboardInterrupt` is caught around the `feat.run()` call; `finally` stops the voice listener, the glove controller, and closes the link, then returns.
-10. Normal-run branch (line 340-380, the actual production path): builds `engine = GestureEngine(store.gestures, on_event=None)`, `recorder = GestureRecorder()`, `registry = FeatureRegistry(FEATURES)`, `link = ServerLink(args.host, args.port)`, then `sm = HubStateMachine(controller=controller, engine=engine, recorder=recorder, registry=registry, store=store, feedback=feedback, link=link)`. Callbacks are wired imperatively after construction: `engine.on_event = sm.dispatch` and `controller.on_frame = sm.on_frame` — meaning every parsed UART sensor frame flows synchronously, from the glove's RX thread, into `GestureEngine`, and any matched gesture flows into `HubStateMachine.dispatch`. `link.connect()` is called best-effort (features/state machine reconnect on demand later). A `VoiceListener(on_command=sm.on_voice)` is started unless `--no-voice`. `_probe_devices(feedback, link)` runs the audible self-test. Finally `sm.run()` is called and blocks — this is the actual "main loop" of the whole robot, living inside `HubStateMachine` (not shown in the files read, but externally referenced). `KeyboardInterrupt` around `sm.run()` triggers graceful shutdown: `voice.stop()`, `sm.stop()`, `controller.stop()`, `link.close()`, in that order, in a `finally` block so shutdown always happens even on unhandled exceptions escaping `sm.run()`.
+`main()` is the entry point invoked from `if __name__ == "__main__"`. Execution order:
+1. Build an `argparse.ArgumentParser` with connectivity flags (`--host` default `10.254.249.159`, `--port` default `9000`, `--uart` default `/dev/ttyS5`, `--baud` default `115200`, `--alsa`, `--mic` — forces a specific `sounddevice` input device index for feature voice, applied via `orangepi_client.set_mic_override()` right after parsing, overriding the Logitech/USB-keyword auto-detect in `detect_mic()` for boards where auto-detect picks the wrong device or none at all), path flags (`--gestures`, `--cal`), mode flags (`--monitor`, `--calibrate`, `--threshold`, `--no-voice`), a mutually-exclusive feature-bypass group (`--money`, `--ocr`, `--env`, `--home`, `--relay1`, `--relay2`, `--lidar`, `--obstacles`, `--mapping`, `--navigate`), LiDAR-specific flags (`--lidar-port` default `"auto"`, `--navigate-room`), and `--reset-gestures`.
+2. Immediately after `args = ap.parse_args()`: applies `--mic` if given, then creates the single `ServerLink(args.host, args.port)` used for the rest of the process and calls `link.connect()` *before* building `FEATURES` — specifically so it can send `{"feature": "home", "action": "get_relay_count"}` and learn how many relay boards the server actually has paired (falling back to `2` if the server is unreachable or the reply omits the key). This one `link` is reused everywhere downstream (bypass branch and normal-run branch alike); no second `ServerLink` is ever constructed.
+3. Constructs the `FEATURES` list: `MoneyRecognition()`, `OCRReader()`, `EnvAwareness()`, `HomeAutomation()`, then `*relay_features` — one `RelaySwitch(i, f"Relay {i}")` per relay reported by `get_relay_count` above (previously two hardcoded `RelaySwitch` instances; now sized dynamically so pairing a 3rd/4th relay board automatically gets its own gesture-bindable feature with no code change) — four LiDAR feature instances (`LidarNavigation`, `LidarObstacleTest`, `LidarMappingTest`, `LidarNavigateTest`, each given `.port = args.lidar_port`, and the navigate test additionally given `.room_name`), and `ProgrammableGestures()` (deliberately last).
+4. Loads `GestureStore(args.gestures)` and `CalStore(args.cal)`, then prints the loaded gesture table with flex/IMU bitmasks.
+5. `--reset-gestures` path: deletes all `store.gestures` keys prefixed `"FEAT:"`, calls `store.save()`, prints a summary, and returns — process exits without ever opening the glove.
+6. Opens the glove: `controller = GloveController(port=args.uart, baud=args.baud)`; `feedback = Feedback(controller, alsa=args.alsa)`; `controller.start(wait_ready=False)` — on failure (`False` return, e.g. serial port missing) prints an error and calls `sys.exit(1)`. Sleeps 0.5 s to let first UART frames arrive.
+7. `--monitor` mode: restores calibration if present (`cal_store.restore(controller)`), calls `diagnostics.run_monitor(controller, store.gestures, say=feedback.speak)` (blocking live view), then `controller.stop()` in a `finally` and returns — process exits after monitor session ends.
+8. `--threshold` override: `controller.set_threshold(args.threshold)` (validated 10-90 inside `GloveController`); catches `ValueError`.
+9. Calibration branch: if `--calibrate`, runs `diagnostics.run_calibration(controller, say=feedback.speak)`; on success saves via `cal_store.save(rest=..., bent=..., thresh_pct=...)`, speaks confirmation, and immediately calls `cal_store.restore(controller)`. On abort, falls back to restoring any previously saved calibration. If not calibrating, restores saved calibration automatically if `cal_store.has_calibration()` is true, else prints a warning that no calibration exists.
+10. Feature-bypass branch: if any of `--money/--ocr/--env/--home/--relay1/--relay2/--lidar/--obstacles/--mapping/--navigate` was passed, hub looks up the matching `Feature` instance by `.name` in a dict built from `FEATURES` (`relay1`/`relay2` resolve to the dynamically-built `RelaySwitch` instances — these two flags used to be declared in argparse but never actually checked anywhere, so passing them silently did nothing; now wired into the same dispatch table). It creates a `threading.Event()` named `abort` and — as of the gesture/voice-forwarding fix below — a real `queue.Queue()` named `gesture_queue` (previously hardcoded to `None`). It computes `active_key = FeatureRegistry.gesture_key(feat)` (the feature's own `"FEAT:<title>"` toggle key), builds a `GestureEngine(store.gestures, on_event=_forward)`, and wires `controller.on_frame = engine.feed`, so hand gestures are now actually parsed while a feature is running via bypass — previously bypass mode fed no UART frames into any gesture engine at all. `_forward(name)` sets `abort` if `name` is `"START"` or `active_key` (mirroring `HubStateMachine.dispatch()`'s toggle-to-close behavior for the currently-open feature's own gesture), otherwise pushes `name` onto `gesture_queue`. It starts a `VoiceListener(on_command=_voice_abort)` (unless `--no-voice` or the feature is one of the LiDAR modes, which manage their own listener to avoid a microphone conflict); `_voice_abort` still sets `abort` directly for `"START"`/`"OCR_CLOSE"` as before, and now *also* calls `_forward(cmd)` for every recognized voice command — so a global voice command like "scan" (translated to `OCR_SCAN` by `gesture_hub/voice.py`'s `_COMMAND_MAP`) is forwarded into `gesture_queue` exactly as it would be via `HubStateMachine.on_voice()` → `dispatch()` in the normal flow. Before this fix, bypass-launched features (`--money`, `--ocr`, etc.) had no gesture input and no global-voice input at all — the only way to command them was through a feature's own internal Whisper voice loop (if any), so calling a feature "directly" via a CLI flag behaved noticeably differently from opening it by its real gesture. Speaks a test-mode announcement, and calls `feat.run(FeatureContext(link=link, abort=abort, feedback=feedback, gesture_queue=gesture_queue))` — `link` here is the one already connected earlier in `main()`, not a new one. `KeyboardInterrupt` is caught around the `feat.run()` call; `finally` stops the voice listener, the glove controller, and closes the link, then returns.
+11. Normal-run branch (the actual production path): builds `engine = GestureEngine(store.gestures, on_event=None)`, `recorder = GestureRecorder()`, `registry = FeatureRegistry(FEATURES)` — reuses the already-connected `link` from step 2 rather than creating a new `ServerLink` — then `sm = HubStateMachine(controller=controller, engine=engine, recorder=recorder, registry=registry, store=store, feedback=feedback, link=link)`. Callbacks are wired imperatively after construction: `engine.on_event = sm.dispatch` and `controller.on_frame = sm.on_frame` — meaning every parsed UART sensor frame flows synchronously, from the glove's RX thread, into `GestureEngine`, and any matched gesture flows into `HubStateMachine.dispatch`. A `VoiceListener(on_command=sm.on_voice)` is started unless `--no-voice`. `_probe_devices(feedback, link)` runs the audible self-test. Finally `sm.run()` is called and blocks — this is the actual "main loop" of the whole robot, living inside `HubStateMachine` (not shown in the files read, but externally referenced). `KeyboardInterrupt` around `sm.run()` triggers graceful shutdown: `voice.stop()`, `sm.stop()`, `controller.stop()`, `link.close()`, in that order, in a `finally` block so shutdown always happens even on unhandled exceptions escaping `sm.run()`.
 
 ### 1.3 External Libraries
-`argparse`, `os`, `sys`, `threading`, `time` (stdlib only) at top level. Inside `_probe_devices`, `cv2` (OpenCV, camera-open test) and `sounddevice` (microphone enumeration) are imported lazily inside `try/except Exception` blocks so their absence does not crash the hub — it only degrades the self-test message.
+`argparse`, `os`, `queue`, `sys`, `threading`, `time` (stdlib only) at top level, plus `orangepi_client as mc` (used only for `mc.set_mic_override()` when `--mic` is passed). Inside `_probe_devices`, `cv2` (OpenCV, camera-open test) and `sounddevice` (microphone enumeration) are imported lazily inside `try/except Exception` blocks so their absence does not crash the hub — it only degrades the self-test message.
 
 ### 1.4 Key Functions
 - `_probe_devices(feedback, link) -> None`: side effect only — speaks a diagnostic sentence; no return value. Not thread-safe by design assumption (called once, synchronously, at boot).
@@ -228,6 +229,8 @@ Process start (line 1-76): imports `argparse`, `os`, `sys`, `threading`, `time` 
 - **Ctrl+C during normal run**: caught around `sm.run()`; hub prints a shutdown message and cleanly tears down voice, state machine, controller, and link in `finally`.
 - **Ctrl+C during bypass mode**: caught around `feat.run()`; same teardown pattern scoped to bypass-mode's local `voice`, `controller`, `link`.
 - **`--reset-gestures`**: purely file-system side effect (gestures.json), never touches hardware.
+- **Relay count query fails/times out**: `get_relay_count`'s response is `None` or omits `"relay_count"` → hub falls back to building exactly 2 `RelaySwitch` features, matching the server's own `DEFAULT_RELAY_COUNT` fallback (see Section 6/Home Automation), so the feature list is never empty even against an unreachable or freshly-restarted server.
+- **Feature launched via bypass flag**: gesture and global-voice commands now reach the running feature through the same `gesture_queue` mechanism as the real gesture-driven flow (see step 10 above) — e.g. `--ocr` responds to the OCR_PAUSE/OCR_FWD/OCR_BWD hand gestures and to saying "scan"/"close", not just to the feature's own internal voice loop.
 
 ### 1.7 Dependencies & Shared State
 `hub.py` depends on essentially the entire `gesture_hub` package and `features` package (out of scope for this section, covered elsewhere), plus `glove_controller.GloveController` and `net.client.ServerLink` from this section's files. It is the sole owner/creator of the `ServerLink` instance(s) used for the whole process lifetime; it passes that same link object into `HubStateMachine` (normal mode) or into a `FeatureContext` (bypass mode), meaning every feature module shares one persistent TCP connection rather than opening its own. The `feature` string that tags every outbound message is always a `Feature.name` value taken from the `FEATURES` list built in `hub.py`.
@@ -246,10 +249,10 @@ Module-level constants define server address (`SERVER_HOST`, `SERVER_PORT`, same
 
 Classes/functions in execution order as called from `main()`:
 - `Metrics` class (line 102-156): `__init__(path)` touches the JSONL file to fail fast; `log(rec)` appends a timestamped dict to both an in-memory list and the file; `summary()` prints an aggregate report (avg record/transcribe/network/total latency, Whisper confidence, fuzzy-correction rate) at shutdown.
-- Auto-detect helpers `detect_mic()`, `detect_speaker()`, `detect_camera()`, orchestrated by `auto_detect_all()` (line 266-274) — scans `sounddevice.query_devices()` for Logitech/USB mic names, parses `aplay -l` output via regex to find a headset/Logi/USB playback card, and probes `/dev/video*` nodes with `v4l2-ctl` + OpenCV open tests to find a Logitech UVC camera, falling back to `/dev/video1` hard-coded.
+- Auto-detect helpers `detect_mic()`, `detect_speaker()`, `detect_camera()`, orchestrated by `auto_detect_all()` (line 266-274) — scans `sounddevice.query_devices()` for Logitech/USB mic names, parses `aplay -l` output via regex to find a headset/Logi/USB playback card, and probes `/dev/video*` nodes with `v4l2-ctl` + OpenCV open tests to find a Logitech UVC camera, falling back to `/dev/video1` hard-coded. `detect_mic()` returns `None` ("system default") when no name matches the Logitech/USB keyword lists, which can silently resolve to a device with zero input channels (e.g. an onboard audio codec that only supports playback) — for that case, `set_mic_override(index)` sets a module-level `_MIC_OVERRIDE` that `auto_detect_all()` checks first and uses verbatim instead of calling `detect_mic()`, skipping auto-detect entirely. `hub.py`'s `--mic <index>` flag is the intended caller, invoked once right after argument parsing, before any feature's `_ensure_mc()`/`auto_detect_all()` call.
 - Audio-cue helpers `_tone_wav()`, `init_cues()`, `play_cue()` synthesize and play short sine-wave "earcons" (listen/ack/shot/think) via a piped `aplay` subprocess.
 - `correct_transcript(text)` (line 379-404): deterministic STT correction — first an exact `KNOWN_CONFUSIONS` dict lookup (e.g. "japanese"→"lebanese", a documented Whisper mishearing), then a `difflib.get_close_matches` fuzzy snap against a fixed `COMMAND_VOCAB` set with cutoff 0.74.
-- TTS chain: `_preprocess_tts()` (abbreviation expansion/cleanup for espeak), `_play_wav_bytes()` (pipes WAV bytes into `aplay`), `_piper_ready()`/`_speak_piper()` (local neural TTS via the `piper` CLI), and `speak(text, wav_bytes=None)` (line 484-531) — the central TTS dispatcher, guarded by `_tts_lock`, that tries local Piper first, then a server-provided PC-rendered WAV, then espeak-ng as last resort, tracking which engine fired in `LAST_TTS_ENGINE`. `is_speaking()`, `stop_speaking()`, `wait_speaking()` manage playback state/barge-in.
+- TTS chain: `_preprocess_tts()` (abbreviation expansion/cleanup for espeak), `_play_wav_bytes()` (pipes WAV bytes into `aplay` via a `Popen` with `stdin=PIPE`), `_piper_ready()`/`_speak_piper()` (local neural TTS via the `piper` CLI), and `speak(text, wav_bytes=None)` (line 484-531) — the central TTS dispatcher, guarded by `_tts_lock`, that tries local Piper first, then a server-provided PC-rendered WAV, then espeak-ng as last resort, tracking which engine fired in `LAST_TTS_ENGINE`. `is_speaking()`, `stop_speaking()`, `wait_speaking()` manage playback state/barge-in. `_play_wav_bytes()`'s `proc.stdin.write(wav_bytes)` is wrapped in `try/except (BrokenPipeError, OSError)` — if `aplay` dies before or during the write (observed cause: a Ctrl-C's `SIGINT` reaches the `aplay` child too, since it shares the foreground process group with the Python process; a briefly-rejected ALSA device open is another possibility), this used to raise an uncaught `BrokenPipeError` all the way up through `speak()` → `_speak_resp()` → whichever feature called it, crashing the entire process instead of just failing that one spoken line — now it prints a one-line notice and moves on.
 - `load_models()` (line 559-575): instantiates `webrtcvad.Vad(VAD_AGGRESSIVENESS)` and `WhisperModel(...)`, detecting via `inspect.signature` whether the installed faster-whisper version supports `hotwords`.
 - `record_with_vad()` (line 586-660): opens a `sounddevice.InputStream`, reads fixed-size frames, computes RMS noise-gating, runs `vad.is_speech()` per frame, maintains a pre-roll ring buffer (`collections.deque`) and a voiced/unvoiced ratio state machine to detect speech start/end, handles `sd.PortAudioError` xruns with a retry cap, and returns a concatenated float32 numpy array or `None`.
 - `transcribe(audio)` (line 690-723): normalizes and optionally denoises (`_denoise` via `noisereduce.reduce_noise`) audio, then calls `whisper_model.transcribe(...)` with domain `initial_prompt` and optional `hotwords`, returning `(text, stats)` with average logprob / no-speech probability.
@@ -336,13 +339,15 @@ Module constants: `UART_DEV = "/dev/ttyS5"`, `BAUD = 115200`, `TIMEOUT_S = 0.1` 
 
 Dataclasses: `IMUData` (aX/aY/aZ floats), `SensorFrame` (an `IMUData`, `raw_flex` list of 5 ints, `flex_bits`/`imu_bits` ints, `timestamp` defaulting to `time.time()`; computed properties `finger_bent` — a 5-bool list decoded from `flex_bits` — and `imu_flags` — a dict of six named tilt/rotate booleans decoded from `imu_bits` via bitmasks 1<<0 through 1<<5 — plus a human-readable `__str__`), and `CalibrationState` (active flag, current finger index, wait_bent flag, and 5-element `rest_vals`/`bent_vals` lists).
 
+**MPU-mirror fix**: the MPU sits mirrored on this glove relative to what the ATmega firmware's own bit order assumes, so its raw forward/back and left/right bits read backwards — physically tilting forward set the bit the firmware calls "backward", and left set the bit it calls "right". `imu_flags` now swaps the label each raw bit maps to (bit 0 → `tilt_left`, bit 1 → `tilt_right`, bit 2 → `tilt_backward`, bit 3 → `tilt_forward`, bits 4/5 unchanged as `rotate_cw`/`rotate_ccw`) so every consumer sees the true physical direction without reflashing the ATmega. The same corrected mapping is the single source of truth in `gesture_hub/specs.py`'s `IMU_BIT_NAMES` (see Section 2), which is what actually drives gesture matching — `imu_flags` here is a secondary, display-only copy used by `motor_test.py` and this module's own `__str__`/CLI, kept in sync by hand.
+
 `_V_RE` (line 92-95): a compiled regex matching the ATmega's `V:<aX>,<aY>,<aZ>,<r0>..<r4>|<fb_hex><ib_hex>` line format. `parse_frame(line) -> Optional[SensorFrame]` (line 97-107) applies this regex and constructs a `SensorFrame`, returning `None` on no match (malformed line).
 
 `GloveController` class (line 110-341):
 - `__init__(port, baud, on_frame=None, on_cal_event=None)`: stores config and callbacks; initializes `self._ser = None`, `self._tx_q = queue.Queue()`, `self._stop = threading.Event()`, `self._ready = threading.Event()`, thread handles `self._rx_thread`/`self._tx_thread` (both `None` initially), `self.cal = CalibrationState()`, `self.last_frame = None`; configures module logging and creates `self.log`.
 - `start(wait_ready=True, timeout=5.0) -> bool` (line 152-178): opens `serial.Serial(self.port, self.baud, timeout=TIMEOUT_S, write_timeout=1.0)`, catching `serial.SerialException` and returning `False` on failure (this is the exact failure path `hub.py` checks). On success, clears the stop/ready events, spawns two **daemon** threads — `glove-rx` running `self._rx_loop` and `glove-tx` running `self._tx_loop` — and starts them. If `wait_ready=True`, blocks up to `timeout` seconds on `self._ready.wait(timeout)`, logging a warning (but not failing) if the ATmega's `"RDY"` line never arrives; `hub.py` always calls with `wait_ready=False` so this wait never actually blocks hub boot.
 - `stop()` (line 180-190): sets `self._stop`, pushes a `None` sentinel into `self._tx_q` to unblock `_tx_loop`, joins both threads with a 2 s timeout each, closes the serial port if open, logs "Controller stopped". Note: if a thread doesn't join within 2 s (e.g., blocked in a `serial.read()` call), `stop()` proceeds anyway and closes the port underneath it — a potential race, though in practice `serial.read()` has its own 0.1 s timeout so this rarely blocks long.
-- `send(cmd)`, `calibrate()`, `cal_confirm()`, `set_threshold(percent)` (validates 10-90, raises `ValueError` otherwise), `status()`, `vibrate(motor, ms)` (validates `motor in (1,2,3)` and `ms > 0`, raises `ValueError` otherwise) — all public commands are just convenience wrappers that format a string and push it onto `self._tx_q`; actual transmission happens asynchronously in `_tx_loop`.
+- `send(cmd)`, `calibrate()`, `cal_confirm()`, `set_threshold(percent)` (validates 10-90, raises `ValueError` otherwise), `status()`, `vibrate(motor, ms)` (validates `motor in (1,2,3)` and `ms > 0`, raises `ValueError` otherwise) — all public commands are just convenience wrappers that format a string and push it onto `self._tx_q`; actual transmission happens asynchronously in `_tx_loop`. `motor` here is the physical connector index wired on the hand — confirmed hardware mapping: **motor 1 = bottom, motor 2 = right, motor 3 = left**. This mapping is a hardware fact independent of any software "direction" naming; callers that reason about obstacle/turn direction (`features/lidar_nav.py`) and confirmation cues (`gesture_hub/feedback.py`) must pick the correct motor number for the physical position they intend — `lidar_nav.py` previously had this rotated (assumed 1=right, 2=left, 3=bottom) and has since been corrected (see Section 3).
 - `_rx_loop(self)` (line 224-239): runs in the `glove-rx` daemon thread; loops reading up to 256 bytes at a time from the serial port (catching `serial.SerialException` to break the loop entirely on hard errors), accumulating into `buf`, splitting on `b"\n"`, decoding ASCII with `errors="replace"`, and dispatching each non-empty line to `self._dispatch(line)`.
 - `_tx_loop(self)` (line 241-254): runs in the `glove-tx` daemon thread; blocks on `self._tx_q.get(timeout=0.5)`, breaking on the `None` sentinel, otherwise writes+flushes the command to the serial port, catching `serial.SerialException` per-write (does not crash the thread, just logs).
 - `_dispatch(line)` (line 256-289): the protocol demultiplexer — `"RDY"` sets `self._ready`; lines starting `"V:"` are parsed via `parse_frame()` and, if valid, stored as `self.last_frame` and forwarded to `self.on_frame(frame)` if a callback is registered (this is the exact callback `hub.py` wires to `sm.on_frame`, meaning **every valid sensor frame synchronously calls into the state machine from the RX thread**, not the main thread); malformed `"V:"` lines are logged as a warning and dropped silently (no callback fires); `"CAL:"` lines go to `_handle_cal`; `"CFG:"` lines log and optionally call `on_cal_event("CFG", {...})`; `"MOT:"` lines log motor-fire confirmations; anything else logs an "Unknown line" warning.
@@ -489,7 +494,7 @@ SECTION 2 — GESTURE HUB SUBSYSTEM
 
 **Key constants.**
 - `FINGER_NAMES = ["Thumb","Index","Middle","Ring","Pinky"]`, and `FINGER_INDEX` (lowercase name → bit index 0-4).
-- `IMU_BIT_NAMES` — 6 semantic flags: `tilt_right`(0), `tilt_left`(1), `tilt_forward`(2), `tilt_backward`(3), `rotate_cw`(4), `rotate_ccw`(5), plus `IMU_BIT_INDEX` reverse map.
+- `IMU_BIT_NAMES` — 6 semantic flags: `tilt_left`(0), `tilt_right`(1), `tilt_backward`(2), `tilt_forward`(3), `rotate_cw`(4), `rotate_ccw`(5), plus `IMU_BIT_INDEX` reverse map. **This is the single source of truth for which raw ATmega IMU bit means which physical direction, corrected for a hardware mirroring bug**: the MPU sits mirrored on this glove relative to the ATmega firmware's own bit order, so its raw bits originally read forward/back and left/right backwards (physically tilting forward set the bit the firmware calls "backward", and left set the bit it calls "right"). Bits 0-3 were swapped here from the firmware's native order (was `tilt_right`(0)/`tilt_left`(1)/`tilt_forward`(2)/`tilt_backward`(3)) to correct for this without reflashing the ATmega; `glove_controller.py`'s `imu_flags` property carries a manually-synced copy of the same corrected mapping for display purposes (see Section 1).
 - `Motion(str, Enum)` — `STATIC = "static"`, `FLICK = "flick"`.
 
 **`GestureSpec` dataclass** — fields: `name:str`, `flex_mask:int`, `imu_mask:int`, `motion:Motion`, `hold_frames:int=3`, `flex_exact:bool=False`. Methods:
@@ -497,13 +502,15 @@ SECTION 2 — GESTURE HUB SUBSYSTEM
 - `describe()` — builds spoken-friendly text used pervasively by `feedback.speak()` (e.g. "Thumb + Pinky [exact], hold tilt_right").
 - `to_dict()` / `from_dict()` — JSON (de)serialization; `from_dict` defensively coerces ints and defaults missing keys (`hold_frames=3`, `flex_exact=False`) for forward-compatibility with older JSON files.
 
-**`DEFAULT_GESTURES`** — a `dict[str, GestureSpec]` hardcoding 6 system gestures, all with `flex_exact=True` so that a full fist or superset of bent fingers never spuriously fires them:
-- `START`: flex 0x11 (Thumb+Pinky), imu 0x01 (tilt_right), STATIC, hold=3.
-- `NEXT`: flex 0x10 (Pinky), imu 0x01, FLICK, hold=2.
+**`DEFAULT_GESTURES`** — a `dict[str, GestureSpec]` hardcoding 6 system gestures, all with `flex_exact=True` so that a full fist or superset of bent fingers never spuriously fires them. `imu_mask` values below were re-pointed at the corrected bits above so each gesture still matches its documented physical motion (e.g. START's "hold tilt right" now actually fires on a real rightward tilt):
+- `START`: flex 0x11 (Thumb+Pinky), imu 0x02 (tilt_right), STATIC, hold=3.
+- `NEXT`: flex 0x10 (Pinky), imu 0x02 (tilt_right), FLICK, hold=2.
 - `EDIT`: flex 0x05 (Thumb+Middle), imu 0x00 (any), STATIC, hold=3.
-- `OCR_PAUSE`: flex 0x19 (Thumb+Ring+Pinky), imu 0x08 (tilt_backward), STATIC, hold=3.
-- `OCR_FWD`: flex 0x01 (Thumb), imu 0x01 (tilt_right), FLICK, hold=2.
-- `OCR_BWD`: flex 0x01 (Thumb), imu 0x02 (tilt_left), FLICK, hold=2.
+- `OCR_PAUSE`: flex 0x19 (Thumb+Ring+Pinky), imu 0x04 (tilt_backward), STATIC, hold=3.
+- `OCR_FWD`: flex 0x01 (Thumb), imu 0x02 (tilt_right), FLICK, hold=2.
+- `OCR_BWD`: flex 0x01 (Thumb), imu 0x01 (tilt_left), FLICK, hold=2.
+
+`gestures.json` on disk does not need manual migration for this change: `gesture_hub/store.py`'s `GestureStore.load()` always overwrites the 6 system-gesture keys with the current `DEFAULT_GESTURES` on every boot (user-assigned `FEAT:*` keys are preserved from the file) — see item 9 below.
 
 No third-party imports; uses only `dataclasses` and `enum` from the standard library.
 
@@ -637,7 +644,7 @@ Imports only `collections.Counter` and `gesture_hub.specs`.
 
 **`Feedback.__init__(controller, alsa=None, speed=150)`**: auto-detects the ALSA device unless overridden, probes for `espeak-ng --version` (prints found/not-found — non-fatal), and initializes `_audio_proc`/`_audio_tmp`/`_audio_lock` for cross-thread audio-process bookkeeping.
 
-**Haptics** — thin wrappers around `controller.vibrate(motor, ms)`, each wrapped in try/except so a controller failure never propagates: `confirm()` (motor 1, 120ms), `tick()` (motor 2, 60ms), `select()` (motor 1, double-pulse 90ms/90ms with 120ms gap), `error()` (motor 3, 400ms), `beep()` (motor 2, 150ms).
+**Haptics** — thin wrappers around `controller.vibrate(motor, ms)`, each wrapped in try/except so a controller failure never propagates: `confirm()` (motor 1 = bottom, 120ms — positive/completion cue), `tick()` (motor 2 = right, 60ms — neutral menu-scroll cue), `select()` (motor 1 = bottom, double-pulse 90ms/90ms with 120ms gap), `error()` (motor 3 = left, 400ms — alert cue), `beep()` (motor 2 = right, 150ms — "go" cue). These motor numbers were audited against the confirmed hand wiring (motor 1=bottom, 2=right, 3=left — see Section 1's `glove_controller.vibrate()` entry and Section 3's LiDAR haptic-mapping fix) and found already correct, since this module always addressed motors by their literal hardware number rather than reasoning through a "right"/"left" abstraction the way `lidar_nav.py` did; only comments were added to document the mapping so it isn't accidentally broken by a future edit.
 
 **Speech (`speak(text)`)**: prints to console, calls `_stop_audio()` to kill any in-flight playback (gesture priority), synthesizes synchronously via `espeak-ng -s <speed> -w <tmpfile> <text>` (typically <1s), then launches `aplay` asynchronously via `subprocess.Popen` (immediately registers the Popen under the lock so `_stop_audio()` can kill it from another thread at any moment), and spawns a daemon monitor thread that waits on the process, classifies "normal kill" (`returncode in (0,-15,-9)` or "Interrupted system call" in stderr) versus real errors, retries once with a larger `--buffer-size` on unexpected non-xrun errors, and always deletes the temp WAV in `finally`. `play_raw(wav_bytes)` is the analogous method for server-generated audio (used for TTS/audio pushed from the Python feature server), computing playback duration from WAV header metadata (falling back to a byte-count heuristic on parse failure) and returning that duration to the caller. `silence()` exposes `_stop_audio()` publicly for callers needing pre-recording silence. `is_speaking()` checks `_audio_proc.poll() is None` under the lock. `wait(timeout=12.0)` blocks the calling thread (sleeping 0.15s first to let `aplay` actually start) polling `is_speaking()` every 50ms until it stops or timeout — used by the state machine before haptic "go" cues so instructions are always fully heard.
 
@@ -858,7 +865,7 @@ This file treats `slam_engine.py` purely as a black-box SLAM/room-database servi
 
 Note: `ServerLink.send()` (from `net/client.py`) is a **blocking, synchronous, JSON-over-length-prefixed-TCP call** with a default 120 s socket timeout, and it returns the server's decoded reply dict or `None` on any connection/timeout/JSON error. Every single call site in `lidar_nav.py` (`_send_map`, `_send_report`, the `pose_update` sends) either ignores the return value outright or is not wrapped in `try/except` at all for the `pose_update` and `_send_report`/`_send_map` calls — meaning **a slow or unreachable server can stall the main SLAM/haptics loop for up to the full timeout window**, unlike env_awareness.py which wraps every send in `try/except Exception: pass`. This is a materially different (and riskier) failure-handling posture and worth flagging: an obstacle-avoidance-critical loop can block on network I/O.
 
-**Obstacle haptics — the shared safety layer**, `_obstacle_haptics(scan, ctx, last_haptic, nav_target=None, slam=None)`, runs every scan cycle across all four features. It self-throttles to at most once per `HAPTIC_INTERVAL = 0.22` s. It computes the minimum in-range distance in three ±`SECTOR_HALF_DEG = 45°` sectors centered on sensor angles 0° (front, MT3), 90° (left, MT2), 270° (right, MT1), each masked to ignore returns closer than `MIN_OBSTACLE_M = 0.10` m (filtering the sensor's own stabilizer housing). `_dist_ms(d)` maps distance to pulse duration via `_DIST_LEVELS = [(0.30,420),(0.60,300),(1.00,160),(1.50,70)]` — i.e. **< 0.30 m → 420 ms (strongest/emergency), 0.30–0.60 m → 300 ms, 0.60–1.00 m → 160 ms, 1.00–1.50 m → 70 ms, ≥ 1.50 m → silent (0 ms, no pulse)**. Priority order is front > left > right: if front has any nonzero pulse duration it fires MT3 and returns immediately, never checking left/right that cycle. Only if all three sectors are clear does it fall through to a directional "steer toward destination" haptic when navigating: `slam.direction_to_room(nav_target)` gives a bearing; `>15°` pulses MT2 (turn-left cue), `<-15°` pulses MT1 (turn-right cue), using `_bearing_ms`: `≥60° → 220 ms, ≥30° → 130 ms, otherwise 70 ms`.
+**Obstacle haptics — the shared safety layer**, `_obstacle_haptics(scan, ctx, last_haptic, nav_target=None, slam=None)`, runs every scan cycle across all four features. It self-throttles to at most once per `HAPTIC_INTERVAL = 0.22` s. It computes the minimum in-range distance in three ±`SECTOR_HALF_DEG = 45°` sectors centered on sensor angles 0° (front, MT1), 90° (left, MT3), 270° (right, MT2) — **corrected mapping**: the motor numbers sent over UART are the physical connector indices wired on the hand (confirmed: motor 1 = bottom, motor 2 = right, motor 3 = left; see Section 1's `glove_controller.vibrate()` entry). This file previously had them rotated (front→MT3, left→MT2, right→MT1), so obstacle-direction pulses and turn cues fired on the wrong physical motor; fixed to match the real wiring. Each sector is masked to ignore returns closer than `MIN_OBSTACLE_M = 0.10` m (filtering the sensor's own stabilizer housing). `_dist_ms(d)` maps distance to pulse duration via `_DIST_LEVELS = [(0.30,420),(0.60,300),(1.00,160),(1.50,70)]` — i.e. **< 0.30 m → 420 ms (strongest/emergency), 0.30–0.60 m → 300 ms, 0.60–1.00 m → 160 ms, 1.00–1.50 m → 70 ms, ≥ 1.50 m → silent (0 ms, no pulse)**. Priority order is front > left > right: if front has any nonzero pulse duration it fires MT1 (bottom) and returns immediately, never checking left/right that cycle. Only if all three sectors are clear does it fall through to a directional "steer toward destination" haptic when navigating: `slam.direction_to_room(nav_target)` gives a bearing; `>15°` pulses MT3 (left, turn-left cue), `<-15°` pulses MT2 (right, turn-right cue), using `_bearing_ms`: `≥60° → 220 ms, ≥30° → 130 ms, otherwise 70 ms`.
 
 **Feature 1 — `LidarNavigation` (full flow, `--lidar`).** Starts in `mode="mapping"`. Voice/gesture commands: `"save [name]"` (or bare "save", auto-named `room_{n+1}`) calls `_do_save`, which requires `len(slam.keyframes) >= MIN_KF_TO_SAVE = 5` or refuses with "Not enough data — N keyframes. Walk more."; on success it speaks confirmation (mentioning `connected_to` the previous room saved this session, tracked in `_session_rooms`) and uploads the map PNG. `"take me to X"` fuzzy-matches a saved room and switches `mode="navigation"`, `nav_target=matched`. `"list rooms"` speaks all saved names. `"stop"` sets `ctx.abort`. Gesture `NEXT` mirrors save (mapping mode) or cycles to the next saved room (navigation mode); `EDIT` returns to mapping mode. Every scan cycle: `slam.update()` runs; haptics fire; if navigating, a `pose_update` is sent every 2 s and a spoken distance/bearing update ("kitchen: 2.3 m, turn left.") every `NAV_SPEAK_S = 6.0` s via `_bearing_str` (`>15°` "turn left", `<-15°` "turn right", else "straight ahead"); if mapping and `slam.update()` reports a `room_match` (loop-closure/relocalization against a known room), it speaks "Recognised: X." On exit (`finally`), threads are stopped, adapter released, and — provided at least `MIN_KF_TO_SAVE` keyframes exist — a full session report is always sent regardless of save state, with `keyframe_log` (id, timestamp, x, y per keyframe), total path length (`_path_length`, Euclidean sum over consecutive keyframe positions), duration, and the list of rooms saved this session.
 
@@ -911,13 +918,13 @@ Worth calling out as a distinct rendering pipeline: builds a 400×400 px polar p
 ### 3.9 What is shared with the rest of the codebase
 
 - Imports `MS200Adapter` from `lidar_adapter.py` (serial sensor driver: port discovery, scan acquisition, `to_xy` conversion) and `SLAMEngine`, `ROOMS_DIR` from `slam_engine.py` (pose estimation, occupancy mapping, room persistence, loop-closure/room-recognition, bearing/direction queries) — both treated as opaque, already-documented subsystems.
-- Shares the `ctx.feedback._pulse(motor, ms)` three-motor haptic API and `ctx.feedback.speak/confirm/wait` with every other feature in the codebase (including env_awareness.py).
+- Shares the `ctx.feedback._pulse(motor, ms)` three-motor haptic API and `ctx.feedback.speak/confirm/wait` with every other feature in the codebase (including env_awareness.py). Motor numbers are physical connector indices on the hand — confirmed wiring: 1=bottom, 2=right, 3=left (see Section 1's `glove_controller.vibrate()` entry); `lidar_nav.py`'s own obstacle/turn-cue motor selection was corrected to this mapping (previously rotated).
 - Shares the `_LidarVoice`/`sounddevice`+`faster-whisper`+`webrtcvad` architecture pattern with the OCR reader feature (per env_awareness.py's docstring reference) and, at a design level, mirrors env_awareness.py's earlier `orangepi_client`-based voice approach, though `lidar_nav.py`'s implementation is self-contained (its own `_LidarVoice` class) rather than reusing `orangepi_client.voice_listen_loop`.
 - All server-bound traffic funnels through the single shared `net.client.ServerLink` instance (`ctx.link`), always tagged `feature="lidar"`, with `action` values `map_save`, `map_update`, `pose_update`, `report`, and (from env_awareness.py) `feature_state` — strongly implying one consolidated server-side module, most plausibly `handlers/lidar.py`, that persists/forwards room map PNGs, live pose dots, and JSON session reports to whatever dashboard or storage the "server_app" maintains, and that also doubles as a generic feature-activity tracker for other features (env) that piggyback on the same channel.
 
 ## DIAGRAM GENERATION PROMPT — Environment Awareness & LiDAR Navigation Features
 
-Draw two side-by-side vertical swimlane pipeline diagrams on one canvas for an OrangePi assistive-robot glove system. Left lane, titled "EnvAwareness (features/env_awareness.py)": show a loop starting at "Voice/gesture input (ENV_SCAN, ENV_CLOSE, NEXT via gesture_queue; mc.voice_listen_loop)" → "_classify_env() keyword router" branching three ways to "SCAN: _record_frames() OpenCV camera (3s @ 10fps)" → "_extract_keyframes(): HSV Bhattacharyya scene-cut @ threshold 0.30, pad to 3, keep top 5 by Laplacian sharpness" → "_frame_to_jpeg() resize 1024px, JPEG q=75" → "_ask_gemini(): Gemini 2.5 Flash API (direct HTTPS, not through feature server)" → "fb.speak(reply) + save session JSON in ~/env_sessions/"; and "LOAD"/"CLOSE" branches; with a dashed side-arrow labeled 'ctx.link.send("lidar", {action: feature_state, feature_name: env, state: started/scan_done/stopped}) — fire-and-forget, exceptions swallowed' pointing to a small "Feature Server (handlers/lidar.py?)" box. Right lane, titled "LiDAR family (features/lidar_nav.py: LidarNavigation, LidarObstacleTest, LidarMappingTest, LidarNavigateTest)": show "MS200Adapter (lidar_adapter.py) @ 230400 baud" feeding a "_scan_worker thread → bounded scan_q(maxsize=2)" into "SLAMEngine.update() (slam_engine.py, ICP_MAX_ROT_DEG overridden to 20°)" which forks into "_obstacle_haptics(): sectors ±45° at 0°/90°/270° (front/left/right), ignore <0.10m housing, pulse ms by distance band 0.30m→420ms, 0.60m→300ms, 1.00m→160ms, 1.50m→70ms, else silent, throttled to one decision per 0.22s, priority front>left>right, driving glove motors MT3/MT2/MT1" and "navigation branch: slam.direction_to_room() → bearing >15° turn-left / <-15° turn-right haptic and speech every 6s, pose_update sent every 2s, arrival declared and session ends when distance < 0.5m". Add a shared "_LidarVoice: sounddevice mic callback → webrtcvad → faster-whisper 'tiny' ASR worker thread → _parse_voice() commands save/take me to/list/stop" box feeding voice commands into the SLAM lane. Show all four LiDAR classes converging on one outbound arrow labeled 'ctx.link.send("lidar", {action: map_save/map_update/pose_update/report, room_name, frame: PNG, x, y, data:{...}})' into the same "Feature Server" box, and annotate that unlike EnvAwareness, several of these sends are NOT exception-guarded and can block the safety loop on a slow/dead server connection. Use warning-red coloring on the <0.30m obstacle band and the "server send unguarded" annotation to emphasize risk areas.
+Draw two side-by-side vertical swimlane pipeline diagrams on one canvas for an OrangePi assistive-robot glove system. Left lane, titled "EnvAwareness (features/env_awareness.py)": show a loop starting at "Voice/gesture input (ENV_SCAN, ENV_CLOSE, NEXT via gesture_queue; mc.voice_listen_loop)" → "_classify_env() keyword router" branching three ways to "SCAN: _record_frames() OpenCV camera (3s @ 10fps)" → "_extract_keyframes(): HSV Bhattacharyya scene-cut @ threshold 0.30, pad to 3, keep top 5 by Laplacian sharpness" → "_frame_to_jpeg() resize 1024px, JPEG q=75" → "_ask_gemini(): Gemini 2.5 Flash API (direct HTTPS, not through feature server)" → "fb.speak(reply) + save session JSON in ~/env_sessions/"; and "LOAD"/"CLOSE" branches; with a dashed side-arrow labeled 'ctx.link.send("lidar", {action: feature_state, feature_name: env, state: started/scan_done/stopped}) — fire-and-forget, exceptions swallowed' pointing to a small "Feature Server (handlers/lidar.py?)" box. Right lane, titled "LiDAR family (features/lidar_nav.py: LidarNavigation, LidarObstacleTest, LidarMappingTest, LidarNavigateTest)": show "MS200Adapter (lidar_adapter.py) @ 230400 baud" feeding a "_scan_worker thread → bounded scan_q(maxsize=2)" into "SLAMEngine.update() (slam_engine.py, ICP_MAX_ROT_DEG overridden to 20°)" which forks into "_obstacle_haptics(): sectors ±45° at 0°/90°/270° (front/left/right), ignore <0.10m housing, pulse ms by distance band 0.30m→420ms, 0.60m→300ms, 1.00m→160ms, 1.50m→70ms, else silent, throttled to one decision per 0.22s, priority front>left>right, driving glove motors MT1/MT3/MT2 (confirmed hand wiring: MT1=bottom, MT2=right, MT3=left)" and "navigation branch: slam.direction_to_room() → bearing >15° turn-left (MT3) / <-15° turn-right (MT2) haptic and speech every 6s, pose_update sent every 2s, arrival declared and session ends when distance < 0.5m". Add a shared "_LidarVoice: sounddevice mic callback → webrtcvad → faster-whisper 'tiny' ASR worker thread → _parse_voice() commands save/take me to/list/stop" box feeding voice commands into the SLAM lane. Show all four LiDAR classes converging on one outbound arrow labeled 'ctx.link.send("lidar", {action: map_save/map_update/pose_update/report, room_name, frame: PNG, x, y, data:{...}})' into the same "Feature Server" box, and annotate that unlike EnvAwareness, several of these sends are NOT exception-guarded and can block the safety loop on a slow/dead server connection. Use warning-red coloring on the <0.30m obstacle band and the "server send unguarded" annotation to emphasize risk areas.
 
 ================================================================================
 SECTION 4 — OCR READER, MONEY RECOGNITION & PROGRAMMABLE FEATURES
@@ -976,6 +983,8 @@ This strongly implies a server-side handler — most plausibly `handlers/ocr.py`
 **Storage**: pages are stored in a `dict` keyed by `("num", page_number)` or `("idx", running_index)` tuples — this dual-keying lets numbered pages be read back in numeric order and unnumbered pages appended by capture order (`_reading_order()` sorts `"num"` keys numerically then appends `"idx"` keys). Rescanning an already-seen page number replaces it in place with an announcement.
 
 **Session naming**: on the very first successful scan of a session, if `session_name` is unset, the user is asked to say a name; unrecognized/skip/failure falls back to an auto-generated `f"reading_{self._session_counter}"`.
+
+**LOAD / ADD (opening a saved book instead of scanning a new one)**: both branches share `_saved_session_names()` (lists every `.json` file's `name` field under `~/ocr_sessions`, in save order) to announce the available books *before* asking the user to pick one by voice — e.g. "Saved books: reading_1, my_notes. Say the book name to read." If no sessions exist yet, the user is told so and pointed at "scan" instead of being asked a question with no valid answer. `LOAD` then calls `mc.listen()` for the spoken name, resolves it via `_find_session()` (exact match, then substring match against saved names), merges the loaded pages into the in-memory `pages` dict, and immediately starts `_read_pages()` at the first page in reading order — i.e. LOAD both opens and reads. `ADD` performs the same name resolution but does **not** start reading — it merges the pages and returns to the scan-wait loop so the next `SCAN` appends a new page to that same book. (Previously, `LOAD` asked "Say the session name" without announcing what was actually saved, unlike `ADD` which already listed names first — this asymmetry has been fixed by extracting the shared `_saved_session_names()` helper so both branches behave consistently and match the "state the options, then ask" pattern used elsewhere, e.g. Money Recognition's "Which currency? Say dollar or Lebanese pound.")
 
 **Reading loop** (`_read_pages(start_key)`): iterates pages in `_reading_order()`, chunk by chunk, playing pre-synthesized WAV audio (`_play_wav_b64`) when available or falling back to local `fb.speak(chunks[i])` with an estimated duration `_chunk_dur()` (`len(words)/WORDS_PER_SEC + 0.4`, `WORDS_PER_SEC=2.5`). During each chunk's playback window, gesture polls check for `OCR_PAUSE` (pause), `OCR_FWD`/`OCR_BWD` (skip/rewind `SKIP_CHUNKS=3` chunks), `NEXT`/`OCR_SCAN` (jump to next page), `OCR_CLOSE` (abort+close). While paused, voice is re-enabled and the same command set plus `YES`/`NO`(resume) is accepted. Returns one of `"scan"`, `"close"`, `"done"` to the outer loop.
 
@@ -1926,49 +1935,81 @@ Response schema: always `{"tts": str, "quit": bool}` — this handler never retu
 Create a technical pipeline diagram with three parallel horizontal swim-lanes, one per feature handler, all starting from a shared "TCP dispatcher (feature_server.py)" box at the top that routes an incoming JSON message by its `feature` field. Lane 1, "LidarHandler.handle()" (handlers/lidar.py): show branching on `action` into `_map_save` (base64-decodes `frame`, writes PNG to `lidar_maps/<room_name>.png`), `_pose_update` (converts `x,y` meters to pixels via `_world_to_px`, caches in memory), and `_report` (writes JSON to `lidar_reports/<session_id>_<mode>.json`); show a side box "HTTP viewer :8080 (_start_http)" reading those same files to serve `/live`, `/map/<room_name>.png` (with `_overlay` drawing a red position dot via OpenCV), `/reports`, and `/metrics`. Lane 2, "OCRHandler.handle()" (handlers/ocr.py): show `_handle_scan` decoding base64 `frame` to a JPEG via cv2.imdecode, writing `ocr_debug/scan_<timestamp>_raw.jpg`, running `_preprocess` (auto-rotate, upscale, Gaussian-blur unsharp mask), writing `ocr_debug/scan_<timestamp>_proc.jpg`, then `_run_ocr` calling a lazily-loaded EasyOCR Reader singleton, filtering by `CONF_THRESHOLD=0.30`, running `_detect_page` regex heuristics, then `_chunk_text` and `_synth` producing base64 WAV clips, logging every outcome to `ocr_metrics.jsonl`, and pruning old debug files via `_rotate_debug` (cap 20). Lane 3, "MoneyHandler.handle()" (handlers/money.py): show a `Session` state machine (ASK_CURRENCY → ASK_AMOUNT → CONFIRM_AMOUNT → SCANNING) feeding into `analyze_frame`, which runs a lazily-loaded Ultralytics YOLO model on the decoded frame, filters/deduplicates boxes via `filter_overlapping_boxes`, calls `dump_frames` to write `captured_scans/scan_<n>_<timestamp>_annotated.jpg` (YOLO-plotted boxes) and `captured_scans/scan_<n>_<timestamp>_blurred.jpg` (Gaussian-blurred raw frame for privacy), logs to `money_metrics.jsonl`, and returns spoken running-total or change-making guidance. End all three lanes converging into a shared "response dict {tts, quit, ...} → protocol.send_msg → OrangePi client" box, and visually distinguish disk-write side effects (file icons with the exact filename patterns above) from in-memory/session-only paths (dashed arrows) to make the persistence behavior of each handler unambiguous.
 
 ================================================================================
-SECTION 8 — HOME AUTOMATION FEATURE (ESP32 RELAYS + QR-CODE WIFI PROVISIONING)
+SECTION 8 — HOME AUTOMATION FEATURE (ESP8266/ESP-01 RELAYS + QR-CODE WIFI PROVISIONING)
 ================================================================================
 
-SECTION 8 — HOME AUTOMATION FEATURE (ESP32 RELAYS + QR-CODE WIFI PROVISIONING)
-===============================================================================
+SECTION 8 — HOME AUTOMATION FEATURE (ESP8266/ESP-01 RELAYS + QR-CODE WIFI PROVISIONING)
+========================================================================================
 
 8.1 Purpose and Architecture
 
 Home Automation lets a glove gesture (or voice command) toggle physical
-relays — lights, an outlet, a fan — mounted on a 2-channel ESP32 relay board
-somewhere in the house. It is integrated exactly the same way every other
-feature is: it is a `Feature` subclass registered in `hub.py`'s `FEATURES`
-list, it talks to the server through the existing shared `ServerLink`
-(`feature="home"`), and its gestures are stored in `gestures.json` under
-`"FEAT:<title>"` keys with zero changes to `gesture_hub/`. Nothing about the
-gesture engine, state machine, or enrollment/Programmable-panel flow needed
-to change — this is a direct payoff of the existing `Feature`/`FeatureRegistry`
-design documented in Section 3.
+relays — lights, an outlet, a fan — mounted on a 2-channel ESP-01 (ESP8266)
+relay board somewhere in the house. It is integrated exactly the same way
+every other feature is: it is a `Feature` subclass registered in `hub.py`'s
+`FEATURES` list, it talks to the server through the existing shared
+`ServerLink` (`feature="home"`), and its gestures are stored in
+`gestures.json` under `"FEAT:<title>"` keys with zero changes to
+`gesture_hub/`. Nothing about the gesture engine, state machine, or
+enrollment/Programmable-panel flow needed to change — this is a direct payoff
+of the existing `Feature`/`FeatureRegistry` design documented in Section 3.
+
+**Hardware note — the board is an ESP-01/ESP8266, not an ESP32.** The ESP-01
+module exposes only two truly free GPIOs (GPIO0 and GPIO2), plus TX(GPIO1)/
+RX(GPIO3) which can be repurposed as plain outputs at the cost of losing the
+Serial console. The firmware wires **Relay 1 to GPIO2** and **Relay 2 to
+GPIO1/TX** — meaning this board has no `Serial.print()` debug output at all
+once wired (the firmware deliberately contains none; use the HTTP `/info` and
+`/status` routes instead). ESP8266 also only supports 2.4 GHz WiFi, which
+matters during pairing (see 8.5).
 
 Three independent pieces exist, each owned by a different machine:
 
-  1. **ESP32 relay board firmware** (`server_app/esp_relay_firmware/`) —
-     Arduino sketch, flashed directly to the ESP32 by the user (not deployed
-     through this codebase's Python tooling). Lives next to the server code
-     because the server is what generates its setup QR and is what it talks
-     to once online — it has no relationship to the OrangePi Python client at
-     all.
+  1. **ESP-01/ESP8266 relay board firmware** (`server_app/esp_relay_firmware/
+     relay_controller/relay_controller.ino`) — Arduino sketch (board:
+     "Generic ESP8266 Module"), flashed directly to the board by the user via
+     a 3.3V USB-to-serial adapter (not deployed through this codebase's
+     Python tooling). Lives next to the server code because the server is
+     what generates its setup QR and is what it talks to once online — it has
+     no relationship to the OrangePi Python client at all.
   2. **Server handler** (`server_app/handlers/home.py`) — a `FeatureHandler`
-     that proxies relay commands from the glove to the ESP32 over the home
+     that proxies relay commands from the glove to the ESP8266 over the home
      LAN, keeps a small device registry, and hosts a tiny HTTP dashboard
-     (port 8090+) that generates the WiFi-setup QR PNG.
+     (port 8090+, auto-incrementing to the next free port up to 8099) that
+     generates the WiFi-setup QR PNG.
   3. **OrangePi feature** (`OrangePI/features/home_automation.py`) — two
      `Feature` classes: `HomeAutomation` (a small voice menu: pair / status /
      close) and `RelaySwitch` (one instance per physical relay, each an
      instant, independently gesture-bindable on/off toggle).
 
+8.1.1 Dynamic Relay Count (how many `RelaySwitch` instances actually exist)
+
+The number of `RelaySwitch` features built into `hub.py`'s `FEATURES` list is
+no longer hardcoded. Immediately after parsing CLI args and before building
+`FEATURES`, `hub.py`'s `main()` connects the shared `ServerLink` and sends
+`{"feature": "home", "action": "get_relay_count"}`. `handlers/home.py`'s
+`HomeHandler._get_relay_count()` resolves the caller's paired device (falling
+back to a module-level `DEFAULT_RELAY_COUNT` if none is paired yet) and
+replies `{"tts": "", "quit": False, "relay_count": <int>}` — deliberately
+silent (empty `tts`) since this is a boot-time query, never something spoken
+to the user. `hub.py` then builds exactly `relay_count` `RelaySwitch(i, f"Relay
+{i}")` instances (falling back to 2 if the server is unreachable or the reply
+omits the key), so pairing a 3rd or 4th relay board automatically produces a
+3rd/4th gesture-bindable feature on the next hub restart, with no code change
+required. This also fixed a startup pitfall: since Python does not hot-reload
+a running process, a server started *before* the `get_relay_count` handler
+existed will simply not match that `action` and fall through to the handler's
+generic `{"tts": "", "quit": False}` reply (no `relay_count` key at all) —
+indistinguishable from "count unknown" from the hub's point of view, silently
+resolving to the 2-relay fallback. Restarting the server process after a
+`handlers/home.py` deploy is required for the real count to take effect.
+
 8.2 Why Each Relay Is Its Own Feature (not a sub-menu)
 
 `gesture_hub/registry.py`'s `FeatureRegistry.gesture_key(feature)` returns
 `f"FEAT:{feature.title}"` — a stable key derived purely from the feature's
-`title` attribute. Because `RelaySwitch(1, "Relay 1")` and
-`RelaySwitch(2, "Relay 2")` are two distinct `Feature` instances with distinct
-titles, the existing enrollment walk (`registry.unassigned()`,
+`title` attribute. Because each `RelaySwitch(i, f"Relay {i}")` is a distinct
+`Feature` instance with a distinct title, the existing enrollment walk (`registry.unassigned()`,
 `start_enrollment()`, `next_enrollment()`) and the Programmable panel treat
 them as two ordinary, independently re-bindable menu items — a user assigns
 "Relay 1" one gesture and "Relay 2" a completely different one, and can
@@ -1986,64 +2027,94 @@ map naturally onto a single instant toggle.
 
   1. Operator runs the server with the home WiFi credentials so it can embed
      them in the QR:
-       `python feature_server.py --home-wifi-ssid "MyHomeWifi" --home-wifi-password "secret123"`
+       `python feature_server.py --home-wifi-ssid "MyHomeWifi" --home-wifi-password "secret123" --home-server-host 192.168.1.50`
   2. Operator opens `http://<server-lan-ip>:8090/qr/relay01` in a browser (or
      the device list at `http://<server-lan-ip>:8090/`) and displays the QR
-     on a phone or monitor screen. `handlers/home.py`'s `_generate_qr_png()`
-     encodes this exact JSON (the `PROVISION_TYPE` schema, shared verbatim by
-     all three components):
-       ```json
-       {
-         "type": "esp_relay_provision",
-         "ssid": "MyHomeWifi",
-         "password": "secret123",
-         "server_host": "192.168.1.50",
-         "server_home_port": 8090,
-         "device_id": "relay01",
-         "relay_count": 2
-       }
-       ```
+     on a phone or monitor screen. `handlers/home.py`'s `build_provision_url()`
+     encodes the same field set as before, but **as a URL query string, not
+     raw JSON** — `http://192.168.4.1/provision?type=esp_relay_provision&
+     ssid=MyHomeWifi&password=secret123&server_host=192.168.1.50&
+     server_home_port=8090&device_id=relay01&relay_count=2` — which
+     `_generate_qr_png()` renders as a PNG via the `qrcode` package. Encoding
+     a URL (rather than opaque JSON) means any generic phone camera app can
+     scan it and offer "open in browser" directly: once a phone has joined
+     the ESP's `RelayCtrl-Setup` access point, tapping that one link
+     provisions the board with no dedicated app and no manual typing.
+     `handlers/home.py` also exposes `build_provision_payload()` (the same
+     fields as a plain dict) for the fallback text shown if the `qrcode`
+     package isn't installed on the server.
   3. On the glove, the user activates Home Automation and says "pair".
      `HomeAutomation._pair()` speaks "Show me the setup QR code now.", opens
      the OrangePi's own camera (the same OpenCV capture pattern used by OCR
      and Money — no new camera-handling code, no ESP-side camera needed at
      all), and loops `cv2.QRCodeDetector().detectAndDecode(frame)` for up to
-     15 seconds until it decodes a payload whose `"type"` matches
-     `esp_relay_provision`.
-  4. The freshly-flashed ESP32 is, at this point, broadcasting its own
+     15 seconds. The decoded string is handed to `_parse_provision_data()`,
+     which tries `json.loads` first (legacy raw-JSON QR format, kept for
+     backward compatibility) and, if that fails, falls back to parsing it as
+     a URL — checking `path == "/provision"` and pulling `type`,
+     `server_home_port`, `relay_count`, etc. out of the query string — so the
+     OrangePi's automated pairing flow accepts the exact same QR a phone's
+     camera app would offer to open in a browser.
+  4. The freshly-flashed ESP-01 is, at this point, broadcasting its own
      open-to-join setup access point (`RelayCtrl-Setup` / `relaysetup`,
      hardcoded identically in the firmware and in `home_automation.py`). The
      OrangePi records its **current** WiFi connection profile name via
      `nmcli -t -f NAME,TYPE connection show --active`, then temporarily joins
      `RelayCtrl-Setup` via `nmcli device wifi connect`.
-  5. It `POST`s the decoded JSON straight to `http://192.168.4.1/provision`
-     (the ESP32's fixed AP-mode IP) using `urllib.request` — no new Python
-     dependency needed on the Pi.
+  5. It `POST`s the decoded payload as JSON to `http://192.168.4.1/provision`
+     (the ESP's fixed AP-mode IP) using `urllib.request` — no new Python
+     dependency needed on the Pi. (The firmware's `GET /provision?...` route
+     exists purely so a human can provision by tapping the QR-encoded link
+     directly from a phone browser, bypassing the OrangePi's automated flow
+     entirely for manual testing — both routes call the same shared
+     `doProvision()` helper in the firmware.)
   6. Regardless of outcome, it immediately reconnects to the recorded home
      WiFi profile via `nmcli connection up <profile>`. Every step from here
      onward runs over the restored home network.
-  7. The ESP32 (`handleProvision()` in the firmware) saves the credentials
-     to flash (`Preferences`/NVS) and reboots. On the next boot it finds
-     saved credentials, joins the home WiFi as a station, starts its
-     relay-control HTTP server, and immediately `POST`s
-     `{"device_id","ip","relay_count","fw"}` to the server's
-     `/esp/register` endpoint — this is how `handlers/home.py` learns the
-     board's LAN IP without the OrangePi ever needing to know it. The ESP32
-     repeats this registration every 30 seconds as a heartbeat so a later
-     DHCP-assigned IP change is picked up automatically.
+  7. The ESP8266 (`doProvision()`, called from either `handleProvision()` or
+     `handleProvisionGet()` in the firmware) saves `device_id`, `server_host`,
+     and `server_home_port` into a `Config` struct persisted via
+     EEPROM-emulated flash (`EEPROM.begin/put/commit/end`, sanity-checked with
+     a `CONFIG_MAGIC` value so a blank/foreign flash resets to safe defaults
+     rather than reading garbage), calls `WiFi.begin(ssid, pass)` with
+     `WiFi.persistent(true)` (the ESP8266 SDK itself persists the SSID/
+     password to flash — no separate application-level storage needed for
+     those two fields, unlike `device_id`/`server_host`/`port`), and reboots.
+     On the next boot it finds `g_cfg.provisioned == true`, joins the home
+     WiFi as a station (`connectStation()`, 20 s timeout — if the saved
+     credentials no longer work, e.g. router replaced, it falls back to
+     re-opening the provisioning AP automatically rather than retrying
+     forever), starts its relay-control HTTP server, and immediately `POST`s
+     `{"device_id","ip","relay_count","fw"}` to the server's `/esp/register`
+     endpoint — this is how `handlers/home.py` learns the board's LAN IP
+     without the OrangePi ever needing to know it. The board repeats this
+     registration every `REGISTER_INTERVAL_MS` (30 s) as a heartbeat so a
+     later DHCP-assigned IP change is picked up automatically.
   8. `HomeAutomation._pair()` speaks a final confirmation once WiFi is
      restored, and logs a `pair` metric (see Section 9) recording total
      elapsed time and success/failure.
 
-Critically, the ESP32 **never** talks to the OrangePi at any point in normal
+**Two live-testing gotchas confirmed during bring-up**, worth keeping in the
+report as operational notes: (a) the phone/device used to scan the QR and
+join `RelayCtrl-Setup` **cannot simultaneously be hosting its own hotspot**
+that the OrangePi or another device depends on — joining a different network
+kills the hotspot mid-provision; use a laptop or a second phone for the
+join+provision step if the primary phone is acting as a hotspot. (b) the
+ESP8266 **only supports 2.4 GHz WiFi** — if the phone/laptop's own hotspot or
+the home network is 5 GHz-only (or 5 GHz-only band-steered), the ESP can never
+join it regardless of retries; the home WiFi (and any hotspot standing in for
+it during testing) must have a 2.4 GHz band available.
+
+Critically, the ESP8266 **never** talks to the OrangePi at any point in normal
 operation — only during this one-time pairing hand-off, and even then it's a
 plain unauthenticated HTTP POST to a fixed, well-known setup address. Once
 provisioned, every relay command in this system flows exclusively
-glove → OrangePi → feature server → ESP32, matching the chosen topology.
+glove → OrangePi → feature server → ESP8266, matching the chosen topology.
 
 8.4 Runtime Relay Toggle Flow
 
-  1. User fires the gesture bound to "Relay 1" (or 2).
+  1. User fires the gesture bound to "Relay 1" (or 2, or however many relays
+     the paired board actually reports — see 8.1.1).
   2. `RelaySwitch.run(ctx)` sends
      `ctx.link.send("home", {"action": "toggle", "relay": 1, "state": "toggle"})`
      over the existing `ServerLink` and returns as soon as a reply arrives —
@@ -2053,8 +2124,20 @@ glove → OrangePi → feature server → ESP32, matching the chosen topology.
      most-recently-registered device if `device_id` wasn't given — the
      common case with exactly one board), issues
      `GET http://<esp-ip>/relay?ch=1&state=toggle` via `urllib.request` with a
-     4-second timeout, and relays the ESP's `{"ok","relay","state"}` reply
-     back as a spoken `"Relay 1 turned on."`/`"...off."`.
+     4-second timeout. On the firmware side, `handleRelay()` maps channel 1
+     to GPIO2 and channel 2 to GPIO1/TX (`relayPin()`), resolves `state` (
+     `on`/`off`/`toggle` against the current `relayState[ch]`), and calls
+     `applyRelay(ch, newState)`, which writes `HIGH`/`LOW` according to the
+     single `RELAY_ACTIVE_LOW` compile-time flag (`false` in the current
+     firmware — HIGH turns a relay on; flipping this one line and reflashing
+     is the entire fix if "on"/"off" ever behave backwards on a different
+     relay module) — then relays the ESP's `{"ok","relay","state"}` reply
+     back to the OrangePi as a spoken `"Relay 1 turned on."`/`"...off."`.
+     Both relays default to `off` at boot (`applyRelay(1/2, false)` in
+     `setup()`); GPIO2 specifically idles HIGH for a brief instant at power-on
+     as an unavoidable ESP8266 boot-strapping quirk, so with
+     `RELAY_ACTIVE_LOW=false` Relay 1 may flicker on for a fraction of a
+     second before `setup()` corrects it — not present on Relay 2 (GPIO1).
   4. If the board hasn't registered in over `STALE_DEVICE_S` (120 s), the
      handler still attempts the request (the last known IP might still be
      valid) but appends a spoken hint that the address may be stale if it
@@ -2091,7 +2174,7 @@ glove → OrangePi → feature server → ESP32, matching the chosen topology.
     call is unconditional once `profile` was captured), and the user hears
     `"Could not send the WiFi details to the relay board. Your WiFi has been
     restored."` — the user is never left stranded off their home network.
-  - **ESP32 loses its saved WiFi entirely** (router replaced, password
+  - **ESP8266 loses its saved WiFi entirely** (router replaced, password
     changed): the firmware's `connectStation()` times out after 20 s and
     falls back to re-opening the `RelayCtrl-Setup` provisioning AP
     automatically — the same pairing flow above simply runs again with a
@@ -2099,14 +2182,28 @@ glove → OrangePi → feature server → ESP32, matching the chosen topology.
   - **Two relay boards**: giving each board a distinct `device_id` in its
     provisioning payload (`relay01`, `relay02`, ...) lets `handlers/home.py`
     track them as separate registry entries; `HomeAutomation`/`RelaySwitch`
-    as written target a single default board (the current 2-relay
-    prototype), so a second board would need its `device_id` passed
-    explicitly in the toggle payload — a small, clearly-scoped extension
-    point (`_resolve_device()` already accepts an explicit `device_id`).
+    as written target a single default board (`_resolve_device()` picks the
+    most-recently-registered device when no `device_id` is given), so a
+    second board's relays would need `device_id` passed explicitly in the
+    toggle payload — a small, clearly-scoped extension point
+    (`_resolve_device()` already accepts an explicit `device_id`). Note this
+    is orthogonal to the dynamic relay-*count* fix in 8.1.1, which sizes the
+    `RelaySwitch` list to one board's relay count, not to multiple boards.
+  - **Server restarted with new `handlers/home.py` code, hub started before
+    the server picked it up**: `get_relay_count` (8.1.1) is answered by
+    whichever server process is actually listening — if that process
+    predates the handler existing, the action falls through to the generic
+    `{"tts": "", "quit": False}` reply with no `relay_count` key, and `hub.py`
+    silently uses its 2-relay fallback. Confirmed live: two duplicate server
+    processes both listening on the configured port (one from a stale
+    background launch) can mask this identically. Always verify with
+    `Get-NetTCPConnection -LocalPort <port> -State Listen` / a process list
+    that exactly one, freshly-started server owns the port after a handler
+    change, before assuming the count itself is wrong.
 
 8.6 DIAGRAM GENERATION PROMPT — Home Automation (Relays + QR Provisioning)
 
-Draw a three-column architecture diagram. Column 1 "OrangePi (features/home_automation.py)": show `HomeAutomation` (voice menu: pair/status/close) and two `RelaySwitch(1)`/`RelaySwitch(2)` boxes, each with their own bindable gesture via the existing `FeatureRegistry`/`GestureStore` (`FEAT:Relay 1`, `FEAT:Relay 2` keys in gestures.json — no gesture_hub changes). Show a `_pair()` flow: camera capture -> `cv2.QRCodeDetector` decode -> `nmcli device wifi connect RelayCtrl-Setup` -> `POST http://192.168.4.1/provision` -> `nmcli connection up <original-profile>`. Column 2 "Feature Server (handlers/home.py)": a `HomeHandler` box with actions `toggle`/`status`/`list_devices`, an HTTP dashboard on port 8090 with routes `/`, `/qr/<device_id>` (PNG, calls `_generate_qr_png` using the `qrcode` package), `POST /esp/register`, `/metrics`; a device registry `home_devices.json` (device_id -> ip, relay_count, fw, last_seen). Column 3 "ESP32 (esp_relay_firmware/relay_controller.ino)": two states — UNPROVISIONED (SoftAP `RelayCtrl-Setup`, `GET /info`, `POST /provision` saving to NVS via `Preferences` then rebooting) and CONNECTED (`GET /relay?ch=1&state=on|off|toggle` driving GPIO 26/27, `GET /status`, periodic `POST /esp/register` heartbeat every 30s). Draw arrows: Column1 <-> Column2 over the existing TCP ServerLink tagged `feature="home"`; Column2 <-> Column3 over plain HTTP on the home LAN; a dashed one-time arrow Column1 -> Column3 labeled "provisioning POST (only during pairing, bypasses the server entirely)". Annotate the QR JSON schema (`type, ssid, password, server_host, server_home_port, device_id, relay_count`) next to the QR PNG box since it is the single shared contract across all three columns.
+Draw a three-column architecture diagram. Column 1 "OrangePi (hub.py + features/home_automation.py)": show `hub.py` querying `{"feature":"home","action":"get_relay_count"}` at boot (before building FEATURES) to decide how many `RelaySwitch(i, "Relay i")` boxes to create (dynamic N, not a fixed 2), plus `HomeAutomation` (voice menu: pair/status/close) — each RelaySwitch has its own bindable gesture via the existing `FeatureRegistry`/`GestureStore` (`FEAT:Relay 1`, `FEAT:Relay 2`, ... keys in gestures.json — no gesture_hub changes). Show a `_pair()` flow: camera capture -> `cv2.QRCodeDetector` decode -> `_parse_provision_data()` (JSON first, then URL-query fallback) -> `nmcli device wifi connect RelayCtrl-Setup` -> `POST http://192.168.4.1/provision` -> `nmcli connection up <original-profile>`. Column 2 "Feature Server (handlers/home.py)": a `HomeHandler` box with actions `toggle`/`status`/`list_devices`/`get_relay_count`, an HTTP dashboard on port 8090+ with routes `/`, `/qr/<device_id>` (PNG QR encoding a URL via `build_provision_url()`, rendered by `_generate_qr_png()` using the `qrcode` package — not raw JSON, so any phone camera app can "open in browser"), `POST /esp/register`, `/metrics`; a device registry `home_devices.json` (device_id -> ip, relay_count, fw, last_seen). Column 3 "ESP-01/ESP8266 (esp_relay_firmware/relay_controller/relay_controller.ino)": two states — UNPROVISIONED (SoftAP `RelayCtrl-Setup`, `GET /info`, `POST /provision` + `GET /provision?...` both calling shared `doProvision()`, saving device_id/server_host/port to EEPROM via a magic-number-checked `Config` struct, WiFi creds persisted separately by the ESP8266 SDK itself, then rebooting) and CONNECTED (`GET /relay?ch=1&state=on|off|toggle` driving GPIO2 (relay 1) / GPIO1-TX (relay 2) through `applyRelay()`, polarity controlled by one `RELAY_ACTIVE_LOW` flag, `GET /status`, periodic `POST /esp/register` heartbeat every 30s). Draw arrows: Column1 <-> Column2 over the existing TCP ServerLink tagged `feature="home"`; Column2 <-> Column3 over plain HTTP on the home LAN; a dashed one-time arrow Column1 -> Column3 labeled "provisioning POST (only during pairing, bypasses the server entirely)". Annotate the QR contents (`type, ssid, password, server_host, server_home_port, device_id, relay_count` — as URL query params) next to the QR PNG box since it is the single shared contract across all three columns. Add a small side-note box: "ESP8266 = 2.4GHz WiFi only; the phone/device joining RelayCtrl-Setup can't simultaneously host its own hotspot."
 
 ================================================================================
 SECTION 9 — PERFORMANCE METRICS: LOAD TIME, LATENCY, RESPONSE TIME (ALL FEATURES)
