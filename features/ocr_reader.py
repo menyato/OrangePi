@@ -363,6 +363,24 @@ def _save_session(name: str, pages_list: list) -> str:
     return path
 
 
+def _saved_session_names() -> list:
+    """Names of all saved sessions, in save order — used to announce choices
+    before asking the user to pick one by voice (LOAD and ADD)."""
+    if not os.path.isdir(SESSIONS_DIR):
+        return []
+    names = []
+    for fname in sorted(os.listdir(SESSIONS_DIR)):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(SESSIONS_DIR, fname), encoding="utf-8") as f:
+                data = json.load(f)
+            names.append(data.get("name", fname[:-5]))
+        except Exception:
+            pass
+    return names
+
+
 def _find_session(query: str) -> "dict | None":
     """Find a saved session by name (exact then partial match)."""
     if not os.path.isdir(SESSIONS_DIR):
@@ -739,8 +757,19 @@ class OCRReader(Feature):
                     _voice_off()
                     raw_text = ""
 
-                    _srvspeak(ctx, fb, "Say the session name.")
-                    fb.wait(timeout=5)
+                    saved_names = _saved_session_names()
+                    if not saved_names:
+                        _srvspeak(ctx, fb,
+                            "No saved books found yet. Say scan to start one.")
+                        fb.wait(timeout=4)
+                        _voice_on()
+                        continue
+
+                    names_str = ", ".join(saved_names[:5])
+                    extra = f" and {len(saved_names) - 5} more" if len(saved_names) > 5 else ""
+                    _srvspeak(ctx, fb,
+                        f"Saved books: {names_str}{extra}. Say the book name to read.")
+                    fb.wait(timeout=6)
                     if mc_ok:
                         try:
                             raw_text, _ = mc.listen()
@@ -781,29 +810,16 @@ class OCRReader(Feature):
                 # ── ADD (load a session for editing, not for reading) ─────────
                 if cmd == "ADD":
                     _voice_off()
-                    if not os.path.isdir(SESSIONS_DIR) or not os.listdir(SESSIONS_DIR):
+                    saved_names = _saved_session_names()
+                    if not saved_names:
                         _srvspeak(ctx, fb,
                             "No saved books found. Say scan to start a new one.")
                         fb.wait(timeout=4)
                         _voice_on()
                         continue
 
-                    # Announce the available session names so the user can pick one
-                    saved = []
-                    for fname in sorted(os.listdir(SESSIONS_DIR)):
-                        if not fname.endswith(".json"):
-                            continue
-                        try:
-                            with open(os.path.join(SESSIONS_DIR, fname),
-                                      encoding="utf-8") as _f:
-                                saved.append(json.load(_f))
-                        except Exception:
-                            pass
-
-                    names_str = ", ".join(
-                        s.get("name", "?") for s in saved[:5]
-                    )
-                    extra = f" and {len(saved) - 5} more" if len(saved) > 5 else ""
+                    names_str = ", ".join(saved_names[:5])
+                    extra = f" and {len(saved_names) - 5} more" if len(saved_names) > 5 else ""
                     _srvspeak(ctx, fb,
                         f"Saved books: {names_str}{extra}. Say the book name.")
                     fb.wait(timeout=6)
