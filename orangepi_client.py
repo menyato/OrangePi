@@ -76,6 +76,15 @@ MIN_SHARPNESS     = 10
 
 # ── RUNTIME GLOBALS (filled by auto-detect) ───────────────────────────────────
 AUDIO_INPUT_DEVICE: int | None  = None
+_MIC_OVERRIDE:      int | None  = None   # set via set_mic_override() — wins over auto-detect
+
+
+def set_mic_override(index: int) -> None:
+    """Force a specific sounddevice input index instead of auto-detecting.
+    Must be called before auto_detect_all() (hub.py does this right after
+    parsing --mic, before any feature loads models)."""
+    global _MIC_OVERRIDE
+    _MIC_OVERRIDE = index
 ALSA_OUTPUT_DEVICE: str | None  = None
 CAM_DEVICE:         int         = 0
 
@@ -268,7 +277,11 @@ def auto_detect_all() -> None:
     print("\n" + "═" * 60)
     print("  AUTO-DETECTING LOGITECH DEVICES")
     print("═" * 60)
-    AUDIO_INPUT_DEVICE = detect_mic()
+    if _MIC_OVERRIDE is not None:
+        AUDIO_INPUT_DEVICE = _MIC_OVERRIDE
+        print(f"[DETECT] Mic  → [{AUDIO_INPUT_DEVICE}] (forced via --mic)")
+    else:
+        AUDIO_INPUT_DEVICE = detect_mic()
     ALSA_OUTPUT_DEVICE = detect_speaker()
     CAM_DEVICE         = detect_camera()
     print("═" * 60 + "\n")

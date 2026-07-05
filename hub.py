@@ -55,6 +55,7 @@ import threading
 import time
 
 from glove_controller import GloveController
+import orangepi_client as mc
 
 from gesture_hub.store         import GestureStore
 from gesture_hub.cal_store     import CalStore
@@ -132,6 +133,10 @@ def main() -> None:
     ap.add_argument("--baud",      default=115200, type=int, help="UART baud rate")
     ap.add_argument("--alsa",      default=None,
                     help="ALSA device for hub speech, e.g. plughw:0,0")
+    ap.add_argument("--mic",       default=None, type=int,
+                    help="Force sounddevice input index for feature voice "
+                         "(money/env/home), instead of auto-detect. See: "
+                         "python3 -c \"import sounddevice as sd; print(sd.query_devices())\"")
 
     # ── paths ─────────────────────────────────────────────────────────────────
     ap.add_argument("--gestures",  default=DEFAULT_GESTURES_PATH,
@@ -185,6 +190,9 @@ def main() -> None:
                          "Forces full re-enrollment on the next boot.")
 
     args = ap.parse_args()
+
+    if args.mic is not None:
+        mc.set_mic_override(args.mic)
 
     # ── Connect early: needed to ask the server how many relays are actually
     #    paired, so we build exactly that many gesture-bindable RelaySwitch
