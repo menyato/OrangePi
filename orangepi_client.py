@@ -455,6 +455,11 @@ def _play_wav_bytes(wav_bytes: bytes) -> subprocess.Popen:
     RESTORED FUNCTION (was missing in the original — this is the bug that made
     the natural PC voice silently fail and forced robotic espeak fallback).
     Pipes a complete WAV (with header) into aplay on the detected speaker.
+
+    aplay can die before/during the write (e.g. a Ctrl-C's SIGINT reaches it
+    too, since it's in the same foreground process group; or the ALSA device
+    briefly rejects the open) — a bare .write() then raises BrokenPipeError,
+    which previously crashed the whole hub instead of just this one TTS line.
     """
     proc = subprocess.Popen(
         ["aplay", "-D", ALSA_OUTPUT_DEVICE, "-q"],
@@ -462,8 +467,11 @@ def _play_wav_bytes(wav_bytes: bytes) -> subprocess.Popen:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    proc.stdin.write(wav_bytes)
-    proc.stdin.close()
+    try:
+        proc.stdin.write(wav_bytes)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError) as e:
+        print(f"[TTS] aplay pipe closed early ({e}) — skipping this line.")
     return proc
 
 
