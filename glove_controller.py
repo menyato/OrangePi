@@ -61,12 +61,16 @@ class SensorFrame:
 
     @property
     def imu_flags(self) -> dict:
+        # The MPU is mounted mirrored relative to what the ATmega firmware
+        # assumes, so its raw bits read forward/back and left/right backwards.
+        # Swapped here (rather than reflashing the ATmega) so bit 0 (the
+        # firmware's "tilt_right") is reported as tilt_left, and so on.
         b = self.imu_bits
         return {
-            "tilt_right":    bool(b & (1 << 0)),
-            "tilt_left":     bool(b & (1 << 1)),
-            "tilt_forward":  bool(b & (1 << 2)),
-            "tilt_backward": bool(b & (1 << 3)),
+            "tilt_left":     bool(b & (1 << 0)),
+            "tilt_right":    bool(b & (1 << 1)),
+            "tilt_backward": bool(b & (1 << 2)),
+            "tilt_forward":  bool(b & (1 << 3)),
             "rotate_cw":     bool(b & (1 << 4)),
             "rotate_ccw":    bool(b & (1 << 5)),
         }

@@ -5,9 +5,14 @@ flex_mask  — which bits in SensorFrame.flex_bits must be SET
              bit 0 = Thumb, 1 = Index, 2 = Middle, 3 = Ring, 4 = Pinky
 
 imu_mask   — which bits in SensorFrame.imu_bits must be SET
-             bit 0 = tilt_right,    bit 1 = tilt_left
-             bit 2 = tilt_forward,  bit 3 = tilt_backward
+             bit 0 = tilt_left,     bit 1 = tilt_right
+             bit 2 = tilt_backward, bit 3 = tilt_forward
              bit 4 = rotate_cw,     bit 5 = rotate_ccw
+             (bits 0-3 are swapped from the ATmega firmware's own bit order —
+             the MPU sits mirrored on this glove, so its raw forward/back and
+             left/right bits read backwards; corrected here in one place so
+             every consumer of IMU_BIT_NAMES / imu_mask sees the true
+             physical direction without reflashing the ATmega.)
 
 flex_exact — if True the flex match is EXACT: frame.flex_bits == flex_mask.
              If False (default) it is a SUBSET match: extra bent fingers are
@@ -39,10 +44,10 @@ FINGER_NAMES = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
 FINGER_INDEX = {n.lower(): i for i, n in enumerate(FINGER_NAMES)}
 
 IMU_BIT_NAMES = [
-    "tilt_right",    # bit 0
-    "tilt_left",     # bit 1
-    "tilt_forward",  # bit 2
-    "tilt_backward", # bit 3
+    "tilt_left",     # bit 0
+    "tilt_right",    # bit 1
+    "tilt_backward", # bit 2
+    "tilt_forward",  # bit 3
     "rotate_cw",     # bit 4
     "rotate_ccw",    # bit 5
 ]
@@ -107,10 +112,10 @@ class GestureSpec:
 
 DEFAULT_GESTURES: dict[str, GestureSpec] = {
     # ── global navigation ─────────────────────────────────────────────────────
-    "START": GestureSpec("START", flex_mask=0x11, imu_mask=0x01,
+    "START": GestureSpec("START", flex_mask=0x11, imu_mask=0x02,
                          motion=Motion.STATIC, hold_frames=3, flex_exact=True),
     # Pinky only, flick wrist right — scroll / next
-    "NEXT":  GestureSpec("NEXT",  flex_mask=0x10, imu_mask=0x01,
+    "NEXT":  GestureSpec("NEXT",  flex_mask=0x10, imu_mask=0x02,
                          motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
     # Thumb + Middle only, hold in any position — edit / change gesture
     "EDIT":  GestureSpec("EDIT",  flex_mask=0x05, imu_mask=0x00,
@@ -118,12 +123,12 @@ DEFAULT_GESTURES: dict[str, GestureSpec] = {
 
     # ── Book Reader playback controls (only acted on inside OCR feature) ──────
     # Pause/resume: Thumb + Ring + Pinky closed, tilt wrist backward, hold.
-    "OCR_PAUSE": GestureSpec("OCR_PAUSE", flex_mask=0x19, imu_mask=0x08,
+    "OCR_PAUSE": GestureSpec("OCR_PAUSE", flex_mask=0x19, imu_mask=0x04,
                              motion=Motion.STATIC, hold_frames=3, flex_exact=True),
     # Skip forward ~5 s: Thumb only, flick wrist right.
-    "OCR_FWD":   GestureSpec("OCR_FWD",   flex_mask=0x01, imu_mask=0x01,
+    "OCR_FWD":   GestureSpec("OCR_FWD",   flex_mask=0x01, imu_mask=0x02,
                              motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
     # Skip backward ~5 s: Thumb only, flick wrist left.
-    "OCR_BWD":   GestureSpec("OCR_BWD",   flex_mask=0x01, imu_mask=0x02,
+    "OCR_BWD":   GestureSpec("OCR_BWD",   flex_mask=0x01, imu_mask=0x01,
                              motion=Motion.FLICK,  hold_frames=2, flex_exact=True),
 }
