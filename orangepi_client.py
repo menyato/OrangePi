@@ -28,10 +28,18 @@ SERVER_PORT = 9000
 SAMPLE_RATE        = 16000
 FRAME_DURATION     = 30
 FRAME_SIZE         = int(SAMPLE_RATE * FRAME_DURATION / 1000)   # 480 samples
-VAD_AGGRESSIVENESS = 3
+# VAD_AGGRESSIVENESS 3 (max) + a 500ms ring buffer meant "speech ended" fired
+# after as little as ~300ms of quiet (60% of a 500ms window) -- well inside a
+# normal mid-sentence pause ("load... a book"), so multi-word commands kept
+# getting cut off after the first word or two and discarded outright as
+# "Too short" once the truncated capture fell under MIN_SPEECH_SEC. Widened
+# the window to 900ms (needs ~540ms of real quiet to end a phrase) and eased
+# aggressiveness from 3 to 2, which also reduces false "unvoiced" frames on
+# quieter phonemes/consonants that were contributing to premature cutoffs.
+VAD_AGGRESSIVENESS = 2
 VOICED_THRESHOLD   = 0.6
 UNVOICED_THRESHOLD = 0.6
-RING_BUFFER_MS     = 500
+RING_BUFFER_MS     = 900
 RING_BUFFER_FRAMES = int(RING_BUFFER_MS / FRAME_DURATION)
 MAX_RECORD_SEC     = 15
 MIN_SPEECH_SEC     = 0.4
