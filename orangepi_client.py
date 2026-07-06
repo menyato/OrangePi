@@ -401,13 +401,24 @@ KNOWN_CONFUSIONS = {
 
 FUZZY_CUTOFF = 0.74   # difflib ratio threshold for snapping unknown tokens
 
+# Never fuzzy-snap these: ordinary function words that sit right at the
+# cutoff against vocabulary entries — "the"→"three" scores 0.75 and was
+# live-corrupting nearly every sentence ("load the page"→"load three page",
+# a session named "that's the one" saved as "that's three one").
+_NEVER_SNAP = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "is",
+    "it", "its", "for", "my", "me", "this", "that", "was", "are", "be",
+}
+
 
 def correct_transcript(text: str) -> tuple[str, list]:
     """
     Return (corrected_text, list_of_(orig, fixed) corrections).
     1. exact KNOWN_CONFUSIONS replacement, then
     2. fuzzy snap of remaining unknown tokens to COMMAND_VOCAB.
-    Digits and already-known words are left untouched.
+    Digits, already-known words, function words, and words too short to
+    fuzzy-match safely are left untouched (short tokens only get fixed via
+    the exact KNOWN_CONFUSIONS table, e.g. "ad"→"add").
     """
     corrections: list[tuple[str, str]] = []
     out_tokens: list[str] = []
@@ -419,6 +430,9 @@ def correct_transcript(text: str) -> tuple[str, list]:
             out_tokens.append(fixed)
             continue
         if low in COMMAND_VOCAB or low.isdigit():
+            out_tokens.append(low)
+            continue
+        if low in _NEVER_SNAP or len(low) < 4:
             out_tokens.append(low)
             continue
         match = difflib.get_close_matches(low, COMMAND_VOCAB, n=1, cutoff=FUZZY_CUTOFF)
@@ -617,7 +631,7 @@ def _to_pcm(frame: np.ndarray) -> bytes:
     return (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
 
-def record_with_vad() -> np.ndarray | None:
+def record_with_vad(stop_ev=None) -> np.ndarray | None:
     ring_buffer   = collections.deque(maxlen=RING_BUFFER_FRAMES)
     triggered     = False
     voiced_frames: list[np.ndarray] = []
@@ -646,6 +660,16 @@ def record_with_vad() -> np.ndarray | None:
     deadline = time.time() + MAX_RECORD_SEC
     with stream_ctx as stream:
         while time.time() < deadline:
+            # A caller asked us to stop and no speech has started yet — bail
+            # out immediately instead of sitting in the (up to 15 s) VAD wait.
+            # This is what actually makes _voice_off() responsive: without it,
+            # "turn voice off, then speak a prompt" had to wait out the full
+            # record window before the mic was released. Once the user IS
+            # mid-utterance (triggered), we let it finish so the speech isn't
+            # lost — the shared loop queues it and the caller can use it.
+            if stop_ev is not None and stop_ev.is_set() and not triggered:
+                print("[MIC] Stop requested while idle — releasing mic.")
+                return None
             try:
                 chunk, overflowed = stream.read(FRAME_SIZE)
                 if overflowed:
@@ -776,7 +800,8 @@ def transcribe(audio: np.ndarray | None, initial_prompt: str | None = None,
 
 
 def listen(retries: int = 5, initial_prompt: str | None = None,
-           hotwords: str | None = None) -> tuple[str, dict]:
+           hotwords: str | None = None, stop_ev=None,
+           quiet: bool = False, correct: bool = True) -> tuple[str, dict]:
     """
     Returns (corrected_text, audit). Skips the expensive Whisper call entirely
     when no speech was captured, beeps to mark each stage, and tells the user
@@ -785,17 +810,38 @@ def listen(retries: int = 5, initial_prompt: str | None = None,
     initial_prompt/hotwords are passed straight through to transcribe() — see
     its docstring. Pass your feature's own vocabulary here if it's not money
     recognition's currency-scanning commands.
+
+    stop_ev: optional Event that ends the retry loop early. Without it, one
+    listen() call could run its full 5 retries (~2 minutes of mic ownership
+    and spoken "didn't catch that" prompts) after the caller had already
+    moved on — the background voice loop would then talk over and steal
+    speech from whatever prompt the feature was asking next.
+
+    quiet: suppress the spoken "didn't catch that" / "did not understand"
+    prompts. Foreground one-shot listens ask the user a question, so the
+    prompts are helpful there; the background command loop just waits for
+    the user to maybe say something, and nagging them every time room noise
+    trips the VAD (e.g. right after a book finishes reading, when they said
+    nothing at all) is noise.
+
+    correct: apply correct_transcript()'s command-vocabulary snapping.
+    Pass False when the answer is free text (a book title, a session name) —
+    snapping arbitrary words toward command vocabulary corrupts names.
     """
     told = False   # avoid repeating the spoken "didn't catch that" every retry
     for attempt in range(1, retries + 1):
+        if stop_ev is not None and stop_ev.is_set():
+            print("[STT] Stop requested — abandoning remaining retries.")
+            break
         t0 = time.time()
-        audio = record_with_vad()          # plays the LISTEN cue inside
+        audio = record_with_vad(stop_ev=stop_ev)   # plays the LISTEN cue inside
         t_record = time.time() - t0
 
         # ── Nothing to transcribe → DON'T run Whisper; tell the user ────────
         if audio is None:
             print(f"[STT] No speech captured ({attempt}/{retries}).")
-            if not told:
+            if not told and not quiet \
+                    and not (stop_ev is not None and stop_ev.is_set()):
                 speak("I didn't catch that. Please speak after the beep.")
                 wait_speaking()
                 told = True
@@ -806,7 +852,10 @@ def listen(retries: int = 5, initial_prompt: str | None = None,
         raw_text, stats = transcribe(audio, initial_prompt=initial_prompt, hotwords=hotwords)
         t_transcribe = time.time() - t1
 
-        corrected, corrections = correct_transcript(raw_text)
+        if correct:
+            corrected, corrections = correct_transcript(raw_text)
+        else:
+            corrected, corrections = raw_text, []
 
         audit = {
             "t_record": round(t_record, 3),
@@ -821,7 +870,11 @@ def listen(retries: int = 5, initial_prompt: str | None = None,
             "attempt": attempt,
         }
 
-        if corrected.strip():
+        # Require at least one letter or digit: Whisper hallucinates strings
+        # of punctuation (". . . .") on noise-only audio, often with *high*
+        # confidence — one of those got accepted and read back to a blind
+        # user as a "book name" of four hundred spoken dots.
+        if corrected.strip() and re.search(r"[a-z0-9]", corrected, re.IGNORECASE):
             play_cue(_CUE_ACK)   # tells the blind user: heard you, working on it
             _short = " ".join(corrected.split()[:4])
             print("\n" + "─" * 50)
@@ -840,7 +893,8 @@ def listen(retries: int = 5, initial_prompt: str | None = None,
 
         # Heard sound but no words came out
         print(f"[STT] Nothing understood ({attempt}/{retries}).")
-        if not told:
+        if not told and not quiet \
+                and not (stop_ev is not None and stop_ev.is_set()):
             speak("Sorry, I did not understand. Please try again.")
             wait_speaking()
             told = True
@@ -854,10 +908,13 @@ def voice_listen_loop(voice_q, stop_ev, abort_ev, initial_prompt: str | None = N
     """Shared blocking voice worker for features (OCR, Environmental Awareness, …).
 
     Loops calling listen() and puts the corrected transcript into voice_q.
-    Returns when stop_ev or abort_ev is set.
-    Features start this in a daemon thread; stop_ev.set() ends it after the
-    current listen() call completes (listen() itself is not interruptible, but
-    each call is at most a few seconds).
+    Returns when stop_ev or abort_ev is set — stop_ev is passed down into
+    listen() so an in-flight call abandons its retries (and its idle VAD
+    wait) promptly instead of owning the mic for minutes.
+
+    Runs listen() in quiet mode: this loop passively waits for a command,
+    so the spoken "didn't catch that" retry prompts (meant for direct
+    questions) would nag the user every time room noise trips the VAD.
 
     Pass initial_prompt/hotwords with your feature's own command vocabulary —
     these default (inside transcribe()) to money recognition's currency
@@ -866,7 +923,8 @@ def voice_listen_loop(voice_q, stop_ev, abort_ev, initial_prompt: str | None = N
     """
     while not stop_ev.is_set() and not abort_ev.is_set():
         try:
-            text, _ = listen(initial_prompt=initial_prompt, hotwords=hotwords)
+            text, _ = listen(initial_prompt=initial_prompt, hotwords=hotwords,
+                             stop_ev=stop_ev, quiet=True)
         except Exception as e:
             print(f"[VOICE] listen error: {e}")
             import time as _t; _t.sleep(0.5)

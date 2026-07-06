@@ -63,11 +63,11 @@ CHUNK_TARGET   = 10
 SKIP_CHUNKS    = 3
 SESSIONS_DIR   = os.path.expanduser("~/ocr_sessions")
 CAMERA_INDICES = [0, 1, 2]
-# Reading out every saved book's name before asking "which one" gets long and
-# hard to track by ear once there are more than a couple -- name a couple by
-# example and let the user just say the one they want (fuzzy/partial matching
-# in _find_session() still resolves names that aren't in this short list).
-NAMES_ANNOUNCE_LIMIT = 2
+# Only the newest MAX_SAVED_SESSIONS books are kept on disk (older ones are
+# deleted at feature start) and all of them are announced newest-first —
+# reading out a long history of book names is impossible to track by ear.
+MAX_SAVED_SESSIONS   = 3
+NAMES_ANNOUNCE_LIMIT = 3
 IDLE_REMIND_S  = 60
 
 # Domain vocabulary passed to every mc.listen()/voice_listen_loop() call in
@@ -264,6 +264,21 @@ _CMD_VOCAB = [
 ]
 
 
+def _fuzzy_hit(word: str, vocab: set) -> bool:
+    """True if `word` is a close spelling of some vocabulary word.
+
+    Both sides must be at least 4 letters: short strings score deceptively
+    high on difflib's ratio — "one" vs "no" is 0.8 and "one" vs "none" is
+    0.86, which live-classified a user's answer of "one" as NO/skip (their
+    session got silently renamed to the reading_N fallback). Short command
+    words ("no", "ok", "yes", "add") therefore match exactly only.
+    """
+    if len(word) < 4:
+        return False
+    candidates = [v for v in vocab if len(v) >= 4]
+    return bool(difflib.get_close_matches(word, candidates, n=1, cutoff=0.75))
+
+
 def _classify(text: str) -> "str | None":
     words = set(re.findall(r"[a-z]+", text.lower()))
     for cmd, vocab in _CMD_VOCAB:
@@ -273,15 +288,13 @@ def _classify(text: str) -> "str | None":
     # ── fuzzy fallback ───────────────────────────────────────────────────
     # A blind user gets no visual confirmation of what Whisper actually
     # heard, so a mispronounced or slightly-misheard command word (e.g.
-    # "lod"/"lowd" for "load", "closs" for "close", "sken" for "scan")
-    # would otherwise be reported as "(unrecognised)" with no way for the
-    # user to know why -- they'd just have to guess and try again. Accept
-    # a close spelling match per word instead of requiring an exact one.
-    # Skipped for words under 3 letters -- short strings ("no", "ok") match
-    # almost anything at a workable cutoff, so those rely on exact matches.
+    # "lowd" for "load", "closs" for "close", "sken" for "scan") would
+    # otherwise be reported as "(unrecognised)" with no way for the user
+    # to know why -- they'd just have to guess and try again. Accept a
+    # close spelling match per word instead of requiring an exact one.
     for cmd, vocab in _CMD_VOCAB:
         for w in words:
-            if len(w) >= 3 and difflib.get_close_matches(w, vocab, n=1, cutoff=0.75):
+            if _fuzzy_hit(w, vocab):
                 return cmd
     return None
 
@@ -292,8 +305,7 @@ def _is_skip(text: str) -> bool:
     words = set(re.findall(r"[a-z]+", text.lower()))
     if words & _SKIP_W:
         return True
-    return any(len(w) >= 3 and difflib.get_close_matches(w, _SKIP_W, n=1, cutoff=0.75)
-               for w in words)
+    return any(_fuzzy_hit(w, _SKIP_W) for w in words)
 
 
 def _voice_worker(abort: threading.Event,
@@ -416,19 +428,34 @@ def _save_session(name: str, pages_list: list) -> str:
     return path
 
 
-def _saved_session_names() -> list:
-    """Names of all saved sessions, in save order — used to announce choices
-    before asking the user to pick one by voice (LOAD and ADD)."""
+def _session_files_by_mtime() -> list:
+    """Full paths of saved session files, newest first."""
     if not os.path.isdir(SESSIONS_DIR):
         return []
-    names = []
-    for fname in sorted(os.listdir(SESSIONS_DIR)):
-        if not fname.endswith(".json"):
-            continue
+    paths = [os.path.join(SESSIONS_DIR, f)
+             for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
+    return sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True)
+
+
+def _prune_sessions(keep: int = MAX_SAVED_SESSIONS) -> None:
+    """Delete all but the `keep` most recently saved books."""
+    for path in _session_files_by_mtime()[keep:]:
         try:
-            with open(os.path.join(SESSIONS_DIR, fname), encoding="utf-8") as f:
+            os.remove(path)
+            print(f"[OCR] Pruned old session → {path}")
+        except Exception as e:
+            print(f"[OCR] Prune error for {path}: {e}")
+
+
+def _saved_session_names() -> list:
+    """Names of saved sessions, newest first — used to announce choices
+    before asking the user to pick one by voice (LOAD and ADD)."""
+    names = []
+    for path in _session_files_by_mtime():
+        try:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            names.append(data.get("name", fname[:-5]))
+            names.append(data.get("name", os.path.basename(path)[:-5]))
         except Exception:
             pass
     return names
@@ -553,6 +580,8 @@ class OCRReader(Feature):
 
         mc_ok = _ensure_mc(fb, ctx.link)
 
+        _prune_sessions()   # keep only the newest MAX_SAVED_SESSIONS books
+
         self._session_counter += 1
         session_name: "str | None" = None
         pages:        dict         = {}
@@ -563,6 +592,7 @@ class OCRReader(Feature):
         _cur_stop   = [threading.Event()]
         _cur_stop[0].set()
         _cur_thread = [None]   # the OCRVoice Thread currently owning the mic, if any
+        _last_raw   = [""]     # full text of the utterance behind the last voice cmd
 
         def _voice_on() -> None:
             if not mc_ok:
@@ -574,6 +604,13 @@ class OCRReader(Feature):
             def _delayed():
                 time.sleep(1.0)
                 if not stop.is_set():
+                    # Drain again right before listening starts: a previous
+                    # worker that was mid-transcription when it was stopped
+                    # can queue its (now stale) text after the drain above —
+                    # acting on it here would fire a command the user said
+                    # a whole flow ago (e.g. re-triggering a scan they had
+                    # already completed).
+                    _drain(voice_q)
                     _voice_worker(ctx.abort, voice_q, stop)
             t = threading.Thread(target=_delayed, daemon=True, name="OCRVoice")
             _cur_thread[0] = t
@@ -602,7 +639,14 @@ class OCRReader(Feature):
             _cur_stop[0].set()
             t = _cur_thread[0]
             if t is not None and t.is_alive():
-                t.join(timeout=getattr(mc, "MAX_RECORD_SEC", 15) + 3.0)
+                # Worst case the loop is mid-utterance: full record window
+                # plus a slow Whisper pass (23s observed live on the Pi).
+                # An idle listener releases the mic in well under a second
+                # now that record_with_vad() checks stop_ev while waiting.
+                t.join(timeout=getattr(mc, "MAX_RECORD_SEC", 15) + 30.0)
+                if t.is_alive():
+                    print("[OCR] WARNING: voice worker still busy after join "
+                          "timeout — mic may be contended.")
             leftover = None
             try:
                 leftover = voice_q.get_nowait()
@@ -612,8 +656,10 @@ class OCRReader(Feature):
             return leftover
 
         def _get_cmd(ges_timeout: float = 0.1) -> "str | None":
+            _last_raw[0] = ""    # cleared so a gesture cmd can't reuse stale text
             try:
                 raw = voice_q.get_nowait()
+                _last_raw[0] = raw
                 cmd = _classify(raw)
                 if cmd:
                     print(f"[OCR] voice: {raw!r} → {cmd}")
@@ -657,6 +703,14 @@ class OCRReader(Feature):
 
             Returns (last_raw_text_heard, matched_session_or_None).
             """
+            # A leftover that strips to nothing ("load", "read", "a book") is
+            # the user repeating the command, not naming a book — using it as
+            # a name burned one of the two attempts on a guaranteed miss.
+            if leftover and not _strip_filler(leftover):
+                print(f"[OCR] voice(leftover): {leftover!r} — just a command "
+                      "word, not a name; ignoring")
+                leftover = None
+
             raw_text = ""
             for attempt in range(2):
                 if leftover:
@@ -669,10 +723,26 @@ class OCRReader(Feature):
                     raw_text = ""
                     if mc_ok:
                         try:
+                            # correct=False: this is a free-text title, and
+                            # the command-vocab corrector mangles names
+                            # ("that's the one" → "that's three one")
                             raw_text, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
-                                                    hotwords=OCR_HOTWORDS)
+                                                    hotwords=OCR_HOTWORDS,
+                                                    correct=False)
                         except Exception:
                             raw_text = ""
+                    if not raw_text:
+                        # The old background listener may have finished its
+                        # in-flight transcription DURING our direct listen and
+                        # queued the user's answer there instead ("read page
+                        # one" was observed landing in voice_q while the
+                        # direct listen heard nothing).
+                        try:
+                            raw_text = voice_q.get_nowait()
+                            print(f"[OCR] voice(late): {raw_text!r} — "
+                                  "recovered from background queue")
+                        except queue.Empty:
+                            pass
                     print(f"[OCR] voice(direct): {raw_text!r} — answering 'book name'")
 
                 if not raw_text:
@@ -941,14 +1011,34 @@ class OCRReader(Feature):
                         _voice_on()
                         continue
 
-                    names_str = ", ".join(saved_names[:NAMES_ANNOUNCE_LIMIT])
-                    extra = (f" and {len(saved_names) - NAMES_ANNOUNCE_LIMIT} more"
-                             if len(saved_names) > NAMES_ANNOUNCE_LIMIT else "")
-                    raw_text, sdata = _ask_book_name(
-                        leftover,
-                        f"Saved books: {names_str}{extra}. Say the book name to read.",
-                        "I couldn't find that book. Say the name again.",
-                    )
+                    # The command itself may already name the book — "load
+                    # page", "read harry potter" — so try that before asking
+                    # a follow-up question at all.
+                    raw_text, sdata = "", None
+                    hint = _strip_filler(_last_raw[0])
+                    if hint:
+                        sdata = _find_session(hint)
+                        if sdata:
+                            raw_text = hint
+                            print(f"[OCR] book name taken from command: {hint!r}")
+
+                    # Only one book saved → nothing to disambiguate, load it.
+                    if sdata is None and len(saved_names) == 1:
+                        sdata = _find_session(saved_names[0])
+                        if sdata:
+                            raw_text = saved_names[0]
+                            print(f"[OCR] only one saved book — loading "
+                                  f"{saved_names[0]!r} without asking")
+
+                    if sdata is None:
+                        names_str = ", ".join(saved_names[:NAMES_ANNOUNCE_LIMIT])
+                        extra = (f" and {len(saved_names) - NAMES_ANNOUNCE_LIMIT} more"
+                                 if len(saved_names) > NAMES_ANNOUNCE_LIMIT else "")
+                        raw_text, sdata = _ask_book_name(
+                            leftover,
+                            f"Saved books: {names_str}{extra}. Say the book name to read.",
+                            "I couldn't find that book. Say the name again.",
+                        )
 
                     if sdata:
                         loaded_name  = sdata["name"]
@@ -979,7 +1069,10 @@ class OCRReader(Feature):
                         else:
                             _srvspeak(ctx, fb, f"Session {loaded_name} has no pages.")
                     elif raw_text:
-                        _srvspeak(ctx, fb, f"No session found matching {raw_text}.")
+                        # first few words only — echoing a long mis-transcription
+                        # back at a blind user is just noise
+                        _srvspeak(ctx, fb, "No session found matching "
+                                  f"{' '.join(raw_text.split()[:6])}.")
                     _voice_on()
                     continue
 
@@ -998,14 +1091,32 @@ class OCRReader(Feature):
                         _voice_on()
                         continue
 
-                    names_str = ", ".join(saved_names[:NAMES_ANNOUNCE_LIMIT])
-                    extra = (f" and {len(saved_names) - NAMES_ANNOUNCE_LIMIT} more"
-                             if len(saved_names) > NAMES_ANNOUNCE_LIMIT else "")
-                    raw_text, sdata = _ask_book_name(
-                        leftover,
-                        f"Saved books: {names_str}{extra}. Say the book name.",
-                        "I couldn't find that book. Say the name again.",
-                    )
+                    # Same shortcuts as LOAD: name embedded in the command
+                    # ("add to harry potter"), then single-saved-book.
+                    raw_text, sdata = "", None
+                    hint = _strip_filler(_last_raw[0])
+                    if hint:
+                        sdata = _find_session(hint)
+                        if sdata:
+                            raw_text = hint
+                            print(f"[OCR] book name taken from command: {hint!r}")
+
+                    if sdata is None and len(saved_names) == 1:
+                        sdata = _find_session(saved_names[0])
+                        if sdata:
+                            raw_text = saved_names[0]
+                            print(f"[OCR] only one saved book — adding to "
+                                  f"{saved_names[0]!r} without asking")
+
+                    if sdata is None:
+                        names_str = ", ".join(saved_names[:NAMES_ANNOUNCE_LIMIT])
+                        extra = (f" and {len(saved_names) - NAMES_ANNOUNCE_LIMIT} more"
+                                 if len(saved_names) > NAMES_ANNOUNCE_LIMIT else "")
+                        raw_text, sdata = _ask_book_name(
+                            leftover,
+                            f"Saved books: {names_str}{extra}. Say the book name.",
+                            "I couldn't find that book. Say the name again.",
+                        )
 
                     if sdata:
                         loaded_name  = sdata["name"]
@@ -1021,8 +1132,8 @@ class OCRReader(Feature):
                             f"{n_loaded} page{'s' if n_loaded != 1 else ''} "
                             "already saved. Say scan to capture a new page.")
                     elif raw_text:
-                        _srvspeak(ctx, fb,
-                            f"No book found matching {raw_text}.")
+                        _srvspeak(ctx, fb, "No book found matching "
+                                  f"{' '.join(raw_text.split()[:6])}.")
                     else:
                         _srvspeak(ctx, fb, "No name heard.")
                     fb.wait(timeout=5)
@@ -1135,7 +1246,8 @@ class OCRReader(Feature):
                         fb.wait(timeout=5)
                         try:
                             vtxt, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
-                                               hotwords=OCR_HOTWORDS)
+                                               hotwords=OCR_HOTWORDS,
+                                               correct=False)
                             print(f"[OCR] voice(direct): {vtxt!r} — answering 'session name'")
                             if vtxt:
                                 if not _is_skip(vtxt):
@@ -1182,5 +1294,6 @@ class OCRReader(Feature):
                         f"{total_words} words."
                     )
                     print(f"[OCR] Session saved → {path}")
+                    _prune_sessions()   # just-saved book is newest, survives
                 except Exception as e:
                     print(f"[OCR] Save error: {e}")
