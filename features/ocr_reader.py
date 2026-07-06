@@ -466,8 +466,13 @@ def _prune_sessions(keep: int = MAX_SAVED_SESSIONS) -> None:
 
 
 def _saved_session_names() -> list:
-    """Names of saved sessions, newest first — used to announce choices
-    before asking the user to pick one by voice (LOAD and ADD)."""
+    """Names of saved sessions — used in the startup summary and to
+    announce choices before asking the user to pick one (LOAD and ADD).
+
+    The built-in practice books (garden, ocean, mountain) are listed
+    FIRST, in their fixed order, so the user always hears the familiar
+    names they learned with before their own books; the rest follow
+    newest-first."""
     names = []
     for path in _session_files_by_mtime():
         try:
@@ -476,7 +481,10 @@ def _saved_session_names() -> list:
             names.append(data.get("name", os.path.basename(path)[:-5]))
         except Exception:
             pass
-    return names
+    sample_order = [n for n, _ in _SAMPLE_BOOKS]
+    samples_present = [n for n in sample_order if n in names]
+    rest            = [n for n in names if n not in samples_present]
+    return samples_present + rest
 
 
 # Words that carry no naming information when they show up in a spoken
