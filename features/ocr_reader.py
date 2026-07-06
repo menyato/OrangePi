@@ -857,7 +857,16 @@ class OCRReader(Feature):
                 _voice_off()
                 idle_t = time.time() + IDLE_REMIND_S
 
-                _srvspeak(ctx, fb, "Hold the page flat and steady. Capturing now.")
+                # Speak the hold instruction and let it actually finish before
+                # capturing — previously "Capturing now" was said in the same
+                # breath and _capture_frame() started immediately afterward,
+                # since _srvspeak() is non-blocking, so the photo was taken
+                # while the instruction was still being read (or before the
+                # user had any time to act on it).
+                _srvspeak(ctx, fb, "Hold the page flat and steady.")
+                fb.wait(timeout=6)
+                fb.speak("Capturing now.")
+                fb.wait(timeout=3)
                 jpeg = _capture_frame(fb)
 
                 if jpeg is None:
