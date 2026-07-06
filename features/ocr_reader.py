@@ -25,10 +25,14 @@ Voice controls (mc.listen / Whisper — ON during idle, paused, and after page)
 -----------------------------------------------------------------
   "scan"       → capture a new page
   "load <name>"→ load a previously saved session and re-read it
+  "add <name>" → load a saved session to add pages to it
+  "new book"   → save the current book and start a fresh one
   "next"       → jump to next already-scanned page
   "close"      → save and exit
   (paused) "yes" / "resume"  → resume reading
   (paused) "scan"            → break out to capture a new page
+  (paused) "new book"        → save this book, start a fresh one
+  (paused) "load" / "add"    → switch to a different saved book
   (paused) "next"            → skip to next page
   (paused) "close"           → save and exit
 """
@@ -219,6 +223,7 @@ def _capture_frame(fb) -> "bytes | None":
 _SCAN_W  = {"scan", "capture", "take", "photo", "scam", "skan", "skun", "scanned"}
 _LOAD_W  = {"load", "recall", "open", "read"}
 _ADD_W   = {"add", "append", "insert"}
+_NEW_W   = {"new", "fresh"}
 _NEXT_W  = {"next", "skip", "forward"}
 _CLOSE_W = {"close", "stop", "quit", "finish", "exit", "done"}
 _YES_W   = {"yes", "yeah", "resume", "continue", "ok", "yep", "sure"}
@@ -252,8 +257,11 @@ def _parse_number(text: str) -> "int | None":
 
 
 # Priority order for both exact and fuzzy matching -- first hit wins, same
-# order a human would disambiguate a multi-intent utterance in.
+# order a human would disambiguate a multi-intent utterance in. NEW comes
+# before LOAD/ADD so "load a new book" / "add a new book" mean "start a
+# fresh book", not "open a saved one".
 _CMD_VOCAB = [
+    ("NEW",   _NEW_W),
     ("LOAD",  _LOAD_W),
     ("ADD",   _ADD_W),
     ("SCAN",  _SCAN_W),
@@ -518,12 +526,24 @@ def _find_session(query: str) -> "dict | None":
     return None
 
 
+def _coerce_page_num(value) -> "int | None":
+    """Normalize a page number to int (or None). Keys must be uniformly
+    typed: a "2" (str) next to a 3 (int) would crash _reading_order()'s
+    sort — and ordering is what guarantees pages are read in numeric
+    order no matter what order they were scanned or saved in."""
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _pages_from_session(data: dict) -> "tuple[dict, int]":
     """Convert saved session data to pages dict. Returns (pages, next_idx)."""
     pages: dict = {}
     idx = 0
     for p in data.get("pages", []):
-        pnum = p.get("page")
+        pnum = _coerce_page_num(p.get("page"))
+        p["page"] = pnum
         if pnum is not None:
             pages[("num", pnum)] = p
         else:
@@ -775,6 +795,7 @@ class OCRReader(Feature):
                     f"Done reading {session_name}. "
                     f"{n_pg} page{'s' if n_pg != 1 else ''}, {total_w} words. "
                     "Say scan to add a page, "
+                    "new book to start a brand new book, "
                     "load to open a different session, "
                     "or close to save and exit."
                 )
@@ -789,6 +810,9 @@ class OCRReader(Feature):
             elif result == "add":
                 # User said "add" while paused — go straight to add-to-book
                 voice_q.put("ADD")
+            elif result == "new":
+                # User said "new book" while paused — start a fresh book
+                voice_q.put("NEW")
             return False
 
         # ── opening ───────────────────────────────────────────────────────────
@@ -830,6 +854,7 @@ class OCRReader(Feature):
               "scan"  — user asked to scan a new page (from pause)
               "load"  — user asked to open a different saved book (from pause)
               "add"   — user asked to add pages to a different book (from pause)
+              "new"   — user asked to start a brand-new book (from pause)
               "close" — user asked to close
               "done"  — finished reading all pages
             """
@@ -860,6 +885,7 @@ class OCRReader(Feature):
                                 ctx, fb,
                                 "Paused. "
                                 "Say scan to add a page. "
+                                "Say new book to start a brand new book. "
                                 "Say load to open a different book. "
                                 "Say add to add pages to a different book. "
                                 "Say yes to resume. "
@@ -893,6 +919,10 @@ class OCRReader(Feature):
                         elif cmd == "ADD":
                             paused = False; pause_announced = False
                             return "add"
+
+                        elif cmd == "NEW":
+                            paused = False; pause_announced = False
+                            return "new"
 
                         elif cmd == "NEXT":
                             i = len(chunks); paused = False; pause_announced = False
@@ -1140,6 +1170,22 @@ class OCRReader(Feature):
                     _voice_on()
                     continue
 
+                # ── NEW (save current book, start a fresh one) ───────────────
+                if cmd == "NEW":
+                    _autosave()
+                    if pages and session_name:
+                        _srvspeak(ctx, fb,
+                            f"Saved {session_name}. Starting a new book.")
+                    else:
+                        _srvspeak(ctx, fb, "Starting a new book.")
+                    fb.wait(timeout=5)
+                    session_name = None
+                    pages        = {}
+                    page_idx     = 0
+                    # Fall through to capture: first scan of the fresh book
+                    # asks for its name, same as a brand-new session.
+                    cmd = "SCAN"
+
                 if cmd not in ("SCAN", "NEXT"):
                     continue
 
@@ -1187,7 +1233,7 @@ class OCRReader(Feature):
                     _voice_on()
                     continue
 
-                detected_page  = resp.get("page")
+                detected_page  = _coerce_page_num(resp.get("page"))
                 word_count     = len(text_body.split())
                 server_chunks  = resp.get("chunks")          # server-split text chunks
                 chunk_wavs_b64 = resp.get("chunk_wavs")      # parallel list of base64 WAVs
