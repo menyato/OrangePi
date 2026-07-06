@@ -190,7 +190,24 @@ def main() -> None:
                     help="Clear all user-assigned feature gestures and exit. "
                          "Forces full re-enrollment on the next boot.")
 
+    # ── book reader shelf ─────────────────────────────────────────────────────
+    ap.add_argument("--sample-books", action="store_true",
+                    help="Install the Book Reader practice books (garden, "
+                         "ocean, mountain) before starting.")
+    ap.add_argument("--fresh-books", action="store_true",
+                    help="Delete ALL saved books, then install the practice "
+                         "books, before starting.")
+
     args = ap.parse_args()
+
+    if args.sample_books or args.fresh_books:
+        import glob as _glob
+        from features.ocr_reader import SESSIONS_DIR, _install_sample_books
+        if args.fresh_books and os.path.isdir(SESSIONS_DIR):
+            for _p in _glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
+                os.remove(_p)
+                print(f"[HUB] deleted saved book {_p}")
+        _install_sample_books()
 
     if args.mic is not None:
         mc.set_mic_override(args.mic)
