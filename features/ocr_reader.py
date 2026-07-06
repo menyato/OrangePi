@@ -425,45 +425,31 @@ def _pages_from_session(data: dict) -> "tuple[dict, int]":
 # ── startup session summary ───────────────────────────────────────────────────
 
 def _startup_summary() -> str:
-    """Return a spoken summary of all saved sessions for the opening announcement."""
+    """Return a brief saved-book *count* for the opening announcement — just
+    enough for the user to know books exist, without reading every single
+    one's name/pages/word-count up front (that used to make the very first
+    thing a blind user heard, before any instructions, a multi-minute wall of
+    speech once more than a couple of books were saved — with a long enough
+    announcement it could even outrun fb.wait()'s timeout, so the mic started
+    listening for a command while the announcement was still playing). Full
+    names are still spoken on demand: LOAD and ADD both call
+    _saved_session_names() and read them out before asking which one."""
     if not os.path.isdir(SESSIONS_DIR):
         return ""
-    rows = []
-    for fname in sorted(os.listdir(SESSIONS_DIR)):
+    count = 0
+    for fname in os.listdir(SESSIONS_DIR):
         if not fname.endswith(".json"):
             continue
         try:
             with open(os.path.join(SESSIONS_DIR, fname), encoding="utf-8") as f:
                 data = json.load(f)
-            name       = data.get("name", fname[:-5])
-            plist      = data.get("pages", [])
-            n_pages    = len(plist)
-            if n_pages == 0:
-                continue
-            total_w    = sum(
-                p.get("word_count", len(p.get("text", "").split()))
-                for p in plist
-            )
-            nums = sorted(p["page"] for p in plist if p.get("page") is not None)
-            if nums:
-                if len(nums) == 1:
-                    pg_str = f"page {nums[0]}"
-                elif len(nums) <= 6:
-                    pg_str = "pages " + ", ".join(str(n) for n in nums)
-                else:
-                    pg_str = f"pages {nums[0]} to {nums[-1]}"
-            else:
-                pg_str = f"{n_pages} unnumbered page{'s' if n_pages != 1 else ''}"
-            rows.append(f"{name}: {pg_str}, {total_w} words")
+            if data.get("pages"):
+                count += 1
         except Exception:
             pass
-
-    if not rows:
+    if count == 0:
         return ""
-    count = len(rows)
-    out   = f"You have {count} saved session{'s' if count != 1 else ''}. "
-    out  += ". ".join(rows) + ". "
-    return out
+    return f"You have {count} saved book{'s' if count != 1 else ''}. "
 
 
 # ── feature ───────────────────────────────────────────────────────────────────
@@ -572,22 +558,33 @@ class OCRReader(Feature):
             return False
 
         # ── opening ───────────────────────────────────────────────────────────
+        # Spoken in two short, sequenced chunks — menu first, gesture controls
+        # second — rather than one long paragraph. Book *names* are announced
+        # on demand by LOAD/ADD (_saved_session_names()), not dumped here: with
+        # several saved books, reading every one's name/pages/word-count before
+        # any instruction meant a blind user had to sit through a multi-minute
+        # wall of speech just to learn what commands exist — and a long enough
+        # announcement could outrun fb.wait()'s timeout, so the mic started
+        # listening for a command while the announcement was still playing.
         _voice_on()   # start early so 1-second init overlaps with TTS
         _srvspeak(
             ctx, fb,
             "Book reader. "
             + _startup_summary()
             + "Say scan to capture a new page. "
-            "Say load to read a saved book. "
+            "Say load to read a saved book — I'll tell you their names first. "
             "Say add to add pages to a saved book. "
-            "Or say close to exit. "
-            "During reading: "
-            "close thumb ring and pinky and tilt hand back to pause or resume. "
-            "Flick thumb right to skip forward. "
-            "Flick thumb left to rewind. "
-            "Flick pinky right to jump to the next page."
+            "Or say close to exit."
         )
-        fb.wait(timeout=30)   # ensure announcement finishes before the loop polls gestures
+        fb.wait(timeout=20)
+        _srvspeak(
+            ctx, fb,
+            "During reading: close thumb, ring, and pinky, and tilt your hand "
+            "back, to pause or resume. Flick thumb right to skip forward. "
+            "Flick thumb left to rewind. Flick pinky right to jump to the "
+            "next page."
+        )
+        fb.wait(timeout=16)
         if gq:
             _drain(gq)        # discard any gesture that triggered the feature open
 
