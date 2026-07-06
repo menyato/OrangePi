@@ -1,17 +1,19 @@
 """
 features/ocr_reader.py — Book Reader feature for the smart glove.
 
-State transitions (announced via TTS)
---------------------------------------
+Flow (scan and read are separate — reading never interrupts scanning)
+----------------------------------------------------------------------
   IDLE     → "Book reader. Say scan, load <name>, or close."
-  CAPTURE  → "Hold steady. Capturing now."  haptic on success
-  PROCESS  → "Scanning complete. Processing text."
-  RESULT   → "Page N. X words."
-           or "No page number. X words. Say the number or skip."
-  NAME     → "Say a name for this session."  (first scan only)
-  READ     → "Session <name>. Reading now."
-  PAUSE    → "Paused. Scan, yes=resume, next, close."
-  DONE     → "All pages read. Scan for more or close."
+  SCAN     → batch: capture page → page number → "scan for next page,
+             or done to finish" → repeat until done/save
+  NAME     → "Say a name for this book."  (first save only)
+  SAVED    → "Saved as <name>. Say read to listen now, scan to add
+             more pages, or close to exit."
+  LOAD     → "Loaded <name>. Say scan to add new pages first, or read
+             to begin."  then reads all pages in page-number order
+  READ     → continuous, gesture-controlled; pause menu offers scan /
+             new book / load / add / next / close
+  DONE     → "All pages read."
   CLOSE    → gap-warning → "Saved as <name>. N pages, X words."
 
 Gesture controls (during reading only — voice OFF, no cue sounds)
@@ -225,7 +227,7 @@ _LOAD_W  = {"load", "recall", "open", "read"}
 _ADD_W   = {"add", "append", "insert"}
 _NEW_W   = {"new", "fresh"}
 _NEXT_W  = {"next", "skip", "forward"}
-_CLOSE_W = {"close", "stop", "quit", "finish", "exit", "done"}
+_CLOSE_W = {"close", "stop", "quit", "finish", "exit", "done", "save", "saved"}
 _YES_W   = {"yes", "yeah", "resume", "continue", "ok", "yep", "sure"}
 _NO_W    = {"no", "nope", "back"}
 _SKIP_W  = {"skip", "none", "no", "cancel", "default"}
@@ -552,6 +554,105 @@ def _pages_from_session(data: dict) -> "tuple[dict, int]":
     return pages, idx
 
 
+# ── built-in sample books ─────────────────────────────────────────────────────
+# Installed on first run only (no saved books yet) so reading, pause/resume,
+# and skip gestures can be tested immediately without scanning anything.
+# Names are single common words that Whisper hears reliably. Each page is
+# ~120 words (~12 chunks ≈ a minute of speech) — long enough to practise
+# pausing and skipping mid-page. They are saved oldest-first, so as the
+# user saves real books the samples are pruned away first.
+
+_SAMPLE_BOOKS = [
+    ("garden", [
+        "The garden woke up slowly in the morning light. Dew covered every "
+        "leaf and every petal, and the air smelled of wet earth. A small "
+        "bird landed on the fence and looked around before singing its "
+        "first song of the day. The tomatoes were still green, but the "
+        "beans had grown taller than the sticks that held them. Near the "
+        "wall, the old rose bush opened one new flower, deep red and "
+        "wide. An ant climbed along the handle of a forgotten spade. "
+        "Somewhere behind the hedge, a cat moved without a sound. The "
+        "gardener arrived with a cup of tea in one hand, stood by the "
+        "gate, and smiled at all of it before starting the day's work.",
+        "By noon the sun stood high over the garden and the shadows had "
+        "pulled back under the trees. Bees moved from flower to flower "
+        "with a steady hum, never resting long in one place. The gardener "
+        "pulled weeds from between the carrots and threw them into a "
+        "basket. Water from the green hose made small rainbows above the "
+        "lettuce. A butterfly with orange wings settled on the edge of "
+        "the water barrel and drank. The cat from the morning now slept "
+        "openly on the warm stone path, one ear turning at every sound. "
+        "When the church bell rang far away, the gardener sat in the "
+        "shade, ate bread and cheese, and watched the beans climb.",
+    ]),
+    ("ocean", [
+        "The ocean began where the white sand ended, and it went on until "
+        "it touched the sky. Waves arrived one after another, each with "
+        "its own quiet thunder, each leaving a line of foam that sank "
+        "into the sand. A fishing boat with a blue hull rocked near the "
+        "pier, ropes creaking softly. Seagulls hung in the wind above it, "
+        "hardly moving their wings. A child ran along the waterline with "
+        "a red bucket, chasing the foam and then running from it. Far "
+        "out, where the water turned dark, something silver jumped and "
+        "vanished. The old man who sold shells from a wooden table said "
+        "it was a good sign, and nobody argued with him.",
+        "In the evening the ocean changed its voice. The waves came "
+        "slower and lower, as if they were tired from the long day. The "
+        "sun dropped toward the water and laid a road of gold across it, "
+        "from the beach to the very edge of the world. The fishing boat "
+        "came home with its lights on, and the men tied it to the pier "
+        "with hands that knew every knot in the dark. Someone lit a small "
+        "fire on the sand, and the smell of grilled fish drifted along "
+        "the beach. The child with the red bucket slept on a towel, "
+        "holding one perfect shell. The ocean kept talking quietly, the "
+        "way it always does, to anyone who stays and listens.",
+    ]),
+    ("mountain", [
+        "The mountain stood at the end of the valley like a wall built "
+        "before time began. Its lower slopes were covered with pine "
+        "forest, dark green and thick, and above the trees the bare rock "
+        "climbed into the clouds. A narrow path started behind the last "
+        "farmhouse and went up in long, patient turns. Two hikers set "
+        "out at dawn with heavy packs and light hearts. They crossed a "
+        "wooden bridge over a stream so cold it made their fingers ache "
+        "when they filled their bottles. Higher up, the trees grew "
+        "shorter and the wind grew stronger. A hawk circled once above "
+        "them and slid away along the ridge without a single wingbeat.",
+        "By afternoon the hikers reached the stone shelter below the "
+        "summit. Clouds moved past them now instead of above them, wet "
+        "and fast and silent. They ate chocolate and dried fruit sitting "
+        "with their backs against the warm south wall. Far below, the "
+        "valley looked like a map of itself, with tiny fields and a road "
+        "as thin as a thread. The last part of the climb was steep, hand "
+        "over hand beside an old steel cable. Then, all at once, there "
+        "was no more up. The summit was a small flat place with a wooden "
+        "cross and a metal box holding a notebook. They wrote their "
+        "names, sat down in the enormous quiet, and let the mountain "
+        "hold them above the world for a while.",
+    ]),
+]
+
+
+def _seed_sample_books() -> None:
+    """Install the built-in sample books if no books are saved yet."""
+    if _session_files_by_mtime():
+        return
+    for name, texts in _SAMPLE_BOOKS:
+        pages_list = [{"page": i + 1, "text": t,
+                       "word_count": len(t.split()),
+                       "chunks": None, "chunk_wavs": None}
+                      for i, t in enumerate(texts)]
+        try:
+            _save_session(name, pages_list)
+            # keep mtimes strictly ordered so pruning removes samples
+            # in a predictable oldest-first order
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"[OCR] sample book seed error: {e}")
+    print("[OCR] No saved books found — installed sample books: "
+          + ", ".join(n for n, _ in _SAMPLE_BOOKS))
+
+
 # ── startup session summary ───────────────────────────────────────────────────
 
 def _startup_summary() -> str:
@@ -600,7 +701,8 @@ class OCRReader(Feature):
 
         mc_ok = _ensure_mc(fb, ctx.link)
 
-        _prune_sessions()   # keep only the newest MAX_SAVED_SESSIONS books
+        _seed_sample_books()   # first run: install test books to read
+        _prune_sessions()      # keep only the newest MAX_SAVED_SESSIONS books
 
         self._session_counter += 1
         session_name: "str | None" = None
@@ -772,6 +874,152 @@ class OCRReader(Feature):
                     return raw_text, sdata
 
             return raw_text, None
+
+        def _ask_direct(prompt: str, timeout: int = 6, correct: bool = True,
+                        label: str = "") -> str:
+            """Speak a question, take ONE direct listen, return the transcript
+            ('' if nothing heard). Background voice loop must be off."""
+            _srvspeak(ctx, fb, prompt)
+            fb.wait(timeout=timeout)
+            txt = ""
+            if mc_ok:
+                try:
+                    txt, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
+                                       hotwords=OCR_HOTWORDS, correct=correct)
+                except Exception:
+                    txt = ""
+            print(f"[OCR] voice(direct): {txt!r} — answering {label!r}")
+            return txt or ""
+
+        def _capture_one_page() -> bool:
+            """Capture and OCR one page into `pages` (with page number ask).
+            Returns True if a page was stored."""
+            nonlocal page_idx
+
+            # Speak the hold instruction and let it actually finish before
+            # capturing — _srvspeak() is non-blocking, so without the waits
+            # the photo was taken while the instruction was still being read.
+            fb.beep()   # non-verbal "getting ready to scan" heads-up
+            _srvspeak(ctx, fb, "Hold the page flat and steady.")
+            fb.wait(timeout=6)
+            fb.speak("Capturing now.")
+            fb.wait(timeout=3)
+            jpeg = _capture_frame(fb)
+
+            if jpeg is None:
+                _srvspeak(ctx, fb, "Camera error. Check USB camera.")
+                fb.wait(timeout=4)
+                return False
+
+            _srvspeak(ctx, fb, "Scanning complete. Processing text.")
+            resp = ctx.link.send("ocr", {"type": "scan", "frame": jpeg})
+
+            if resp is None:
+                fb.speak("Server not reachable.")   # local only — server is down
+                fb.wait(timeout=4)
+                return False
+
+            text_body = resp.get("text", "").strip()
+            if not text_body:
+                _srvspeak(
+                    ctx, fb,
+                    "No text found. "
+                    "Hold page 30 to 40 centimetres from camera "
+                    "with good lighting, then scan again."
+                )
+                fb.wait(timeout=8)
+                return False
+
+            detected_page  = _coerce_page_num(resp.get("page"))
+            word_count     = len(text_body.split())
+            server_chunks  = resp.get("chunks")          # server-split text chunks
+            chunk_wavs_b64 = resp.get("chunk_wavs")      # parallel list of base64 WAVs
+
+            # ── announce result (server WAV preferred) ────────────────────
+            ann_b64 = resp.get("announcement_wav")
+            if ann_b64:
+                _play_wav_b64(fb, ann_b64)
+            elif detected_page is not None:
+                fb.speak(f"Page {detected_page}. {word_count} words.")
+            else:
+                fb.speak(f"No page number. {word_count} words.")
+
+            if detected_page is None:
+                fb.wait(timeout=5)
+                if mc_ok:
+                    vtxt = _ask_direct("Say the page number, or say skip.",
+                                       timeout=5, label="page number")
+                    if vtxt and not _is_skip(vtxt):
+                        num = _parse_number(vtxt)
+                        if num is not None:
+                            detected_page = num
+                            _srvspeak(ctx, fb, f"Page {detected_page}.")
+                            fb.wait(timeout=3)
+
+            if detected_page is not None:
+                key = ("num", detected_page)
+                if key in pages:
+                    _srvspeak(ctx, fb, f"Page {detected_page} rescanned. Replacing.")
+                    fb.wait(timeout=3)
+            else:
+                key = ("idx", page_idx)
+                page_idx += 1
+
+            pages[key] = {
+                "page":       detected_page,
+                "text":       text_body,
+                "word_count": word_count,
+                "chunks":     server_chunks,     # may be None for loaded sessions
+                "chunk_wavs": chunk_wavs_b64,    # may be None
+            }
+            return True
+
+        def _scan_loop() -> int:
+            """Batch-scan pages until the user says done/save. After every
+            page the user is asked "scan or done", so a whole book can be
+            captured in one sitting without reading starting in between.
+            Returns the number of pages added."""
+            added = 0
+            while not ctx.abort.is_set():
+                if _capture_one_page():
+                    added += 1
+                    ans = _ask_direct(
+                        "Page saved. Say scan for the next page, "
+                        "or done to finish.", label="scan next or done")
+                else:
+                    ans = _ask_direct(
+                        "Say scan to try again, or done to stop.",
+                        label="retry scan or done")
+                c = _classify(ans) if ans else None
+                if c in ("SCAN", "NEXT", "YES"):
+                    continue
+                break   # done / save / close / silence → finish scanning
+            return added
+
+        def _ask_session_name() -> None:
+            """Ask the user to name the current book (first save only)."""
+            nonlocal session_name
+            if session_name is None and mc_ok:
+                vtxt = _ask_direct("Say a name for this book.", timeout=5,
+                                   correct=False, label="session name")
+                if vtxt and not _is_skip(vtxt):
+                    session_name = vtxt.strip()
+            if not session_name:
+                session_name = f"reading_{self._session_counter}"
+
+        def _read_current(start_key: "tuple | None" = None) -> bool:
+            """Read the in-memory book from its first page (or start_key),
+            in page-number order. Returns True if the outer loop should
+            break (user closed during reading)."""
+            order = _reading_order(pages)
+            if not order:
+                _srvspeak(ctx, fb, "No pages to read.")
+                fb.wait(timeout=3)
+                _voice_on()
+                return False
+            if gq: _drain(gq)
+            result = _read_pages(start_key or order[0])
+            return _after_read(result)
 
         def _after_read(result: str) -> bool:
             """Handle the transition after _read_pages() returns.
@@ -1033,6 +1281,21 @@ class OCRReader(Feature):
                     # before it gets replaced below.
                     _autosave()
 
+                    # The command itself may already name the book — "load
+                    # page", "read harry potter" — so try that before asking
+                    # a follow-up question at all.
+                    raw_text, sdata = "", None
+                    hint = _strip_filler(_last_raw[0])
+                    cmd_words = set(re.findall(r"[a-z]+", _last_raw[0].lower()))
+
+                    # Bare "read" with a book already in memory (just scanned
+                    # or just finished) → read it, no selection dialog.
+                    if not hint and pages and "read" in cmd_words:
+                        if _read_current():
+                            break
+                        idle_t = time.time() + IDLE_REMIND_S
+                        continue
+
                     saved_names = _saved_session_names()
                     if not saved_names:
                         _srvspeak(ctx, fb,
@@ -1041,11 +1304,6 @@ class OCRReader(Feature):
                         _voice_on()
                         continue
 
-                    # The command itself may already name the book — "load
-                    # page", "read harry potter" — so try that before asking
-                    # a follow-up question at all.
-                    raw_text, sdata = "", None
-                    hint = _strip_filler(_last_raw[0])
                     if hint:
                         sdata = _find_session(hint)
                         if sdata:
@@ -1081,20 +1339,27 @@ class OCRReader(Feature):
                             session_name = loaded_name
                             pages        = dict(loaded_pages)
                             page_idx     = loaded_idx
-                            _srvspeak(
-                                ctx, fb,
+
+                            # Offer to add pages BEFORE reading starts, so new
+                            # pages (with their numbers) slot into order and
+                            # the whole book then reads on its own.
+                            ans = _ask_direct(
                                 f"Loaded {loaded_name}. "
-                                f"{len(loaded_pages)} pages. Reading now."
-                            )
-                            fb.wait(timeout=5)
-                            order     = _reading_order(pages)
-                            start_key = order[0] if order else None
-                            if start_key:
-                                if gq: _drain(gq)
-                                result = _read_pages(start_key)
-                                if _after_read(result):
-                                    break
-                                idle_t = time.time() + IDLE_REMIND_S
+                                f"{len(loaded_pages)} pages. "
+                                "Say scan to add new pages first, "
+                                "or read to begin.",
+                                timeout=8, label="scan first or read")
+                            c = _classify(ans) if ans else None
+                            if c in ("SCAN", "NEXT"):
+                                if _scan_loop():
+                                    _autosave()
+                            elif c == "CLOSE":
+                                break
+                            _srvspeak(ctx, fb, "Reading now.")
+                            fb.wait(timeout=3)
+                            if _read_current():
+                                break
+                            idle_t = time.time() + IDLE_REMIND_S
                             continue
                         else:
                             _srvspeak(ctx, fb, f"Session {loaded_name} has no pages.")
@@ -1189,132 +1454,39 @@ class OCRReader(Feature):
                 if cmd not in ("SCAN", "NEXT"):
                     continue
 
-                # ── CAPTURE ────────────────────────────────────────────────────
+                # ── SCAN FLOW: batch-scan pages, then name and save ───────────
+                # Reading does NOT start here: the user scans as many pages as
+                # they want ("scan" after each page), then says done — the book
+                # is named (first save only) and saved. Reading happens when
+                # they ask for it ("read"), always in page-number order.
                 _voice_off()
                 idle_t = time.time() + IDLE_REMIND_S
 
-                # Speak the hold instruction and let it actually finish before
-                # capturing — previously "Capturing now" was said in the same
-                # breath and _capture_frame() started immediately afterward,
-                # since _srvspeak() is non-blocking, so the photo was taken
-                # while the instruction was still being read (or before the
-                # user had any time to act on it).
-                fb.beep()   # non-verbal "getting ready to scan" heads-up
-                _srvspeak(ctx, fb, "Hold the page flat and steady.")
-                fb.wait(timeout=6)
-                fb.speak("Capturing now.")
-                fb.wait(timeout=3)
-                jpeg = _capture_frame(fb)
-
-                if jpeg is None:
-                    _srvspeak(ctx, fb, "Camera error. Check USB camera.")
-                    fb.wait(timeout=4)
+                n_added = _scan_loop()
+                if n_added == 0:
                     _voice_on()
                     continue
 
-                _srvspeak(ctx, fb, "Scanning complete. Processing text.")
-                resp = ctx.link.send("ocr", {"type": "scan", "frame": jpeg})
-
-                if resp is None:
-                    fb.speak("Server not reachable.")   # local only — server is down
-                    fb.wait(timeout=4)
+                _ask_session_name()
+                _autosave()
+                n_pg, total_w = _session_stats()
+                ans = _ask_direct(
+                    f"Saved as {session_name}. "
+                    f"{n_pg} page{'s' if n_pg != 1 else ''}, {total_w} words. "
+                    "Say read to listen now, scan to add more pages, "
+                    "or close to exit.", timeout=8, label="after save")
+                c = _classify(ans) if ans else None
+                if c == "LOAD":                 # "read" is in the LOAD word set
+                    if _read_current():
+                        break
+                elif c in ("SCAN", "NEXT"):
                     _voice_on()
+                    voice_q.put("SCAN")
                     continue
-
-                text_body = resp.get("text", "").strip()
-                if not text_body:
-                    _srvspeak(
-                        ctx, fb,
-                        "No text found. "
-                        "Hold page 30 to 40 centimetres from camera "
-                        "with good lighting, then scan again."
-                    )
-                    fb.wait(timeout=8)
-                    _voice_on()
-                    continue
-
-                detected_page  = _coerce_page_num(resp.get("page"))
-                word_count     = len(text_body.split())
-                server_chunks  = resp.get("chunks")          # server-split text chunks
-                chunk_wavs_b64 = resp.get("chunk_wavs")      # parallel list of base64 WAVs
-
-                # ── ANNOUNCE RESULT (server WAV preferred) ────────────────────
-                ann_b64 = resp.get("announcement_wav")
-                if ann_b64:
-                    _play_wav_b64(fb, ann_b64)
-                elif detected_page is not None:
-                    fb.speak(f"Page {detected_page}. {word_count} words.")
-                else:
-                    fb.speak(f"No page number. {word_count} words.")
-
-                if detected_page is None:
-                    fb.wait(timeout=5)
-                    # Ask user to provide the page number
-                    if mc_ok:
-                        _srvspeak(ctx, fb, "Say the page number, or say skip.")
-                        fb.wait(timeout=5)
-                        try:
-                            vtxt, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
-                                               hotwords=OCR_HOTWORDS)
-                            print(f"[OCR] voice(direct): {vtxt!r} — answering 'page number'")
-                            if vtxt:
-                                if not _is_skip(vtxt):
-                                    num = _parse_number(vtxt)
-                                    if num is not None:
-                                        detected_page = num
-                                        _srvspeak(ctx, fb, f"Page {detected_page}.")
-                                        fb.wait(timeout=3)
-                        except Exception:
-                            pass
-
-                # ── STORE PAGE ────────────────────────────────────────────────
-                if detected_page is not None:
-                    key = ("num", detected_page)
-                    if key in pages:
-                        _srvspeak(ctx, fb, f"Page {detected_page} rescanned. Replacing.")
-                else:
-                    key = ("idx", page_idx)
-                    page_idx += 1
-
-                pages[key] = {
-                    "page":       detected_page,
-                    "text":       text_body,
-                    "word_count": word_count,
-                    "chunks":     server_chunks,     # may be None for loaded sessions
-                    "chunk_wavs": chunk_wavs_b64,    # may be None
-                }
-
-                # ── NAME SESSION (first scan) ──────────────────────────────────
-                if session_name is None:
-                    fb.wait(timeout=4)
-                    if mc_ok:
-                        _srvspeak(ctx, fb, "Say a name for this reading session.")
-                        fb.wait(timeout=5)
-                        try:
-                            vtxt, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
-                                               hotwords=OCR_HOTWORDS,
-                                               correct=False)
-                            print(f"[OCR] voice(direct): {vtxt!r} — answering 'session name'")
-                            if vtxt:
-                                if not _is_skip(vtxt):
-                                    session_name = vtxt.strip()
-                        except Exception:
-                            pass
-                    if not session_name:
-                        session_name = f"reading_{self._session_counter}"
-                    _srvspeak(ctx, fb, f"Session: {session_name}. Reading now.")
-                    fb.wait(timeout=5)
-                else:
-                    pg_label = f"Page {detected_page}" if detected_page is not None else "Page"
-                    fb.wait(timeout=4)
-                    _srvspeak(ctx, fb, f"{pg_label} added to {session_name}. Reading now.")
-                    fb.wait(timeout=4)
-
-                # ── READ ──────────────────────────────────────────────────────
-                if gq: _drain(gq)
-                result = _read_pages(key)
-                if _after_read(result):
+                elif c == "CLOSE":
                     break
+                else:
+                    _voice_on()
                 idle_t = time.time() + IDLE_REMIND_S
 
         finally:
