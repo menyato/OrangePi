@@ -82,12 +82,14 @@ IDLE_REMIND_S  = 60
 # decoder AWAY from words that never appear in it, like "load"/"add"/book
 # names/page numbers. This is the actual reason "load" was unreliable here.
 OCR_INITIAL_PROMPT = (
-    "Book reader voice commands. Words used: scan, load, add, close, next, "
-    "skip, cancel, yes, no, page, book, session, name. "
+    "Book reader voice commands. Words used: scan, load, read, add, new, "
+    "close, done, save, next, skip, cancel, yes, no, page, book, session, "
+    "name, samples, garden, ocean, mountain. "
     "Numbers: one, two, three, four, five, six, seven, eight, nine, ten, "
     "twenty, fifty, one hundred."
 )
-OCR_HOTWORDS = "scan load add close next skip cancel yes no page book session"
+OCR_HOTWORDS = ("scan load read add new close done save next skip cancel "
+                "yes no page book session samples garden ocean mountain")
 
 # ── server TTS helper ─────────────────────────────────────────────────────────
 
@@ -222,10 +224,11 @@ def _capture_frame(fb) -> "bytes | None":
 
 # ── voice helpers ─────────────────────────────────────────────────────────────
 
-_SCAN_W  = {"scan", "capture", "take", "photo", "scam", "skan", "skun", "scanned"}
-_LOAD_W  = {"load", "recall", "open", "read"}
-_ADD_W   = {"add", "append", "insert"}
-_NEW_W   = {"new", "fresh"}
+_SCAN_W    = {"scan", "capture", "take", "photo", "scam", "skan", "skun", "scanned"}
+_LOAD_W    = {"load", "recall", "open", "read"}
+_ADD_W     = {"add", "append", "insert"}
+_NEW_W     = {"new", "fresh"}
+_SAMPLES_W = {"samples", "sample", "practice"}
 _NEXT_W  = {"next", "skip", "forward"}
 _CLOSE_W = {"close", "stop", "quit", "finish", "exit", "done", "save", "saved"}
 _YES_W   = {"yes", "yeah", "resume", "continue", "ok", "yep", "sure"}
@@ -263,14 +266,15 @@ def _parse_number(text: str) -> "int | None":
 # before LOAD/ADD so "load a new book" / "add a new book" mean "start a
 # fresh book", not "open a saved one".
 _CMD_VOCAB = [
-    ("NEW",   _NEW_W),
-    ("LOAD",  _LOAD_W),
-    ("ADD",   _ADD_W),
-    ("SCAN",  _SCAN_W),
-    ("NEXT",  _NEXT_W),
-    ("YES",   _YES_W),
-    ("NO",    _NO_W),
-    ("CLOSE", _CLOSE_W),
+    ("SAMPLES", _SAMPLES_W),
+    ("NEW",     _NEW_W),
+    ("LOAD",    _LOAD_W),
+    ("ADD",     _ADD_W),
+    ("SCAN",    _SCAN_W),
+    ("NEXT",    _NEXT_W),
+    ("YES",     _YES_W),
+    ("NO",      _NO_W),
+    ("CLOSE",   _CLOSE_W),
 ]
 
 
@@ -633,10 +637,12 @@ _SAMPLE_BOOKS = [
 ]
 
 
-def _seed_sample_books() -> None:
-    """Install the built-in sample books if no books are saved yet."""
-    if _session_files_by_mtime():
-        return
+def _install_sample_books() -> list:
+    """Write the built-in sample books to disk (overwrites same-named
+    files). Returns the list of installed names. Also available on demand
+    via the "samples" voice command — the automatic first-run seeding
+    never fires for users who already have saved sessions."""
+    installed = []
     for name, texts in _SAMPLE_BOOKS:
         pages_list = [{"page": i + 1, "text": t,
                        "word_count": len(t.split()),
@@ -644,13 +650,22 @@ def _seed_sample_books() -> None:
                       for i, t in enumerate(texts)]
         try:
             _save_session(name, pages_list)
+            installed.append(name)
             # keep mtimes strictly ordered so pruning removes samples
             # in a predictable oldest-first order
             time.sleep(0.05)
         except Exception as e:
-            print(f"[OCR] sample book seed error: {e}")
-    print("[OCR] No saved books found — installed sample books: "
-          + ", ".join(n for n, _ in _SAMPLE_BOOKS))
+            print(f"[OCR] sample book install error: {e}")
+    print("[OCR] Installed sample books: " + ", ".join(installed))
+    return installed
+
+
+def _seed_sample_books() -> None:
+    """Install the built-in sample books if no books are saved yet."""
+    if _session_files_by_mtime():
+        return
+    print("[OCR] No saved books found — installing samples.")
+    _install_sample_books()
 
 
 # ── startup session summary ───────────────────────────────────────────────────
@@ -1077,12 +1092,15 @@ class OCRReader(Feature):
             ctx, fb,
             "Book reader. "
             + _startup_summary()
-            + "Say scan to capture a new page. "
-            "Say load to read a saved book — I'll tell you their names first. "
+            + "Say scan to capture a book, page by page. "
+            "Say read or load to listen to a saved book — "
+            "I'll tell you their names first. "
+            "Say new book to start a fresh one. "
             "Say add to add pages to a saved book. "
+            "Say samples for practice books. "
             "Or say close to exit."
         )
-        fb.wait(timeout=20)
+        fb.wait(timeout=25)
         _srvspeak(
             ctx, fb,
             "During reading: close thumb, ring, and pinky, and tilt your hand "
@@ -1271,6 +1289,28 @@ class OCRReader(Feature):
                         fb.wait(timeout=10)
                         _voice_on()
                         idle_t = time.time() + IDLE_REMIND_S
+                    continue
+
+                # ── SAMPLES (install the practice books on demand) ──────────
+                if cmd == "SAMPLES":
+                    _voice_off()
+                    installed = _install_sample_books()
+                    if installed:
+                        if len(installed) > 1:
+                            names_spoken = (", ".join(installed[:-1])
+                                            + f", and {installed[-1]}")
+                        else:
+                            names_spoken = installed[0]
+                        _srvspeak(ctx, fb,
+                            f"Practice books installed: {names_spoken}. "
+                            f"Say load {installed[0]} to try one. "
+                            "Note: only the three newest books are kept, "
+                            "so older saved books may be removed.")
+                    else:
+                        _srvspeak(ctx, fb, "Could not install practice books.")
+                    fb.wait(timeout=10)
+                    _voice_on()
+                    idle_t = time.time() + IDLE_REMIND_S
                     continue
 
                 # ── LOAD saved session ─────────────────────────────────────
