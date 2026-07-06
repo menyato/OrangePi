@@ -23,7 +23,7 @@ import threading
 import time
 from enum import Enum, auto
 
-from features.base import FeatureContext
+from features.base import FeatureContext, MIC_OWNING_FEATURE_NAMES
 
 START_LOCKOUT_S = 2.0
 
@@ -55,6 +55,13 @@ class HubStateMachine:
         self.feedback        = feedback
         self.link            = link
         self.record_window_s = record_window_s
+
+        # Set by hub.py right after construction (same imperative-wiring
+        # pattern as engine.on_event/controller.on_frame). Paused around
+        # mic-owning features in _launch_feature() so the global
+        # VoiceListener's sr.Microphone() stream never fights a feature's own
+        # sounddevice.InputStream for the same physical mic.
+        self.voice = None
 
         self.state     = State.INACTIVE
         self._queue:   queue.Queue            = queue.Queue()
@@ -369,6 +376,13 @@ class HubStateMachine:
         self.state  = State.RUNNING
         self._feature_gesture_q = queue.Queue()
         crashed = False
+        # Mic-owning features (money/ocr/env/home/lidar family) open their own
+        # microphone stream — pause the global voice listener for the duration
+        # so the two never fight over the same physical mic (see
+        # features.base.MIC_OWNING_FEATURE_NAMES for why).
+        pause_voice = self.voice is not None and feat.name in MIC_OWNING_FEATURE_NAMES
+        if pause_voice:
+            self.voice.stop()
         try:
             feat.run(FeatureContext(link=self.link,
                                     abort=self._abort,
@@ -380,6 +394,8 @@ class HubStateMachine:
             self.feedback.error()
             self.feedback.speak(f"{feat.title} error. Closed.")
         finally:
+            if pause_voice:
+                self.voice.start()
             deactivated              = (self.state != State.RUNNING)
             self._abort              = None
             self._active_feature     = None

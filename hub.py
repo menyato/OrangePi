@@ -76,7 +76,7 @@ from features.home_automation   import HomeAutomation, RelaySwitch
 from features.programmable      import ProgrammableGestures
 from features.lidar_nav         import (LidarNavigation, LidarObstacleTest,
                                         LidarMappingTest, LidarNavigateTest)
-from features.base              import FeatureContext
+from features.base              import FeatureContext, MIC_OWNING_FEATURE_NAMES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GESTURES_PATH = os.path.join(HERE, "gestures.json")
@@ -372,9 +372,11 @@ def main() -> None:
             _forward(cmd)
 
         voice = VoiceListener(on_command=_voice_abort)
-        # All lidar modes manage their own speech listener — skip hub's to avoid mic conflict
-        _lidar_modes = {"lidar", "obstacles", "mapping", "navigate"}
-        if not args.no_voice and bypass_name not in _lidar_modes:
+        # Mic-owning features (money/ocr/env/home/lidar family) manage their
+        # own speech listener — skip hub's global one entirely in bypass mode
+        # to avoid two simultaneous mic consumers (see
+        # features.base.MIC_OWNING_FEATURE_NAMES).
+        if not args.no_voice and bypass_name not in MIC_OWNING_FEATURE_NAMES:
             voice.start()
 
         feedback.speak(
@@ -425,6 +427,13 @@ def main() -> None:
     voice = VoiceListener(on_command=sm.on_voice)
     if not args.no_voice:
         voice.start()
+        # Only wire sm.voice when voice is actually enabled — _launch_feature()
+        # unconditionally restarts it after a mic-owning feature closes, which
+        # would defeat --no-voice if wired unconditionally here. See
+        # features.base.MIC_OWNING_FEATURE_NAMES for why this pause/resume
+        # exists at all: it and a feature's own voice loop must never fight
+        # over the same physical microphone.
+        sm.voice = voice
 
     _probe_devices(feedback, link)
 

@@ -85,7 +85,17 @@ class VoiceListener:
         self._thread.start()
 
     def stop(self) -> None:
+        """Signal the listener thread to stop and wait for it to actually
+        release the microphone before returning. Callers that are about to
+        open their own mic stream (see features.base.MIC_OWNING_FEATURE_NAMES)
+        rely on this: _run()'s r.listen(timeout=5, phrase_time_limit=7) only
+        notices self._stop on its next loop check, up to ~7s away mid-phrase,
+        so returning immediately (as this used to) left a real window where
+        both this thread's sr.Microphone() and the caller's own mic stream
+        could be open at once."""
         self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=8.0)
 
     # ── background thread ─────────────────────────────────────────────────────
 
