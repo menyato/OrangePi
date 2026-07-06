@@ -88,6 +88,19 @@ MAX_HISTORY_TURNS = 16      # keep last N conversation turns in session context
 IDLE_REMIND_S     = 60
 _KEY_ENV          = "GEMINI_API_KEY"
 
+# Domain vocabulary for every listen in this feature. Without it,
+# transcribe() falls back to money recognition's currency vocabulary, which
+# biases Whisper AWAY from the words this feature actually uses — and
+# free-form questions to Gemini got "corrected" toward currency command
+# words by correct_transcript(). Chat input must arrive verbatim.
+ENV_INITIAL_PROMPT = (
+    "Environmental awareness assistant for a blind user. Commands: "
+    "describe, scan, look, capture, load, close, stop, exit, skip. "
+    "The user also asks natural questions about their surroundings: "
+    "objects, people, colors, distances, obstacles, doors, stairs, signs."
+)
+ENV_HOTWORDS = "describe scan look capture load close stop exit skip"
+
 # ── Hardcoded API key (optional) ──────────────────────────────────────────────
 # If you don't want to rely on GEMINI_API_KEY / ~/.env / ~/keys.env — e.g.
 # because hub.py runs as a systemd service and doesn't inherit your shell's
@@ -424,8 +437,17 @@ def _classify_env(text: str) -> "str | None":
     """
     Return a control command string ("SCAN", "LOAD", "CLOSE") if the text
     matches a command word set; return None to treat it as a Gemini question.
+
+    Only SHORT utterances count as commands. Free-form questions routinely
+    contain command words — "what do you SEE", "is there a STOP sign",
+    "can I TAKE the stairs" — and used to trigger a re-scan or close the
+    feature instead of being answered. Anything longer than 3 words is
+    conversation for Gemini.
     """
-    words = set(re.findall(r"[a-z]+", text.lower()))
+    words_list = re.findall(r"[a-z]+", text.lower())
+    if len(words_list) > 3:
+        return None
+    words = set(words_list)
     if words & _CLOSE_W:
         return "CLOSE"
     if words & _LOAD_W:
@@ -528,19 +550,45 @@ class EnvAwareness(Feature):
 
         # ── voice thread helpers ──────────────────────────────────────────────
 
+        _voice_thread = [None]
+
         def _voice_on() -> None:
             nonlocal stop_ev
             stop_ev = threading.Event()
+            ev = stop_ev
             _drain()
             def _start():
                 time.sleep(1.0)
-                if not stop_ev.is_set() and not ctx.abort.is_set():
+                if not ev.is_set() and not ctx.abort.is_set():
                     if _MC_OK:
-                        mc.voice_listen_loop(voice_q, stop_ev, ctx.abort)
-            threading.Thread(target=_start, daemon=True).start()
+                        # drain again right before listening starts so text a
+                        # dying previous worker queued late can't fire a
+                        # stale command
+                        _drain()
+                        # correct=False: most input here is free-form chat for
+                        # Gemini — vocabulary snapping corrupts questions
+                        mc.voice_listen_loop(voice_q, ev, ctx.abort,
+                                             initial_prompt=ENV_INITIAL_PROMPT,
+                                             hotwords=ENV_HOTWORDS,
+                                             correct=False)
+            t = threading.Thread(target=_start, daemon=True, name="ENVVoice")
+            _voice_thread[0] = t
+            t.start()
 
         def _voice_off() -> None:
+            # Join, don't just signal: the recorder and the camera share the
+            # same USB webcam. Recording video while an in-flight listen still
+            # owns the device produced "Device unavailable" storms (and
+            # barge-in silenced announcements mid-sentence). stop_ev now ends
+            # an idle listen in well under a second; a mid-utterance one runs
+            # at most record + transcribe time.
             stop_ev.set()
+            t = _voice_thread[0]
+            if t is not None and t.is_alive():
+                t.join(timeout=getattr(mc, "MAX_RECORD_SEC", 15) + 30.0)
+                if t.is_alive():
+                    print("[ENV] WARNING: voice worker still busy after join "
+                          "timeout — mic may be contended.")
 
         def _drain() -> None:
             while True:
@@ -634,6 +682,7 @@ class EnvAwareness(Feature):
                     continue
 
                 cmd = _classify_env(raw)
+                print(f"[ENV] voice: {raw!r} → {cmd or '(question for Gemini)'}")
                 idle_t = time.time() + IDLE_REMIND_S
 
                 # ── CLOSE ─────────────────────────────────────────────────────
@@ -657,9 +706,12 @@ class EnvAwareness(Feature):
                     name_text = ""
                     if mc_ok:
                         try:
-                            name_text, _ = mc.listen()
+                            name_text, _ = mc.listen(
+                                initial_prompt=ENV_INITIAL_PROMPT,
+                                hotwords=ENV_HOTWORDS, correct=False)
                         except Exception:
                             name_text = ""
+                    print(f"[ENV] voice(direct): {name_text!r} — answering 'session name'")
                     if name_text:
                         sdata = _find_session(name_text)
                         if sdata:
@@ -729,7 +781,11 @@ class EnvAwareness(Feature):
                             fb.speak("Say a name for this session, or say skip.")
                             fb.wait(timeout=4)
                             try:
-                                vtxt, _ = mc.listen()
+                                vtxt, _ = mc.listen(
+                                    initial_prompt=ENV_INITIAL_PROMPT,
+                                    hotwords=ENV_HOTWORDS, correct=False)
+                                print(f"[ENV] voice(direct): {vtxt!r} — "
+                                      "answering 'name this session'")
                                 if vtxt:
                                     words = set(re.findall(r"[a-z]+", vtxt.lower()))
                                     if not (words & _SKIP_W):

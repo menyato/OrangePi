@@ -904,7 +904,7 @@ def listen(retries: int = 5, initial_prompt: str | None = None,
 
 
 def voice_listen_loop(voice_q, stop_ev, abort_ev, initial_prompt: str | None = None,
-                      hotwords: str | None = None) -> None:
+                      hotwords: str | None = None, correct: bool = True) -> None:
     """Shared blocking voice worker for features (OCR, Environmental Awareness, …).
 
     Loops calling listen() and puts the corrected transcript into voice_q.
@@ -924,7 +924,7 @@ def voice_listen_loop(voice_q, stop_ev, abort_ev, initial_prompt: str | None = N
     while not stop_ev.is_set() and not abort_ev.is_set():
         try:
             text, _ = listen(initial_prompt=initial_prompt, hotwords=hotwords,
-                             stop_ev=stop_ev, quiet=True)
+                             stop_ev=stop_ev, quiet=True, correct=correct)
         except Exception as e:
             print(f"[VOICE] listen error: {e}")
             import time as _t; _t.sleep(0.5)
