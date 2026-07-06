@@ -103,6 +103,10 @@ def _srvspeak(ctx, fb, text: str) -> None:
       - server returns no audio
       - server returns an error response (resp["ok"] is not True)
     """
+    # Server TTS plays with no trace in the console — log every announcement
+    # so transcripts show what the user was actually told (vital when
+    # debugging "I never heard X" reports from a blind user).
+    print(f"[OCR][TTS] {text}")
     try:
         resp = ctx.link.send("tts", {"text": text})
         if resp and resp.get("ok") and resp.get("audio"):
@@ -671,31 +675,18 @@ def _seed_sample_books() -> None:
 # ── startup session summary ───────────────────────────────────────────────────
 
 def _startup_summary() -> str:
-    """Return a brief saved-book *count* for the opening announcement — just
-    enough for the user to know books exist, without reading every single
-    one's name/pages/word-count up front (that used to make the very first
-    thing a blind user heard, before any instructions, a multi-minute wall of
-    speech once more than a couple of books were saved — with a long enough
-    announcement it could even outrun fb.wait()'s timeout, so the mic started
-    listening for a command while the announcement was still playing). Full
-    names are still spoken on demand: LOAD and ADD both call
-    _saved_session_names() and read them out before asking which one."""
-    if not os.path.isdir(SESSIONS_DIR):
-        return ""
-    count = 0
-    for fname in os.listdir(SESSIONS_DIR):
-        if not fname.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(SESSIONS_DIR, fname), encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("pages"):
-                count += 1
-        except Exception:
-            pass
-    if count == 0:
-        return ""
-    return f"You have {count} saved book{'s' if count != 1 else ''}. "
+    """Names of the saved books for the opening announcement, so a blind
+    user knows exactly what's on the shelf without asking. At most
+    MAX_SAVED_SESSIONS books ever exist (pruning), so this stays short —
+    the old count-only summary left users wondering where their books
+    were and which names to say."""
+    names = _saved_session_names()[:MAX_SAVED_SESSIONS]
+    if not names:
+        return "No saved books yet. "
+    if len(names) == 1:
+        return f"You have one saved book: {names[0]}. "
+    spoken = ", ".join(names[:-1]) + f", and {names[-1]}"
+    return f"You have {len(names)} saved books: {spoken}. "
 
 
 # ── feature ───────────────────────────────────────────────────────────────────
@@ -1087,7 +1078,10 @@ class OCRReader(Feature):
         # wall of speech just to learn what commands exist — and a long enough
         # announcement could outrun fb.wait()'s timeout, so the mic started
         # listening for a command while the announcement was still playing.
-        _voice_on()   # start early so 1-second init overlaps with TTS
+        # The mic must stay OFF until the whole intro has been spoken:
+        # record_with_vad() barge-in (stop_speaking on detected speech) means
+        # any cough or room noise while listening KILLS the announcement
+        # mid-sentence — observed live as "the first voice never plays".
         _srvspeak(
             ctx, fb,
             "Book reader. "
@@ -1106,11 +1100,12 @@ class OCRReader(Feature):
             "During reading: close thumb, ring, and pinky, and tilt your hand "
             "back, to pause or resume. Flick thumb right to skip forward. "
             "Flick thumb left to rewind. Flick pinky right to jump to the "
-            "next page."
+            "next page. I am listening now."
         )
-        fb.wait(timeout=16)
+        fb.wait(timeout=18)
         if gq:
             _drain(gq)        # discard any gesture that triggered the feature open
+        _voice_on()
 
         # ── nested reading loop ───────────────────────────────────────────────
         def _read_pages(start_key: tuple) -> str:
