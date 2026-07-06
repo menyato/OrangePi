@@ -35,6 +35,16 @@ except Exception:
 CAMERA_INDICES    = [0, 1, 2]
 QR_SCAN_TIMEOUT_S = 15.0
 
+# transcribe()'s default initial_prompt/hotwords are money recognition's
+# currency vocabulary, which actively biases Whisper's decoder away from
+# unrelated words like "pair"/"status" -- see features/ocr_reader.py's
+# OCR_INITIAL_PROMPT for the same fix applied there first.
+HOME_INITIAL_PROMPT = (
+    "Home automation voice commands. Words used: pair, setup, status, "
+    "check, close, done, stop."
+)
+HOME_HOTWORDS = "pair setup status check close done stop"
+
 # Must match server_app/esp_relay_firmware/relay_controller/relay_controller.ino
 ESP_SETUP_SSID     = "RelayCtrl-Setup"
 ESP_SETUP_PASSWORD = "relaysetup"
@@ -176,9 +186,11 @@ class HomeAutomation(Feature):
 
         fb.speak("Home automation. Say pair to set up a new relay board, "
                  "status to check relays, or close to exit.")
+        fb.wait(timeout=8)   # let the opening finish before listening
 
         while not abort.is_set():
-            text, _audit = mc.listen()
+            text, _audit = mc.listen(initial_prompt=HOME_INITIAL_PROMPT,
+                                     hotwords=HOME_HOTWORDS)
             if abort.is_set():
                 break
             if not text:
@@ -192,17 +204,21 @@ class HomeAutomation(Feature):
             elif cmd == "STATUS":
                 resp = ctx.link.send("home", {"action": "status"})
                 fb.speak(resp["tts"] if resp else "Server not reachable.")
+                fb.wait(timeout=6)
             else:
                 fb.speak("Say pair, status, or close.")
+                fb.wait(timeout=4)
 
     def _pair(self, ctx: FeatureContext) -> None:
         fb = ctx.feedback
         t0 = time.time()
 
         fb.speak("Show me the setup QR code now.")
+        fb.wait(timeout=4)   # let the instruction finish before opening the camera
         payload = _scan_qr()
         if payload is None:
             fb.speak("No QR code found. Try again with better lighting.")
+            fb.wait(timeout=5)
             metrics.report_action(ctx.link, self.name, "pair",
                                   (time.time() - t0) * 1000, ok=False, reason="no_qr")
             return
@@ -228,6 +244,7 @@ class HomeAutomation(Feature):
             fb.speak("Could not send the WiFi details to the relay board. Your WiFi has been restored.")
         else:
             fb.speak("Relay board paired. It will join your WiFi and register with the server shortly.")
+        fb.wait(timeout=6)
 
         # Only reachable again once WiFi is restored above, so this goes
         # through normally on the (now reconnected) server link.

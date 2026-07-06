@@ -201,17 +201,15 @@ def _find_session(raw: str) -> "dict | None":
 
 
 def _startup_summary() -> str:
+    """Brief saved-session *count* only — see ocr_reader.py's
+    _startup_summary for why: reading every session's name and exchange
+    count before any instruction turns into a long wall of speech once
+    several are saved. Full names are spoken on demand by LOAD instead."""
     sessions = _list_sessions()
     if not sessions:
         return ""
-    rows = []
-    for s in sessions:
-        name    = s.get("name", "unknown")
-        n_turns = len(s.get("history", [])) // 2
-        rows.append(f"{name}: {n_turns} exchange{'s' if n_turns != 1 else ''}")
-    c = len(rows)
-    return (f"You have {c} saved session{'s' if c != 1 else ''}. "
-            + ". ".join(rows) + ". ")
+    c = len(sessions)
+    return f"You have {c} saved session{'s' if c != 1 else ''}. "
 
 
 # ── image helpers ─────────────────────────────────────────────────────────────
@@ -591,8 +589,11 @@ class EnvAwareness(Feature):
                 history.pop(0)
 
         # ── opening announcement ──────────────────────────────────────────────
-
-        _voice_on()
+        # _voice_on() must come AFTER the announcement finishes (or times
+        # out) -- it used to fire first, and its own internal 1s head start
+        # is far shorter than this announcement takes to speak, so voice
+        # recognition started trying to open the mic while the announcement
+        # was still playing.
         fb.speak(
             "Environmental awareness. "
             + _startup_summary()
@@ -602,6 +603,7 @@ class EnvAwareness(Feature):
             "You can also ask any question about what I see."
         )
         fb.wait(timeout=15)
+        _voice_on()
 
         # ── main loop ─────────────────────────────────────────────────────────
 
@@ -641,8 +643,17 @@ class EnvAwareness(Feature):
                 # ── LOAD ──────────────────────────────────────────────────────
                 if cmd == "LOAD":
                     _voice_off()
-                    fb.speak("Say the session name.")
-                    fb.wait(timeout=4)
+                    saved = _list_sessions()
+                    if not saved:
+                        fb.speak("No saved sessions yet. Say describe to start one.")
+                        fb.wait(timeout=4)
+                        _voice_on()
+                        continue
+                    names = [s.get("name", "unknown") for s in saved]
+                    names_str = ", ".join(names[:5])
+                    extra = f" and {len(names) - 5} more" if len(names) > 5 else ""
+                    fb.speak(f"Saved sessions: {names_str}{extra}. Say the session name.")
+                    fb.wait(timeout=6)
                     name_text = ""
                     if mc_ok:
                         try:
