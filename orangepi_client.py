@@ -360,6 +360,8 @@ COMMAND_VOCAB = {
     "analyze", "detect", "read", "process", "identify",
     # quit
     "quit", "exit", "stop", "done", "end", "finish", "bye", "goodbye",
+    # OCR / book reader (load, add, close a saved session; skip a step)
+    "load", "add", "book", "page", "close", "skip",
     # currency
     "dollar", "dollars", "usd", "buck", "bucks",
     "lebanese", "lbp", "pound", "pounds", "lira", "lirah",
@@ -384,6 +386,9 @@ KNOWN_CONFUSIONS = {
     "yas": "yes", "yus": "yes", "redu": "redo", "ridu": "redo",
     "riddo": "redo", "diskard": "discard", "kancel": "cancel",
     "conform": "confirm", "no.": "no",
+    "lord": "load", "loud": "load", "lode": "load", "lowd": "load",
+    "ad": "add", "att": "add",
+    "clothes": "close", "clos": "close",
 }
 
 FUZZY_CUTOFF = 0.74   # difflib ratio threshold for snapping unknown tokens
@@ -609,8 +614,6 @@ def record_with_vad() -> np.ndarray | None:
     triggered     = False
     voiced_frames: list[np.ndarray] = []
     pre_roll:     list[np.ndarray]  = []
-    max_frames    = int(MAX_RECORD_SEC * 1000 / FRAME_DURATION)
-    frame_count   = 0
     xrun_count    = 0
     MAX_XRUNS     = 10
 
@@ -625,8 +628,16 @@ def record_with_vad() -> np.ndarray | None:
         print(f"[MIC] Could not open input stream: {e}")
         return None
 
+    # Wall-clock deadline, not a frame counter: below the noise gate, the old
+    # code `continue`'d before ever reaching its frame_count += 1, so
+    # MAX_RECORD_SEC was only actually enforced once enough frames had
+    # cleared the noise gate -- in a quiet room this let one listen attempt
+    # run far longer than 15s (33s+ observed live), tying up the mic (and
+    # blocking anything waiting on it, e.g. _voice_off()'s join) well past
+    # what any caller expected.
+    deadline = time.time() + MAX_RECORD_SEC
     with stream_ctx as stream:
-        while frame_count < max_frames:
+        while time.time() < deadline:
             try:
                 chunk, overflowed = stream.read(FRAME_SIZE)
                 if overflowed:
@@ -670,7 +681,6 @@ def record_with_vad() -> np.ndarray | None:
                 if unvoiced_ratio > UNVOICED_THRESHOLD:
                     print("[MIC] Speech ended.")
                     break
-            frame_count += 1
 
     if not voiced_frames:
         return None
@@ -708,8 +718,22 @@ def _denoise(audio: np.ndarray) -> np.ndarray:
         return audio
 
 
-def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
-    """Returns (raw_text, stats). stats carries Whisper confidence numbers."""
+_DEFAULT_HOTWORDS = ("scan rescan redo discard yes no confirm change "
+                     "ready Lebanese pounds lira dollars done quit")
+
+
+def transcribe(audio: np.ndarray | None, initial_prompt: str | None = None,
+               hotwords: str | None = None) -> tuple[str, dict]:
+    """Returns (raw_text, stats). stats carries Whisper confidence numbers.
+
+    initial_prompt/hotwords default to the money/currency-scanner vocabulary
+    (WHISPER_INITIAL_PROMPT / _DEFAULT_HOTWORDS) so existing callers (money
+    recognition) are unaffected. Other features that share this same
+    transcribe() — OCR, Environmental Awareness, Home Automation — need
+    their OWN vocabulary passed in explicitly: the currency-only prompt
+    actively biases Whisper's decoder AWAY FROM words like "load"/"add"/book
+    names that never appear in it, which is the actual reason those commands
+    were unreliable in features other than money recognition."""
     stats = {"avg_logprob": None, "no_speech_prob": None, "n_segments": 0}
     if audio is None:
         return "", stats
@@ -724,14 +748,13 @@ def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
         best_of=WHISPER_BEAM,
         temperature=0.0,
         condition_on_previous_text=False,
-        initial_prompt=WHISPER_INITIAL_PROMPT,   # ← domain biasing
+        initial_prompt=initial_prompt or WHISPER_INITIAL_PROMPT,   # ← domain biasing
         vad_filter=False,    # we already VAD-gate on the Pi — skip Silero (faster)
         no_speech_threshold=0.5,
         compression_ratio_threshold=2.0,
     )
     if _supports_hotwords:
-        kwargs["hotwords"] = ("scan rescan redo discard yes no confirm change "
-                              "ready Lebanese pounds lira dollars done quit")
+        kwargs["hotwords"] = hotwords or _DEFAULT_HOTWORDS
 
     segments, _ = whisper_model.transcribe(audio, **kwargs)
 
@@ -744,11 +767,16 @@ def transcribe(audio: np.ndarray | None) -> tuple[str, dict]:
     return text, stats
 
 
-def listen(retries: int = 5) -> tuple[str, dict]:
+def listen(retries: int = 5, initial_prompt: str | None = None,
+           hotwords: str | None = None) -> tuple[str, dict]:
     """
     Returns (corrected_text, audit). Skips the expensive Whisper call entirely
     when no speech was captured, beeps to mark each stage, and tells the user
     out loud when it heard nothing or couldn't understand.
+
+    initial_prompt/hotwords are passed straight through to transcribe() — see
+    its docstring. Pass your feature's own vocabulary here if it's not money
+    recognition's currency-scanning commands.
     """
     told = False   # avoid repeating the spoken "didn't catch that" every retry
     for attempt in range(1, retries + 1):
@@ -767,7 +795,7 @@ def listen(retries: int = 5) -> tuple[str, dict]:
 
         play_cue(_CUE_THINK)               # "transcribing now" beep
         t1 = time.time()
-        raw_text, stats = transcribe(audio)
+        raw_text, stats = transcribe(audio, initial_prompt=initial_prompt, hotwords=hotwords)
         t_transcribe = time.time() - t1
 
         corrected, corrections = correct_transcript(raw_text)
@@ -813,7 +841,8 @@ def listen(retries: int = 5) -> tuple[str, dict]:
                 "corrected_text": "", "corrections": [], "attempt": retries}
 
 
-def voice_listen_loop(voice_q, stop_ev, abort_ev) -> None:
+def voice_listen_loop(voice_q, stop_ev, abort_ev, initial_prompt: str | None = None,
+                      hotwords: str | None = None) -> None:
     """Shared blocking voice worker for features (OCR, Environmental Awareness, …).
 
     Loops calling listen() and puts the corrected transcript into voice_q.
@@ -821,10 +850,15 @@ def voice_listen_loop(voice_q, stop_ev, abort_ev) -> None:
     Features start this in a daemon thread; stop_ev.set() ends it after the
     current listen() call completes (listen() itself is not interruptible, but
     each call is at most a few seconds).
+
+    Pass initial_prompt/hotwords with your feature's own command vocabulary —
+    these default (inside transcribe()) to money recognition's currency
+    vocabulary, which actively works against recognizing unrelated commands
+    like "load"/"add" in other features.
     """
     while not stop_ev.is_set() and not abort_ev.is_set():
         try:
-            text, _ = listen()
+            text, _ = listen(initial_prompt=initial_prompt, hotwords=hotwords)
         except Exception as e:
             print(f"[VOICE] listen error: {e}")
             import time as _t; _t.sleep(0.5)

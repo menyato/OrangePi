@@ -64,6 +64,19 @@ SESSIONS_DIR   = os.path.expanduser("~/ocr_sessions")
 CAMERA_INDICES = [0, 1, 2]
 IDLE_REMIND_S  = 60
 
+# Domain vocabulary passed to every mc.listen()/voice_listen_loop() call in
+# this file — transcribe()'s default initial_prompt/hotwords are tuned for
+# money recognition's currency-scanning commands and actively bias Whisper's
+# decoder AWAY from words that never appear in it, like "load"/"add"/book
+# names/page numbers. This is the actual reason "load" was unreliable here.
+OCR_INITIAL_PROMPT = (
+    "Book reader voice commands. Words used: scan, load, add, close, next, "
+    "skip, cancel, yes, no, page, book, session, name. "
+    "Numbers: one, two, three, four, five, six, seven, eight, nine, ten, "
+    "twenty, fifty, one hundred."
+)
+OCR_HOTWORDS = "scan load add close next skip cancel yes no page book session"
+
 # ── server TTS helper ─────────────────────────────────────────────────────────
 
 def _srvspeak(ctx, fb, text: str) -> None:
@@ -249,7 +262,8 @@ def _voice_worker(abort: threading.Event,
                   stop_ev: threading.Event) -> None:
     """Voice worker — delegates to the shared mc.voice_listen_loop()."""
     if _MC_OK:
-        mc.voice_listen_loop(voice_q, stop_ev, abort)
+        mc.voice_listen_loop(voice_q, stop_ev, abort,
+                             initial_prompt=OCR_INITIAL_PROMPT, hotwords=OCR_HOTWORDS)
     else:
         while not stop_ev.is_set() and not abort.is_set():
             time.sleep(1.0)
@@ -476,9 +490,10 @@ class OCRReader(Feature):
         page_idx      = 0
 
         # ── voice thread ──────────────────────────────────────────────────────
-        voice_q   = queue.Queue()
-        _cur_stop = [threading.Event()]
+        voice_q     = queue.Queue()
+        _cur_stop   = [threading.Event()]
         _cur_stop[0].set()
+        _cur_thread = [None]   # the OCRVoice Thread currently owning the mic, if any
 
         def _voice_on() -> None:
             if not mc_ok:
@@ -491,10 +506,25 @@ class OCRReader(Feature):
                 time.sleep(1.0)
                 if not stop.is_set():
                     _voice_worker(ctx.abort, voice_q, stop)
-            threading.Thread(target=_delayed, daemon=True, name="OCRVoice").start()
+            t = threading.Thread(target=_delayed, daemon=True, name="OCRVoice")
+            _cur_thread[0] = t
+            t.start()
 
         def _voice_off() -> None:
+            # Setting the stop Event only tells the loop not to start another
+            # listen() call — the one already in flight (record_with_vad(),
+            # now correctly capped at MAX_RECORD_SEC wall-clock time) keeps
+            # running to completion. Joining here means capture/TTS that
+            # follows never overlaps a still-open microphone stream — without
+            # this, capture and mc.listen() raced for the same USB webcam's
+            # combined mic+camera interface, producing "audio open error:
+            # Device or resource busy" / "Device unavailable" and silently
+            # dropped instructions (aplay failing to open mid-race, with
+            # nothing surfacing that failure back to the caller).
             _cur_stop[0].set()
+            t = _cur_thread[0]
+            if t is not None and t.is_alive():
+                t.join(timeout=getattr(mc, "MAX_RECORD_SEC", 15) + 3.0)
             _drain(voice_q)
 
         def _get_cmd(ges_timeout: float = 0.1) -> "str | None":
@@ -769,7 +799,8 @@ class OCRReader(Feature):
                     fb.wait(timeout=6)
                     if mc_ok:
                         try:
-                            raw_text, _ = mc.listen()
+                            raw_text, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
+                                                    hotwords=OCR_HOTWORDS)
                         except Exception:
                             raw_text = ""
 
@@ -824,7 +855,8 @@ class OCRReader(Feature):
                     raw_text = ""
                     if mc_ok:
                         try:
-                            raw_text, _ = mc.listen()
+                            raw_text, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
+                                                    hotwords=OCR_HOTWORDS)
                         except Exception:
                             raw_text = ""
 
@@ -863,6 +895,7 @@ class OCRReader(Feature):
                 # since _srvspeak() is non-blocking, so the photo was taken
                 # while the instruction was still being read (or before the
                 # user had any time to act on it).
+                fb.beep()   # non-verbal "getting ready to scan" heads-up
                 _srvspeak(ctx, fb, "Hold the page flat and steady.")
                 fb.wait(timeout=6)
                 fb.speak("Capturing now.")
@@ -917,7 +950,8 @@ class OCRReader(Feature):
                         _srvspeak(ctx, fb, "Say the page number, or say skip.")
                         fb.wait(timeout=5)
                         try:
-                            vtxt, _ = mc.listen()
+                            vtxt, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
+                                               hotwords=OCR_HOTWORDS)
                             if vtxt:
                                 skip = set(re.findall(r"[a-z]+", vtxt.lower())) & _SKIP_W
                                 if not skip:
@@ -953,7 +987,8 @@ class OCRReader(Feature):
                         _srvspeak(ctx, fb, "Say a name for this reading session.")
                         fb.wait(timeout=5)
                         try:
-                            vtxt, _ = mc.listen()
+                            vtxt, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
+                                               hotwords=OCR_HOTWORDS)
                             if vtxt:
                                 skip = set(re.findall(r"[a-z]+", vtxt.lower())) & _SKIP_W
                                 if not skip:
