@@ -35,6 +35,7 @@ Voice controls (mc.listen / Whisper — ON during idle, paused, and after page)
 
 import base64
 import contextlib
+import difflib
 import json
 import os
 import queue
@@ -62,6 +63,11 @@ CHUNK_TARGET   = 10
 SKIP_CHUNKS    = 3
 SESSIONS_DIR   = os.path.expanduser("~/ocr_sessions")
 CAMERA_INDICES = [0, 1, 2]
+# Reading out every saved book's name before asking "which one" gets long and
+# hard to track by ear once there are more than a couple -- name a couple by
+# example and let the user just say the one they want (fuzzy/partial matching
+# in _find_session() still resolves names that aren't in this short list).
+NAMES_ANNOUNCE_LIMIT = 2
 IDLE_REMIND_S  = 60
 
 # Domain vocabulary passed to every mc.listen()/voice_listen_loop() call in
@@ -245,16 +251,49 @@ def _parse_number(text: str) -> "int | None":
     return None
 
 
+# Priority order for both exact and fuzzy matching -- first hit wins, same
+# order a human would disambiguate a multi-intent utterance in.
+_CMD_VOCAB = [
+    ("LOAD",  _LOAD_W),
+    ("ADD",   _ADD_W),
+    ("SCAN",  _SCAN_W),
+    ("NEXT",  _NEXT_W),
+    ("YES",   _YES_W),
+    ("NO",    _NO_W),
+    ("CLOSE", _CLOSE_W),
+]
+
+
 def _classify(text: str) -> "str | None":
     words = set(re.findall(r"[a-z]+", text.lower()))
-    if words & _LOAD_W:   return "LOAD"
-    if words & _ADD_W:    return "ADD"
-    if words & _SCAN_W:   return "SCAN"
-    if words & _NEXT_W:   return "NEXT"
-    if words & _YES_W:    return "YES"
-    if words & _NO_W:     return "NO"
-    if words & _CLOSE_W:  return "CLOSE"
+    for cmd, vocab in _CMD_VOCAB:
+        if words & vocab:
+            return cmd
+
+    # ── fuzzy fallback ───────────────────────────────────────────────────
+    # A blind user gets no visual confirmation of what Whisper actually
+    # heard, so a mispronounced or slightly-misheard command word (e.g.
+    # "lod"/"lowd" for "load", "closs" for "close", "sken" for "scan")
+    # would otherwise be reported as "(unrecognised)" with no way for the
+    # user to know why -- they'd just have to guess and try again. Accept
+    # a close spelling match per word instead of requiring an exact one.
+    # Skipped for words under 3 letters -- short strings ("no", "ok") match
+    # almost anything at a workable cutoff, so those rely on exact matches.
+    for cmd, vocab in _CMD_VOCAB:
+        for w in words:
+            if len(w) >= 3 and difflib.get_close_matches(w, vocab, n=1, cutoff=0.75):
+                return cmd
     return None
+
+
+def _is_skip(text: str) -> bool:
+    """Same exact-then-fuzzy leniency as _classify(), for the separate
+    'say skip' vocabulary used by the page-number/session-name prompts."""
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    if words & _SKIP_W:
+        return True
+    return any(len(w) >= 3 and difflib.get_close_matches(w, _SKIP_W, n=1, cutoff=0.75)
+               for w in words)
 
 
 def _voice_worker(abort: threading.Event,
@@ -395,11 +434,29 @@ def _saved_session_names() -> list:
     return names
 
 
+# Words that carry no naming information when they show up in a spoken
+# answer to "say the book name" -- e.g. the user says "load a book" or
+# "the harry potter book" instead of just the title.
+_NAME_FILLER_W = _LOAD_W | _ADD_W | {"a", "the", "book", "please", "session"}
+
+
+def _strip_filler(query: str) -> str:
+    words = [w for w in re.findall(r"[a-z']+", query.lower()) if w not in _NAME_FILLER_W]
+    return " ".join(words)
+
+
 def _find_session(query: str) -> "dict | None":
-    """Find a saved session by name (exact then partial match)."""
+    """Find a saved session by name.
+
+    Tries, in order: exact match, substring match (either direction), then
+    the same two again with filler words ("load"/"a"/"book"/...) stripped
+    out, then a fuzzy spelling match. The filler-stripping and fuzzy pass
+    give a blind user real room for error -- they get no visual feedback on
+    what was transcribed, so "load a book" or a slightly misheard title
+    ("herry potter") should still resolve instead of failing outright.
+    """
     if not os.path.isdir(SESSIONS_DIR):
         return None
-    q = query.lower().strip()
     candidates = []
     for fname in os.listdir(SESSIONS_DIR):
         if not fname.endswith(".json"):
@@ -410,15 +467,27 @@ def _find_session(query: str) -> "dict | None":
             candidates.append(data)
         except Exception:
             pass
-    # Exact match first
-    for d in candidates:
-        if d.get("name", "").lower() == q:
-            return d
-    # Partial match
-    for d in candidates:
-        name = d.get("name", "").lower()
-        if q in name or name in q:
-            return d
+    if not candidates:
+        return None
+
+    q       = query.lower().strip()
+    cleaned = _strip_filler(query)
+
+    for probe in (q, cleaned):
+        if not probe:
+            continue
+        for d in candidates:
+            if d.get("name", "").lower() == probe:
+                return d
+        for d in candidates:
+            name = d.get("name", "").lower()
+            if probe in name or name in probe:
+                return d
+
+    names_lower = [d.get("name", "").lower() for d in candidates]
+    close = difflib.get_close_matches(cleaned or q, names_lower, n=1, cutoff=0.6)
+    if close:
+        return candidates[names_lower.index(close[0])]
     return None
 
 
@@ -510,7 +579,7 @@ class OCRReader(Feature):
             _cur_thread[0] = t
             t.start()
 
-        def _voice_off() -> None:
+        def _voice_off() -> "str | None":
             # Setting the stop Event only tells the loop not to start another
             # listen() call — the one already in flight (record_with_vad(),
             # now correctly capped at MAX_RECORD_SEC wall-clock time) keeps
@@ -521,11 +590,26 @@ class OCRReader(Feature):
             # Device or resource busy" / "Device unavailable" and silently
             # dropped instructions (aplay failing to open mid-race, with
             # nothing surfacing that failure back to the caller).
+            #
+            # If the user was already mid-utterance when this was called
+            # (e.g. said "load the page" and, without waiting for a reply,
+            # immediately kept talking), the in-flight listen() above can
+            # still finish and land in voice_q during the join. That text
+            # used to be silently discarded by the drain below — the user
+            # would hear no acknowledgement at all that anything was heard.
+            # Return it instead so callers that are about to ask a direct
+            # follow-up question can use it as the answer.
             _cur_stop[0].set()
             t = _cur_thread[0]
             if t is not None and t.is_alive():
                 t.join(timeout=getattr(mc, "MAX_RECORD_SEC", 15) + 3.0)
+            leftover = None
+            try:
+                leftover = voice_q.get_nowait()
+            except queue.Empty:
+                pass
             _drain(voice_q)
+            return leftover
 
         def _get_cmd(ges_timeout: float = 0.1) -> "str | None":
             try:
@@ -558,12 +642,56 @@ class OCRReader(Feature):
                 except Exception as e:
                     print(f"[OCR] Auto-save error: {e}")
 
+        def _ask_book_name(leftover: "str | None", first_prompt: str,
+                           retry_prompt: str) -> "tuple[str, dict | None]":
+            """Get a book name from the user and resolve it to a saved session.
+
+            Tries `leftover` first (speech already captured by _voice_off()
+            while it was joining the background listener — previously this
+            was silently dropped, which is exactly what ate "load a book" the
+            first time this bug was seen live). Otherwise does a direct
+            mc.listen() call. Gives one retry if the name doesn't match a
+            saved session. Every attempt is logged through the same
+            "[OCR] voice(...)" convention _get_cmd() uses, so these follow-up
+            prompts are no longer a blind spot in the logs.
+
+            Returns (last_raw_text_heard, matched_session_or_None).
+            """
+            raw_text = ""
+            for attempt in range(2):
+                if leftover:
+                    raw_text = leftover
+                    print(f"[OCR] voice(leftover): {raw_text!r} — used as book name")
+                    leftover = None
+                else:
+                    _srvspeak(ctx, fb, first_prompt if attempt == 0 else retry_prompt)
+                    fb.wait(timeout=6)
+                    raw_text = ""
+                    if mc_ok:
+                        try:
+                            raw_text, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
+                                                    hotwords=OCR_HOTWORDS)
+                        except Exception:
+                            raw_text = ""
+                    print(f"[OCR] voice(direct): {raw_text!r} — answering 'book name'")
+
+                if not raw_text:
+                    continue
+                sdata = _find_session(raw_text)
+                if sdata:
+                    return raw_text, sdata
+
+            return raw_text, None
+
         def _after_read(result: str) -> bool:
             """Handle the transition after _read_pages() returns.
 
             Auto-saves progress, announces session status with next-step options,
             re-enables voice, and for a 'scan' return injects the SCAN command so
             capture starts immediately without requiring a second voice command.
+            'load'/'add' returns (the user interrupted a pause to switch books)
+            are injected the same way, so they land back in the outer loop's
+            LOAD/ADD handling instead of being silently dropped.
 
             Returns True if the outer loop should break (session close).
             """
@@ -585,6 +713,12 @@ class OCRReader(Feature):
             if result == "scan":
                 # User said "scan" while paused — go straight to capture
                 voice_q.put("SCAN")
+            elif result == "load":
+                # User said "load" while paused — go straight to book selection
+                voice_q.put("LOAD")
+            elif result == "add":
+                # User said "add" while paused — go straight to add-to-book
+                voice_q.put("ADD")
             return False
 
         # ── opening ───────────────────────────────────────────────────────────
@@ -624,6 +758,8 @@ class OCRReader(Feature):
 
             Returns:
               "scan"  — user asked to scan a new page (from pause)
+              "load"  — user asked to open a different saved book (from pause)
+              "add"   — user asked to add pages to a different book (from pause)
               "close" — user asked to close
               "done"  — finished reading all pages
             """
@@ -654,6 +790,8 @@ class OCRReader(Feature):
                                 ctx, fb,
                                 "Paused. "
                                 "Say scan to add a page. "
+                                "Say load to open a different book. "
+                                "Say add to add pages to a different book. "
                                 "Say yes to resume. "
                                 "Say next for the next page. "
                                 "Say close to finish. "
@@ -677,6 +815,14 @@ class OCRReader(Feature):
                         elif cmd == "SCAN":
                             paused = False; pause_announced = False
                             return "scan"
+
+                        elif cmd == "LOAD":
+                            paused = False; pause_announced = False
+                            return "load"
+
+                        elif cmd == "ADD":
+                            paused = False; pause_announced = False
+                            return "add"
 
                         elif cmd == "NEXT":
                             i = len(chunks); paused = False; pause_announced = False
@@ -781,8 +927,11 @@ class OCRReader(Feature):
 
                 # ── LOAD saved session ─────────────────────────────────────
                 if cmd == "LOAD":
-                    _voice_off()
-                    raw_text = ""
+                    leftover = _voice_off()
+                    # Persist whatever's already in memory (e.g. the book we
+                    # were mid-read on, interrupted via a pause to switch)
+                    # before it gets replaced below.
+                    _autosave()
 
                     saved_names = _saved_session_names()
                     if not saved_names:
@@ -792,52 +941,55 @@ class OCRReader(Feature):
                         _voice_on()
                         continue
 
-                    names_str = ", ".join(saved_names[:5])
-                    extra = f" and {len(saved_names) - 5} more" if len(saved_names) > 5 else ""
-                    _srvspeak(ctx, fb,
-                        f"Saved books: {names_str}{extra}. Say the book name to read.")
-                    fb.wait(timeout=6)
-                    if mc_ok:
-                        try:
-                            raw_text, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
-                                                    hotwords=OCR_HOTWORDS)
-                        except Exception:
-                            raw_text = ""
+                    names_str = ", ".join(saved_names[:NAMES_ANNOUNCE_LIMIT])
+                    extra = (f" and {len(saved_names) - NAMES_ANNOUNCE_LIMIT} more"
+                             if len(saved_names) > NAMES_ANNOUNCE_LIMIT else "")
+                    raw_text, sdata = _ask_book_name(
+                        leftover,
+                        f"Saved books: {names_str}{extra}. Say the book name to read.",
+                        "I couldn't find that book. Say the name again.",
+                    )
 
-                    if raw_text:
-                        sdata = _find_session(raw_text)
-                        if sdata:
-                            loaded_name  = sdata["name"]
-                            loaded_pages, loaded_idx = _pages_from_session(sdata)
-                            if loaded_pages:
-                                session_name = session_name or loaded_name
-                                pages.update(loaded_pages)
-                                page_idx = max(page_idx, loaded_idx)
-                                _srvspeak(
-                                    ctx, fb,
-                                    f"Loaded {loaded_name}. "
-                                    f"{len(loaded_pages)} pages. Reading now."
-                                )
-                                fb.wait(timeout=5)
-                                order     = _reading_order(pages)
-                                start_key = order[0] if order else None
-                                if start_key:
-                                    if gq: _drain(gq)
-                                    result = _read_pages(start_key)
-                                    if _after_read(result):
-                                        break
-                                    idle_t = time.time() + IDLE_REMIND_S
-                                continue
-                            else:
-                                _srvspeak(ctx, fb, f"Session {loaded_name} has no pages.")
+                    if sdata:
+                        loaded_name  = sdata["name"]
+                        loaded_pages, loaded_idx = _pages_from_session(sdata)
+                        if loaded_pages:
+                            # Replace, don't merge: this book's pages must not
+                            # mix with whatever a previous book (just
+                            # autosaved above) left in memory, or reading and
+                            # saving afterward would corrupt both sessions.
+                            session_name = loaded_name
+                            pages        = dict(loaded_pages)
+                            page_idx     = loaded_idx
+                            _srvspeak(
+                                ctx, fb,
+                                f"Loaded {loaded_name}. "
+                                f"{len(loaded_pages)} pages. Reading now."
+                            )
+                            fb.wait(timeout=5)
+                            order     = _reading_order(pages)
+                            start_key = order[0] if order else None
+                            if start_key:
+                                if gq: _drain(gq)
+                                result = _read_pages(start_key)
+                                if _after_read(result):
+                                    break
+                                idle_t = time.time() + IDLE_REMIND_S
+                            continue
                         else:
-                            _srvspeak(ctx, fb, f"No session found matching {raw_text}.")
+                            _srvspeak(ctx, fb, f"Session {loaded_name} has no pages.")
+                    elif raw_text:
+                        _srvspeak(ctx, fb, f"No session found matching {raw_text}.")
                     _voice_on()
                     continue
 
                 # ── ADD (load a session for editing, not for reading) ─────────
                 if cmd == "ADD":
-                    _voice_off()
+                    leftover = _voice_off()
+                    # Persist whatever's already in memory (e.g. the book we
+                    # were mid-read on, interrupted via a pause to switch)
+                    # before it gets replaced below.
+                    _autosave()
                     saved_names = _saved_session_names()
                     if not saved_names:
                         _srvspeak(ctx, fb,
@@ -846,36 +998,31 @@ class OCRReader(Feature):
                         _voice_on()
                         continue
 
-                    names_str = ", ".join(saved_names[:5])
-                    extra = f" and {len(saved_names) - 5} more" if len(saved_names) > 5 else ""
-                    _srvspeak(ctx, fb,
-                        f"Saved books: {names_str}{extra}. Say the book name.")
-                    fb.wait(timeout=6)
+                    names_str = ", ".join(saved_names[:NAMES_ANNOUNCE_LIMIT])
+                    extra = (f" and {len(saved_names) - NAMES_ANNOUNCE_LIMIT} more"
+                             if len(saved_names) > NAMES_ANNOUNCE_LIMIT else "")
+                    raw_text, sdata = _ask_book_name(
+                        leftover,
+                        f"Saved books: {names_str}{extra}. Say the book name.",
+                        "I couldn't find that book. Say the name again.",
+                    )
 
-                    raw_text = ""
-                    if mc_ok:
-                        try:
-                            raw_text, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
-                                                    hotwords=OCR_HOTWORDS)
-                        except Exception:
-                            raw_text = ""
-
-                    if raw_text:
-                        sdata = _find_session(raw_text)
-                        if sdata:
-                            loaded_name  = sdata["name"]
-                            loaded_pages, loaded_idx = _pages_from_session(sdata)
-                            session_name = loaded_name
-                            pages.update(loaded_pages)
-                            page_idx     = max(page_idx, loaded_idx)
-                            n_loaded     = len(loaded_pages)
-                            _srvspeak(ctx, fb,
-                                f"Ready to add to {loaded_name}. "
-                                f"{n_loaded} page{'s' if n_loaded != 1 else ''} "
-                                "already saved. Say scan to capture a new page.")
-                        else:
-                            _srvspeak(ctx, fb,
-                                f"No book found matching {raw_text}.")
+                    if sdata:
+                        loaded_name  = sdata["name"]
+                        loaded_pages, loaded_idx = _pages_from_session(sdata)
+                        # Replace, don't merge -- see the matching comment in
+                        # the LOAD handler above.
+                        session_name = loaded_name
+                        pages        = dict(loaded_pages)
+                        page_idx     = loaded_idx
+                        n_loaded     = len(loaded_pages)
+                        _srvspeak(ctx, fb,
+                            f"Ready to add to {loaded_name}. "
+                            f"{n_loaded} page{'s' if n_loaded != 1 else ''} "
+                            "already saved. Say scan to capture a new page.")
+                    elif raw_text:
+                        _srvspeak(ctx, fb,
+                            f"No book found matching {raw_text}.")
                     else:
                         _srvspeak(ctx, fb, "No name heard.")
                     fb.wait(timeout=5)
@@ -952,9 +1099,9 @@ class OCRReader(Feature):
                         try:
                             vtxt, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
                                                hotwords=OCR_HOTWORDS)
+                            print(f"[OCR] voice(direct): {vtxt!r} — answering 'page number'")
                             if vtxt:
-                                skip = set(re.findall(r"[a-z]+", vtxt.lower())) & _SKIP_W
-                                if not skip:
+                                if not _is_skip(vtxt):
                                     num = _parse_number(vtxt)
                                     if num is not None:
                                         detected_page = num
@@ -989,9 +1136,9 @@ class OCRReader(Feature):
                         try:
                             vtxt, _ = mc.listen(initial_prompt=OCR_INITIAL_PROMPT,
                                                hotwords=OCR_HOTWORDS)
+                            print(f"[OCR] voice(direct): {vtxt!r} — answering 'session name'")
                             if vtxt:
-                                skip = set(re.findall(r"[a-z]+", vtxt.lower())) & _SKIP_W
-                                if not skip:
+                                if not _is_skip(vtxt):
                                     session_name = vtxt.strip()
                         except Exception:
                             pass

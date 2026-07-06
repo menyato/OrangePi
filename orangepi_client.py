@@ -871,7 +871,20 @@ def voice_listen_loop(voice_q, stop_ev, abort_ev, initial_prompt: str | None = N
             print(f"[VOICE] listen error: {e}")
             import time as _t; _t.sleep(0.5)
             continue
-        if text and not stop_ev.is_set():
+        if text:
+            # listen() has already finished recording (and released the mic)
+            # by the time we get here, so a stop_ev set while we were
+            # mid-utterance no longer protects any device from contention --
+            # only the queue put is left to do. Previously this branch was
+            # `if text and not stop_ev.is_set()`, which silently discarded a
+            # fully-transcribed command with no trace anywhere in the logs
+            # whenever the caller asked us to stop while we were still
+            # listening -- e.g. right after "load the page" is recognized,
+            # the LOAD handler calls _voice_off() to ask a direct follow-up
+            # question, and this loop's already in-flight listen() call ate
+            # the user's next utterance instead of queuing it.
+            if stop_ev.is_set():
+                print(f"[VOICE] stop requested mid-listen, queuing anyway: {text!r}")
             voice_q.put(text.strip())
 
 
