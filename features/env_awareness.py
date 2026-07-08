@@ -594,25 +594,23 @@ def _gemini_local(client, system: str, user_text: str, jpegs: list) -> str:
     raise last_err
 
 
-def _gemini_via_server(link, system: str, user_text: str, jpegs: list,
-                       session: str, save_images: bool) -> str:
+def _gemini_via_server(link, system: str, user_text: str, jpegs: list) -> str:
     """
-    Ask the laptop server to run the Gemini call (stable internet) and archive
-    the frames + reply for review. Returns the reply text.
+    BACKUP Gemini path: ask the laptop server (stable internet) to run the call
+    and return the reply text. Does NOT archive — image saving is a separate,
+    always-on step (_send_scan_to_server).
 
     Raises RuntimeError if the server is unreachable or reports it can't reach
-    Gemini, so the caller can fall back to _gemini_local().
+    Gemini, so the caller can surface a clear error.
     """
     import base64
     frames_b64 = [base64.b64encode(j).decode("ascii") for j in jpegs]
     resp = link.send("env", {
         "action":      "ask",
-        "session":     session,
         "system":      system,
         "user":        user_text,
         "frames_b64":  frames_b64,
         "keyframes":   len(jpegs),
-        "save_images": bool(save_images),
     })
     if resp is None:
         raise RuntimeError("no response from server")
@@ -625,34 +623,29 @@ def _gemini_via_server(link, system: str, user_text: str, jpegs: list,
 
 
 def _describe(link, client, history: list, user_text: str, jpegs: list,
-              session: str, save_images: bool,
-              prefer_server: bool = True) -> "tuple[str, str]":
+              session: str) -> "tuple[str, str]":
     """
-    Get a description/answer, preferring the laptop server (stable internet)
-    and falling back to on-Pi Gemini. Returns (reply, source) where source is
-    "server" (server already archived the frames) or "local" (the caller must
-    archive them). Raises if neither path works.
-
-    prefer_server: only try the server for Gemini when it reported it can reach
-    Gemini at startup — otherwise skip straight to the Pi so we don't do a
-    wasted failing round-trip (and don't double-archive the frames).
+    Get a description/answer. The on-Pi Gemini is the PRIMARY path; the laptop
+    server is only a BACKUP for when the Pi can't reach Gemini. Returns
+    (reply, source) where source is "local" or "server". Raises only if BOTH
+    fail. Image archiving is a SEPARATE concern handled by the caller — this
+    function never saves anything.
     """
     system = _build_system(history)
     errors = []
-    if link is not None and USE_SERVER_GEMINI and prefer_server:
+    # Primary: on-Pi Gemini.
+    if client is not None:
         try:
-            return _gemini_via_server(link, system, user_text, jpegs,
-                                      session, save_images), "server"
+            return _gemini_local(client, system, user_text, jpegs), "local"
+        except Exception as e:
+            errors.append(f"local: {e}")
+            print(f"[ENV] Pi Gemini failed, trying server backup: {e}")
+    # Backup: laptop server (stable internet).
+    if link is not None and USE_SERVER_GEMINI:
+        try:
+            return _gemini_via_server(link, system, user_text, jpegs), "server"
         except Exception as e:
             errors.append(f"server: {e}")
-            print(f"[ENV] Server description failed, trying Pi: {e}")
-    if client is not None:
-        return _gemini_local(client, system, user_text, jpegs), "local"
-    # No local client and the server couldn't help: as a last resort still try
-    # the server directly (it may have come online since startup).
-    if link is not None and USE_SERVER_GEMINI and not prefer_server:
-        return _gemini_via_server(link, system, user_text, jpegs,
-                                  session, save_images), "server"
     raise RuntimeError("; ".join(errors) or "no Gemini path available")
 
 
@@ -800,23 +793,11 @@ class EnvAwareness(Feature):
         last_image_paths: list = []   # disk paths of last_keyframes (for save/load)
         idle_t = time.time() + IDLE_REMIND_S
 
-        # ── Gemini path selection: laptop server first, Pi as fallback ─────────
-        # The Pi's phone-hotspot DNS is unreliable, so by default we ask the
-        # laptop server (stable internet) to run the Gemini call. Check whether
-        # the server can reach Gemini; if so we skip the flaky on-Pi self-test
-        # that used to crash startup on a hotspot DNS blip.
-        server_ready = False
-        if USE_SERVER_GEMINI:
-            try:
-                sresp = ctx.link.send("env", {"action": "selftest"})
-                server_ready = bool(sresp and sresp.get("gemini_ready"))
-                print(f"[ENV] Server Gemini ready: {server_ready}")
-            except Exception as e:
-                print(f"[ENV] Server selftest failed: {e}")
-
-        # Build an on-Pi Gemini client as a FALLBACK. Best-effort and non-fatal:
-        # if google-genai isn't installed or no key is present, rely on the
-        # server (no longer a hard error the way it used to be).
+        # ── Gemini path selection: Pi PRIMARY, laptop server BACKUP ────────────
+        # The Pi runs the Gemini call itself (primary). The laptop server is
+        # only a backup for when the Pi can't reach Gemini. Image archiving to
+        # the server is a SEPARATE, always-on step (see the scan branch), so it
+        # happens regardless of which side answered.
         client = None
         if _GENAI_OK:
             api_key = _load_api_key()
@@ -831,46 +812,45 @@ class EnvAwareness(Feature):
                     print(f"[ENV] Local Gemini init error (non-fatal): {e}")
                     client = None
             else:
-                print("[ENV] No on-Pi Gemini key — relying on the server.")
+                print("[ENV] No on-Pi Gemini key — will use the server backup.")
         else:
-            print("[ENV] google-genai not installed on the Pi — relying on the server.")
+            print("[ENV] google-genai not installed on the Pi — will use the server backup.")
 
-        if server_ready:
-            print("[ENV] Descriptions will run on the laptop server.")
-        elif client is None:
-            fb.speak(
-                "I can't reach Gemini from the glove or the laptop server. "
-                "Check the laptop's internet and Gemini key. I'll stay open so "
-                "you can try describe once it's ready, or say close to exit."
-            )
-            fb.wait(timeout=8)
+        # Is the server backup available? (Informational; also lets us warn the
+        # user up front if neither path can reach Gemini.)
+        server_ready = False
+        if USE_SERVER_GEMINI:
+            try:
+                sresp = ctx.link.send("env", {"action": "selftest"})
+                server_ready = bool(sresp and sresp.get("gemini_ready"))
+                print(f"[ENV] Server Gemini backup ready: {server_ready}")
+            except Exception as e:
+                print(f"[ENV] Server backup selftest failed: {e}")
 
-        # Only self-test the on-Pi path when the server can't do it — the Pi's
-        # hotspot DNS is the unreliable side, so there's no point poking it when
-        # the laptop is handling requests. Non-fatal either way.
+        # Self-test the PRIMARY (on-Pi) path when it exists. Non-fatal and
+        # retried — a hotspot DNS blip here no longer aborts the feature.
         global _gemini_tested
-        if not server_ready and client is not None and not _gemini_tested:
-            last_err = None
+        if client is not None and not _gemini_tested:
             for attempt in range(1, 4):
                 try:
                     _probe = client.models.generate_content(
                         model=GEMINI_MODEL, contents="Reply with the single word OK.",
                     )
-                    print(f"[ENV] Local Gemini self-test OK: {(_probe.text or '').strip()!r}")
+                    print(f"[ENV] Pi Gemini self-test OK: {(_probe.text or '').strip()!r}")
                     _gemini_tested = True
-                    last_err = None
                     break
                 except Exception as e:
-                    last_err = e
-                    print(f"[ENV] Local self-test attempt {attempt}/3 failed: {e}")
+                    print(f"[ENV] Pi self-test attempt {attempt}/3 failed: {e}")
                     if attempt < 3 and not ctx.abort.is_set():
                         time.sleep(2.0)
-            if last_err is not None:
-                fb.speak(
-                    "I can't reach Gemini right now. I'll stay open; say "
-                    "describe to try again, or close to exit."
-                )
-                fb.wait(timeout=6)
+
+        if client is None and not server_ready:
+            fb.speak(
+                "I can't reach Gemini from the glove or the laptop server. "
+                "Check the internet and the Gemini key. I'll stay open so you "
+                "can try describe once it's ready, or say close to exit."
+            )
+            fb.wait(timeout=8)
 
         # Notify server that env feature is now active
         try:
@@ -1154,17 +1134,20 @@ class EnvAwareness(Feature):
                                 "possible. Tell me what kind of place this is and "
                                 "everything that is around me.")
                     try:
-                        # server first (stable internet), Pi as fallback; the
-                        # server also archives the frames + reply for review.
+                        # Pi Gemini is primary; server is only a backup.
                         reply, source = _describe(
                             ctx.link, client, history, user_msg, jpegs,
-                            store_name, save_images=True,
-                            prefer_server=server_ready)
+                            store_name)
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
                         fb.speak(f"Could not reach Gemini. {e}")
                         fb.wait(timeout=4)
+                        # Still archive the frames for reference, even with no
+                        # description — image saving is independent of Gemini.
+                        _send_scan_to_server(ctx.link, store_name, user_msg,
+                                             "(no description — Gemini unavailable)",
+                                             jpegs, len(keyframes), True)
                         _voice_on()
                         continue
                     print(f"[ENV] scan description via {source}")
@@ -1190,14 +1173,13 @@ class EnvAwareness(Feature):
                     fb.speak(reply)
                     fb.wait(timeout=max(4, len(reply.split()) // 2))
 
-                    # Archive the frames + reply on the laptop for review. Only
-                    # when the Pi answered locally — a server-produced reply is
-                    # already archived server-side. Done here synchronously
-                    # (fast on the LAN) AFTER speaking, so it reliably lands and
-                    # is logged, instead of vanishing in a daemon thread.
-                    if source == "local":
-                        _send_scan_to_server(ctx.link, store_name, user_msg,
-                                             reply, jpegs, len(keyframes), True)
+                    # ALWAYS archive the frames + reply on the laptop for
+                    # reference — this is a separate concern from which Gemini
+                    # answered (Pi or server backup). Synchronous + logged so it
+                    # reliably lands; done after speaking so it never delays the
+                    # description.
+                    _send_scan_to_server(ctx.link, store_name, user_msg,
+                                         reply, jpegs, len(keyframes), True)
                     _voice_on()
                     continue
 
@@ -1226,8 +1208,7 @@ class EnvAwareness(Feature):
                               "sentence. Do not repeat the earlier description.)")
                     reply, source = _describe(
                         ctx.link, client, history, q_text, q_jpegs,
-                        session_name or auto_name, save_images=False,
-                        prefer_server=server_ready)
+                        session_name or auto_name)
                     print(f"[ENV] answer via {source}")
                 except Exception as e:
                     import traceback
