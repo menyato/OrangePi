@@ -236,6 +236,29 @@ def _list_sessions() -> list:
     return result
 
 
+def _next_auto_name() -> str:
+    """Next free 'session N' label, so a session the user never names gets a
+    short, speakable name ("session 3") instead of a timestamp."""
+    nums = []
+    for s in _list_sessions():
+        m = re.fullmatch(r"session[ _]?(\d+)", s.get("name", "").strip().lower())
+        if m:
+            nums.append(int(m.group(1)))
+    return f"session {max(nums) + 1 if nums else 1}"
+
+
+def _delete_session(name: str) -> None:
+    """Remove a saved session's JSON (used to drop the placeholder 'session N'
+    once the user gives the same session a real name on close)."""
+    safe = re.sub(r"[^\w\-]", "_", (name or "").strip())[:60] or "session"
+    path = os.path.join(SESSIONS_DIR, f"{safe}.json")
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
 def _find_session(raw: str) -> "dict | None":
     needle = raw.lower().strip()
     sessions = _list_sessions()
@@ -674,7 +697,7 @@ class EnvAwareness(Feature):
         # before the user has named it. The user is only asked for a real name
         # when they close/save the session (see the CLOSE branch); until then
         # nothing is announced about naming.
-        auto_name = "env_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        auto_name = _next_auto_name()
         scan_count = 0
         # Most recent scan's key frames (BGR) kept in memory so follow-up
         # questions — and a freshly LOADed session — still have the images to
@@ -1124,6 +1147,10 @@ class EnvAwareness(Feature):
                 try:
                     path = _save_session(final_name, history,
                                          last_images=last_image_paths)
+                    # If the user gave it a real name on close, drop the
+                    # placeholder "session N" record that autosave created.
+                    if session_name and session_name != auto_name:
+                        _delete_session(auto_name)
                     n = len(history) // 2
                     fb.speak(
                         f"Saved as {final_name}. "
