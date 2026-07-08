@@ -625,15 +625,21 @@ def _gemini_via_server(link, system: str, user_text: str, jpegs: list,
 
 
 def _describe(link, client, history: list, user_text: str, jpegs: list,
-              session: str, save_images: bool) -> "tuple[str, str]":
+              session: str, save_images: bool,
+              prefer_server: bool = True) -> "tuple[str, str]":
     """
     Get a description/answer, preferring the laptop server (stable internet)
     and falling back to on-Pi Gemini. Returns (reply, source) where source is
-    "server" or "local". Raises if neither path works.
+    "server" (server already archived the frames) or "local" (the caller must
+    archive them). Raises if neither path works.
+
+    prefer_server: only try the server for Gemini when it reported it can reach
+    Gemini at startup — otherwise skip straight to the Pi so we don't do a
+    wasted failing round-trip (and don't double-archive the frames).
     """
     system = _build_system(history)
     errors = []
-    if link is not None and USE_SERVER_GEMINI:
+    if link is not None and USE_SERVER_GEMINI and prefer_server:
         try:
             return _gemini_via_server(link, system, user_text, jpegs,
                                       session, save_images), "server"
@@ -642,6 +648,11 @@ def _describe(link, client, history: list, user_text: str, jpegs: list,
             print(f"[ENV] Server description failed, trying Pi: {e}")
     if client is not None:
         return _gemini_local(client, system, user_text, jpegs), "local"
+    # No local client and the server couldn't help: as a last resort still try
+    # the server directly (it may have come online since startup).
+    if link is not None and USE_SERVER_GEMINI and not prefer_server:
+        return _gemini_via_server(link, system, user_text, jpegs,
+                                  session, save_images), "server"
     raise RuntimeError("; ".join(errors) or "no Gemini path available")
 
 
@@ -1147,7 +1158,8 @@ class EnvAwareness(Feature):
                         # server also archives the frames + reply for review.
                         reply, source = _describe(
                             ctx.link, client, history, user_msg, jpegs,
-                            store_name, save_images=True)
+                            store_name, save_images=True,
+                            prefer_server=server_ready)
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
@@ -1214,7 +1226,8 @@ class EnvAwareness(Feature):
                               "sentence. Do not repeat the earlier description.)")
                     reply, source = _describe(
                         ctx.link, client, history, q_text, q_jpegs,
-                        session_name or auto_name, save_images=False)
+                        session_name or auto_name, save_images=False,
+                        prefer_server=server_ready)
                     print(f"[ENV] answer via {source}")
                 except Exception as e:
                     import traceback
