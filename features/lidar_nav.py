@@ -16,10 +16,16 @@ Pulse strength ← distance:
 ────────────────────────────────────────────────────────────────────────────────
 Feature classes (all launched via hub.py bypass args):
 
-  LidarNavigation    --lidar            Full flow: map + voice save + navigate
+  LidarNavigation    --lidar            Unified: asks obstacle / mapping /
+                                        navigation at startup, then runs it
   LidarObstacleTest  --obstacles        Obstacle detection only (no SLAM)
   LidarMappingTest   --mapping          Mapping only + live server map
   LidarNavigateTest  --navigate         Navigate to a saved room
+
+Opening menu (--lidar): the feature first speaks the three choices and takes
+the answer by voice ("obstacle" / "mapping" / "navigation") or by gesture
+(NEXT cycles the options aloud, START/EDIT selects). It then routes to the
+obstacle loop (no SLAM) or the SLAM loop started in mapping or navigation.
 
 Voice commands (all modes)
   "save [name]"             save map as [name]
@@ -243,6 +249,16 @@ def _parse_voice(text: str):
             name = re.sub(r"\s+", "_",
                           re.sub(r"^(the|a|an)\s+", "", m.group(1).strip()))
             return ("navigate", name) if name else None
+
+    # Mode-selection words (used by the opening menu; ignored by the running
+    # loops). Checked AFTER "save <room>" / "navigate to <room>" above so those
+    # still win when a room name is included.
+    if words & {"obstacle", "obstacles", "avoidance", "avoid"}:
+        return ("mode", "obstacle")
+    if words & {"mapping", "map", "mapp"}:
+        return ("mode", "mapping")
+    if words & {"navigation", "navigate", "guidance", "guide", "guided"}:
+        return ("mode", "navigation")
 
     return None
 
@@ -522,7 +538,87 @@ def _do_save(slam, ctx: "FeatureContext", room_name: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Feature 1 — Full lidar (mapping + navigation + voice)       --lidar
+# Opening mode menu (shared by the unified --lidar feature)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_MODE_NAMES = {
+    "obstacle":   "obstacle detection",
+    "mapping":    "mapping and saving rooms",
+    "navigation": "navigation with vibration and voice guidance",
+}
+_MODE_ORDER = ["obstacle", "mapping", "navigation"]
+
+
+def _ask_lidar_mode(ctx: FeatureContext) -> "str | None":
+    """
+    Speak the opening menu and return the chosen mode:
+    "obstacle" | "mapping" | "navigation", or None if the user aborted.
+
+    Choice by voice ("obstacle" / "mapping" / "navigation") or by gesture
+    (NEXT flick cycles the options aloud, START/EDIT selects the current one).
+    Runs its own short-lived voice listener, stopped before returning so the
+    chosen mode can open the mic cleanly.
+    """
+    fb      = ctx.feedback
+    gq      = ctx.gesture_queue
+    voice_q: queue.Queue = queue.Queue()
+    voice   = _LidarVoice(voice_q, ctx.link)
+    voice.start()
+    voice._ready.wait(timeout=12.0)
+
+    def _menu() -> None:
+        fb.speak(
+            "Lidar. Choose a mode. "
+            "Say obstacle for obstacle detection only. "
+            "Say mapping to map and save rooms. "
+            "Say navigation to load a map and be guided with vibration and voice. "
+            "Or flick next to hear each option and hold to choose."
+        )
+
+    try:
+        _menu()
+        fb.wait(timeout=14)
+        cursor   = 0
+        deadline = time.time() + 60.0
+        while not ctx.abort.is_set() and time.time() < deadline:
+            # ── voice ──────────────────────────────────────────────────────
+            try:
+                cmd = voice_q.get(timeout=0.1)
+            except queue.Empty:
+                cmd = None
+            if cmd:
+                if cmd[0] == "abort":
+                    return None
+                if cmd[0] == "mode":
+                    fb.speak(f"{_MODE_NAMES[cmd[1]]}. Starting.")
+                    fb.wait(timeout=3)
+                    return cmd[1]
+            # ── gesture ────────────────────────────────────────────────────
+            if gq is not None:
+                try:
+                    g = gq.get_nowait()
+                    if g == "NEXT":
+                        cursor = (cursor + 1) % len(_MODE_ORDER)
+                        fb.speak(_MODE_NAMES[_MODE_ORDER[cursor]])
+                        deadline = time.time() + 60.0
+                    elif g in ("START", "EDIT"):
+                        choice = _MODE_ORDER[cursor]
+                        fb.speak(f"{_MODE_NAMES[choice]}. Starting.")
+                        fb.wait(timeout=3)
+                        return choice
+                except queue.Empty:
+                    pass
+        # Timed out with no choice → obstacle detection (safest, no SLAM).
+        fb.speak("No choice heard. Starting obstacle detection.")
+        fb.wait(timeout=3)
+        return "obstacle"
+    finally:
+        voice.stop()
+        time.sleep(0.4)   # let the mic fully release before the mode reopens it
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 1 — Unified lidar: asks obstacle / mapping / navigation   --lidar
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class LidarNavigation(Feature):
@@ -531,6 +627,20 @@ class LidarNavigation(Feature):
     port: str = DEFAULT_PORT
 
     def run(self, ctx: FeatureContext) -> None:
+        """Ask which mode, then route to it. Obstacle uses the no-SLAM loop;
+        mapping and navigation share the SLAM loop (started in that mode)."""
+        if not _LIDAR_OK:
+            ctx.feedback.speak("Lidar libraries not installed.")
+            return
+        mode = _ask_lidar_mode(ctx)
+        if mode is None or ctx.abort.is_set():
+            return
+        if mode == "obstacle":
+            LidarObstacleTest().run(ctx)
+        else:
+            self._run_slam(ctx, start_mode=mode)
+
+    def _run_slam(self, ctx: FeatureContext, start_mode: str = "mapping") -> None:
         if not _LIDAR_OK:
             ctx.feedback.speak("Lidar libraries not installed.")
             return
@@ -566,11 +676,27 @@ class LidarNavigation(Feature):
 
         saved = slam.list_rooms()
         _session_rooms: list = []   # rooms saved this session — for room connections
-        ctx.feedback.speak(
-            f"Lidar mapping. {len(saved)} rooms saved. "
-            "Say save kitchen to save. Say take me to kitchen to navigate. "
-            + voice_status
-        )
+
+        if start_mode == "navigation":
+            if saved:
+                room_list = ", ".join(r.replace("_", " ") for r in saved)
+                ctx.feedback.speak(
+                    f"Navigation. Saved rooms: {room_list}. "
+                    "Say take me to a room to be guided there with vibration and "
+                    "voice. Say save, then a name, to add a room. " + voice_status
+                )
+            else:
+                ctx.feedback.speak(
+                    "Navigation. No rooms saved yet, so there is nowhere to go. "
+                    "Walk around and say save, then a name, to map a room first. "
+                    + voice_status
+                )
+        else:  # mapping
+            ctx.feedback.speak(
+                f"Mapping. {len(saved)} room{'s' if len(saved) != 1 else ''} saved. "
+                "Walk around and say save, then a room name, to save this room. "
+                "Say take me to a room to navigate. " + voice_status
+            )
 
         try:
             while not ctx.abort.is_set():
