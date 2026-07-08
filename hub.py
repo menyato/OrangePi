@@ -240,6 +240,10 @@ def main() -> None:
     nav_feat.port      = args.lidar_port
     nav_feat.room_name = args.navigate_room
 
+    # Gesture-menu features (what the user scrolls/assigns in the pipeline).
+    # The unified Lidar feature asks obstacle / mapping / navigation at startup,
+    # so its three test-only siblings are NOT listed here — they stay reachable
+    # only via the --obstacles / --mapping / --navigate bypass flags.
     FEATURES = [
         MoneyRecognition(),
         OCRReader(),
@@ -247,11 +251,10 @@ def main() -> None:
         HomeAutomation(),
         *relay_features,
         lidar_feat,
-        obs_feat,
-        map_feat,
-        nav_feat,
         ProgrammableGestures(),  # always last
     ]
+    # Extra features reachable only by bypass flag, never in the gesture menu.
+    BYPASS_ONLY_FEATURES = [obs_feat, map_feat, nav_feat]
 
     # ── Load gesture store + calibration store ────────────────────────────────
     store     = GestureStore(args.gestures)
@@ -351,7 +354,7 @@ def main() -> None:
         None
     )
     if bypass_name:
-        feat_map = {f.name: f for f in FEATURES}
+        feat_map = {f.name: f for f in FEATURES + BYPASS_ONLY_FEATURES}
         feat = feat_map.get(bypass_name)
         if feat is None:
             print(f"[HUB] Feature {bypass_name!r} not in registry.")
