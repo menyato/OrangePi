@@ -123,11 +123,37 @@ _GMAP_ENV = {
 
 # ── command word sets ─────────────────────────────────────────────────────────
 
-_SCAN_W  = {"describe", "scan", "look", "capture", "photo",
-            "take", "see", "record", "view"}
+_SCAN_W  = {"describe", "scan", "rescan", "look", "capture", "photo", "photos",
+            "picture", "pictures", "take", "see", "record", "view", "camera",
+            "surroundings", "around", "environment", "again", "more"}
 _LOAD_W  = {"load", "recall", "open", "restore"}
-_CLOSE_W = {"close", "stop", "quit", "exit", "done", "finish"}
+_CLOSE_W = {"close", "stop", "quit", "exit", "done", "finish", "leave", "bye"}
 _SKIP_W  = {"skip", "none", "no", "cancel", "default"}
+
+# Words that, when they appear as the FIRST word, mark the utterance as a scan
+# request even if it is a long sentence ("describe everything around me",
+# "scan the room again"). Excludes ambiguous words like "see"/"look" that
+# routinely start questions ("look, is there a door?" / "see anything red?").
+_SCAN_LEAD = {"describe", "scan", "rescan", "capture", "record"}
+
+# Multi-word phrases that trigger a (re)scan no matter where they appear or how
+# long the sentence is — this is what lets the user say "let me take more
+# photos" or "can you see this more" mid-conversation and get a fresh capture.
+_SCAN_PHRASE = re.compile(
+    r"\b(re[- ]?scan|scan (again|this|more|the)|"
+    r"take (a |an |another |more |some |the )?(photo|picture|pic|shot|look)s?|"
+    r"more (photo|picture|pic|shot)s?|another (photo|picture|pic|scan|shot)s?|"
+    r"new (scan|photo|picture|pic)s?|look again|see (this |it )?(more|again)|"
+    r"describe again|describe (my|the) surrounding|show me)\b"
+)
+
+# Explicit "I am finished" phrases — these end the session (and prompt for a
+# name) even inside a longer sentence, so "okay, let's save the session" or
+# "leave the session now" work without being sent to Gemini as a question.
+_CLOSE_PHRASE = re.compile(
+    r"\b(save (the |this )?session|leave (the |this )?session|end (the |this )?session|"
+    r"close (the |this )?session|save and (close|exit|quit)|i'?m done|that'?s all)\b"
+)
 
 # ── Gemini system prompt ──────────────────────────────────────────────────────
 
@@ -184,12 +210,13 @@ def _load_api_key() -> str:
 
 # ── session persistence ───────────────────────────────────────────────────────
 
-def _save_session(name: str, history: list) -> str:
+def _save_session(name: str, history: list, last_images: "list | None" = None) -> str:
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     safe = re.sub(r"[^\w\-]", "_", name.strip())[:60] or "session"
     path = os.path.join(SESSIONS_DIR, f"{safe}.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"name": name, "history": history}, f,
+        json.dump({"name": name, "history": history,
+                   "last_images": last_images or []}, f,
                   indent=2, ensure_ascii=False)
     return path
 
@@ -315,6 +342,69 @@ def _frame_to_jpeg(frame) -> bytes:
     return buf.tobytes()
 
 
+# ── key-frame persistence (local + server) ────────────────────────────────────
+
+def _img_dir(name: str) -> str:
+    safe = re.sub(r"[^\w\-]", "_", (name or "").strip())[:60] or "session"
+    return os.path.join(SESSIONS_DIR, safe + "_images")
+
+
+def _save_keyframes_local(name: str, scan_idx: int, jpegs: list) -> list:
+    """Write this scan's JPEG key frames to the session's image folder and
+    return their absolute paths (recorded in the session so a later LOAD can
+    hand them back to Gemini as visual context)."""
+    d = _img_dir(name)
+    os.makedirs(d, exist_ok=True)
+    ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    paths = []
+    for k, jpg in enumerate(jpegs):
+        p = os.path.join(d, f"scan_{scan_idx}_{ts}_f{k}.jpg")
+        try:
+            with open(p, "wb") as f:
+                f.write(jpg)
+            paths.append(p)
+        except OSError as e:
+            print(f"[ENV] Keyframe save error: {e}")
+    return paths
+
+
+def _load_keyframes(paths: list) -> list:
+    """Read saved JPEG key frames back into BGR frames (for a loaded session)."""
+    frames = []
+    if not _CV2_OK:
+        return frames
+    for p in paths or []:
+        try:
+            if os.path.isfile(p):
+                img = cv2.imread(p)
+                if img is not None and img.size > 0:
+                    frames.append(img)
+        except Exception:
+            pass
+    return frames
+
+
+def _send_scan_to_server(link, session: str, user: str, reply: str,
+                         jpegs: list, keyframes: int) -> None:
+    """Archive the scan (key frames + Gemini reply) on the laptop server so it
+    can be reviewed later. Best-effort: never blocks or breaks the feature."""
+    if link is None:
+        return
+    import base64
+    try:
+        frames_b64 = [base64.b64encode(j).decode("ascii") for j in jpegs]
+        link.send("env", {
+            "action":     "scan",
+            "session":    session,
+            "user":       user,
+            "reply":      reply,
+            "keyframes":  keyframes,
+            "frames_b64": frames_b64,
+        })
+    except Exception as e:
+        print(f"[ENV] Server archive failed (non-fatal): {e}")
+
+
 # ── camera capture ────────────────────────────────────────────────────────────
 
 def _record_frames() -> list:
@@ -385,14 +475,24 @@ def _ask_gemini(client, history: list, user_text: str, frames: list) -> str:
 
     contents.append(f"User: {user_text}")
 
+    # thinking_budget=0 is essential: gemini-2.5-flash spends "thinking" tokens
+    # out of the SAME max_output_tokens budget before it writes a single visible
+    # word. With thinking on and a 512 cap, a scan came back cut off mid-sentence
+    # ("...living room, with") — the model had burned the budget thinking. Turn
+    # thinking off and give a generous cap so a full detailed paragraph fits.
+    cfg_kwargs = dict(
+        system_instruction=system,
+        max_output_tokens=1200,
+        temperature=0.4,
+    )
+    try:
+        cfg_kwargs["thinking_config"] = _gtypes.ThinkingConfig(thinking_budget=0)
+    except (AttributeError, TypeError):
+        pass  # older google-genai without ThinkingConfig — cap alone still helps
     resp = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=contents,
-        config=_gtypes.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=512,
-            temperature=0.3,
-        ),
+        config=_gtypes.GenerateContentConfig(**cfg_kwargs),
     )
     return (resp.text or "").strip()
 
@@ -443,25 +543,51 @@ def _ensure_mc(fb, link=None) -> bool:
 
 def _classify_env(text: str) -> "str | None":
     """
-    Return a control command string ("SCAN", "LOAD", "CLOSE") if the text
-    matches a command word set; return None to treat it as a Gemini question.
+    Return a control command string ("SCAN", "LOAD", "CLOSE") or None to treat
+    the text as a free-form question for Gemini.
 
-    Only SHORT utterances count as commands. Free-form questions routinely
-    contain command words — "what do you SEE", "is there a STOP sign",
-    "can I TAKE the stairs" — and used to trigger a re-scan or close the
-    feature instead of being answered. Anything longer than 3 words is
-    conversation for Gemini.
+    The earlier version only accepted commands from utterances of 3 words or
+    fewer, so mis-hears like "describe, mayors, or surroundings" fell through
+    to Gemini and the user's clear intent to scan was lost. Detection now works
+    three ways, most specific first:
+
+      • explicit multi-word phrases  — "save the session", "take more photos",
+        "scan the room again" — match anywhere, at any length;
+      • a leading command word       — "describe …", "scan …" starts a scan
+        even in a long sentence (but not question-openers like "see"/"look");
+      • short command utterances      — a single/short phrase whose words hit a
+        command set, e.g. "load", "stop", "describe".
+
+    Free-form questions ("what colour is the wall", "is anyone near me") match
+    none of these and are sent to Gemini.
     """
-    words_list = re.findall(r"[a-z]+", text.lower())
-    if len(words_list) > 3:
+    low = text.lower().strip()
+    words_list = re.findall(r"[a-z']+", low)
+    if not words_list:
         return None
-    words = set(words_list)
-    if words & _CLOSE_W:
+    words = set(w.strip("'") for w in words_list)
+
+    # 1 — explicit phrases (work at any length / position)
+    if _CLOSE_PHRASE.search(low):
         return "CLOSE"
-    if words & _LOAD_W:
-        return "LOAD"
-    if words & _SCAN_W:
+    if _SCAN_PHRASE.search(low):
         return "SCAN"
+
+    # 2 — leading command word carries a whole sentence
+    first = words_list[0].strip("'")
+    if first in _SCAN_LEAD:
+        return "SCAN"
+    if first in _LOAD_W:
+        return "LOAD"
+
+    # 3 — short utterances: a bare command word or two
+    if len(words_list) <= 3:
+        if words & _CLOSE_W:
+            return "CLOSE"
+        if words & _LOAD_W:
+            return "LOAD"
+        if words & _SCAN_W:
+            return "SCAN"
     return None
 
 
@@ -473,12 +599,22 @@ class EnvAwareness(Feature):
 
     Commands
     ────────
-    "describe / scan / look" → record 5-second clip, extract key frames,
-                               ask Gemini to describe the environment.
-    "load"                   → reload a saved session (restores history).
-    "close / stop / quit"    → save session and exit.
-    Any other speech         → treated as a follow-up question to Gemini;
-                               no new video captured, answers from prior context.
+    "describe / scan / rescan / take a photo …"
+                             → record 5-second clip, extract key frames, ask
+                               Gemini to describe the surroundings in detail.
+                               Works as a full sentence too ("scan the room
+                               again", "let me take more photos").
+    "load"                   → reload a saved session — restores the whole
+                               conversation AND the last scan's images so
+                               Gemini keeps visual context.
+    "save/leave session, close, stop, done"
+                             → prompt for a session name, save, and exit.
+    Any other speech         → follow-up question to Gemini, answered from the
+                               conversation history plus the last scan's frames;
+                               no new video captured.
+
+    Every scan's key frames and Gemini's reply are also archived on the laptop
+    server (handlers/env_scans/<session>/) for later review.
     """
     name  = "env"
     title = "Environmental awareness"
@@ -492,6 +628,17 @@ class EnvAwareness(Feature):
 
         history: list        = []
         session_name: "str | None" = None
+        # Silent working name so autosave protects the session against a crash
+        # before the user has named it. The user is only asked for a real name
+        # when they close/save the session (see the CLOSE branch); until then
+        # nothing is announced about naming.
+        auto_name = "env_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        scan_count = 0
+        # Most recent scan's key frames (BGR) kept in memory so follow-up
+        # questions — and a freshly LOADed session — still have the images to
+        # reason over, instead of only the text history.
+        last_keyframes: list = []
+        last_image_paths: list = []   # disk paths of last_keyframes (for save/load)
         idle_t = time.time() + IDLE_REMIND_S
 
         # ── dependency checks ─────────────────────────────────────────────────
@@ -630,13 +777,14 @@ class EnvAwareness(Feature):
         # ── session helpers ───────────────────────────────────────────────────
 
         def _autosave() -> None:
-            if history and session_name:
-                try:
-                    _save_session(session_name, history)
-                    print(f"[ENV] Auto-saved '{session_name}' "
-                          f"({len(history) // 2} exchanges)")
-                except Exception as e:
-                    print(f"[ENV] Auto-save error: {e}")
+            if not history:
+                return
+            name = session_name or auto_name
+            try:
+                _save_session(name, history, last_images=last_image_paths)
+                print(f"[ENV] Auto-saved '{name}' ({len(history) // 2} exchanges)")
+            except Exception as e:
+                print(f"[ENV] Auto-save error: {e}")
 
         def _append(role: str, content: str) -> None:
             history.append({"role": role, "content": content})
@@ -693,8 +841,29 @@ class EnvAwareness(Feature):
                 print(f"[ENV] voice: {raw!r} → {cmd or '(question for Gemini)'}")
                 idle_t = time.time() + IDLE_REMIND_S
 
-                # ── CLOSE ─────────────────────────────────────────────────────
+                # ── CLOSE (save & exit) ───────────────────────────────────────
+                # Naming happens HERE, not after the first scan: the user asked
+                # to keep scanning / asking freely and only be prompted for a
+                # name when they actually leave. If they never name it, the
+                # silent auto_name autosave already protected the session.
                 if cmd == "CLOSE":
+                    _voice_off()
+                    _drain()
+                    if history and session_name is None and mc_ok:
+                        fb.speak("Say a name for this session, or say skip.")
+                        fb.wait(timeout=4)
+                        try:
+                            vtxt, _ = mc.listen(
+                                initial_prompt=ENV_INITIAL_PROMPT,
+                                hotwords=ENV_HOTWORDS, correct=False)
+                            print(f"[ENV] voice(direct): {vtxt!r} — "
+                                  "answering 'name this session'")
+                            if vtxt:
+                                nwords = set(re.findall(r"[a-z']+", vtxt.lower()))
+                                if not (nwords & _SKIP_W):
+                                    session_name = vtxt.strip()
+                        except Exception:
+                            pass
                     break
 
                 # ── LOAD ──────────────────────────────────────────────────────
@@ -726,10 +895,21 @@ class EnvAwareness(Feature):
                             session_name = sdata["name"]
                             history.clear()
                             history.extend(sdata.get("history", []))
+                            # Restore the last scan's key frames so Gemini keeps
+                            # visual context — a loaded session can answer
+                            # questions about what it saw, not just recite text.
+                            last_image_paths = sdata.get("last_images", []) or []
+                            last_keyframes = _load_keyframes(last_image_paths)
+                            scan_count = len(history) // 2
                             n = len(history) // 2
+                            imgnote = ""
+                            if last_keyframes:
+                                imgnote = (f" I still have the {len(last_keyframes)} "
+                                           "image" + ("s" if len(last_keyframes) != 1 else "")
+                                           + " from the last scan.")
                             fb.speak(
                                 f"Loaded {session_name}. "
-                                f"{n} exchange{'s' if n != 1 else ''}. "
+                                f"{n} exchange{'s' if n != 1 else ''}.{imgnote} "
                                 "Say describe to scan, or ask a question."
                             )
                         else:
@@ -783,50 +963,47 @@ class EnvAwareness(Feature):
                         _voice_on()
                         continue
 
-                    # First scan: name the session
-                    if session_name is None:
-                        fb.speak(reply)
-                        fb.wait(timeout=max(4, len(reply.split()) // 2))
-                        if mc_ok:
-                            fb.speak("Say a name for this session, or say skip.")
-                            fb.wait(timeout=4)
-                            try:
-                                vtxt, _ = mc.listen(
-                                    initial_prompt=ENV_INITIAL_PROMPT,
-                                    hotwords=ENV_HOTWORDS, correct=False)
-                                print(f"[ENV] voice(direct): {vtxt!r} — "
-                                      "answering 'name this session'")
-                                if vtxt:
-                                    words = set(re.findall(r"[a-z]+", vtxt.lower()))
-                                    if not (words & _SKIP_W):
-                                        session_name = vtxt.strip()
-                            except Exception:
-                                pass
-                        if not session_name:
-                            session_name = (
-                                "env_"
-                                + datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                            )
-                        fb.speak(f"Session: {session_name}.")
-                        fb.wait(timeout=3)
-                    else:
-                        fb.speak(reply)
-                        fb.wait(timeout=max(4, len(reply.split()) // 2))
+                    # Keep this scan's frames in memory so follow-up questions
+                    # (and a later LOAD) still have the images to reason over.
+                    scan_count += 1
+                    last_keyframes = keyframes
+                    jpegs      = [_frame_to_jpeg(f) for f in keyframes]
+                    store_name = session_name or auto_name
+                    try:
+                        last_image_paths = _save_keyframes_local(
+                            store_name, scan_count, jpegs)
+                    except Exception as e:
+                        print(f"[ENV] Local keyframe save error: {e}")
+                        last_image_paths = []
 
                     _append("user", user_msg)
                     _append("assistant", reply)
                     _autosave()
+
+                    # Archive frames + reply on the laptop server for review,
+                    # off the interaction path so it never delays the user.
+                    threading.Thread(
+                        target=_send_scan_to_server,
+                        args=(ctx.link, store_name, user_msg, reply,
+                              jpegs, len(keyframes)),
+                        daemon=True, name="ENVArchive",
+                    ).start()
                     try:
                         ctx.link.send("lidar", {
                             "action":       "feature_state",
                             "feature_name": "env",
                             "state":        "scan_done",
-                            "session":      session_name,
+                            "session":      store_name,
                             "reply_words":  len(reply.split()),
                             "keyframes":    len(keyframes),
                         })
                     except Exception:
                         pass
+
+                    # No name prompt here — just describe and keep going. The
+                    # user keeps asking questions or scanning until they close.
+                    fb.speak(reply)
+                    fb.wait(timeout=max(4, len(reply.split()) // 2))
                     _voice_on()
                     continue
 
@@ -844,7 +1021,9 @@ class EnvAwareness(Feature):
 
                 fb.speak("Thinking.")
                 try:
-                    reply = _ask_gemini(client, history, raw, [])
+                    # Re-attach the last scan's frames so the answer is grounded
+                    # in what the camera actually saw, not just the text history.
+                    reply = _ask_gemini(client, history, raw, last_keyframes)
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -863,22 +1042,24 @@ class EnvAwareness(Feature):
 
         finally:
             _voice_off()
+            final_name = session_name or auto_name
             try:
                 ctx.link.send("lidar", {
                     "action":       "feature_state",
                     "feature_name": "env",
                     "state":        "stopped",
-                    "session":      session_name,
+                    "session":      final_name,
                     "exchanges":    len(history) // 2,
                 })
             except Exception:
                 pass
-            if history and session_name:
+            if history:
                 try:
-                    path = _save_session(session_name, history)
+                    path = _save_session(final_name, history,
+                                         last_images=last_image_paths)
                     n = len(history) // 2
                     fb.speak(
-                        f"Saved as {session_name}. "
+                        f"Saved as {final_name}. "
                         f"{n} exchange{'s' if n != 1 else ''}."
                     )
                     fb.wait(timeout=5)
