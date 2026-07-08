@@ -148,6 +148,18 @@ def _bearing_ms(abs_deg: float) -> int:
     return 70
 
 
+def _dist_phrase(m: float) -> str:
+    """Speakable rough distance for obstacle guidance."""
+    if m < 0.4:
+        return "very close"
+    if m < 0.8:
+        return "half a metre"
+    if m < 1.3:
+        return "one metre"
+    n = round(m)
+    return f"{n} metres"
+
+
 # ─── haptics ──────────────────────────────────────────────────────────────────
 
 def _obstacle_haptics(scan, ctx, last_haptic: float,
@@ -640,6 +652,23 @@ class LidarNavigation(Feature):
         else:
             self._run_slam(ctx, start_mode=mode)
 
+    def _localize(self, ctx: FeatureContext, slam, scan_q,
+                  timeout: float = 8.0) -> "str | None":
+        """Consume scans for up to `timeout` seconds and return the recognised
+        saved-room name (SLAM room_match), or None if this spot isn't one of
+        the saved maps. Used at the start of navigation so the user is told
+        where they are before being guided."""
+        deadline = time.time() + timeout
+        while time.time() < deadline and not ctx.abort.is_set():
+            try:
+                scan = scan_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            result = slam.update(MS200Adapter.to_xy(scan), rpm=scan.rpm)
+            if result.room_match:
+                return result.room_match
+        return None
+
     def _run_slam(self, ctx: FeatureContext, start_mode: str = "mapping") -> None:
         if not _LIDAR_OK:
             ctx.feedback.speak("Lidar libraries not installed.")
@@ -678,19 +707,34 @@ class LidarNavigation(Feature):
         _session_rooms: list = []   # rooms saved this session — for room connections
 
         if start_mode == "navigation":
-            if saved:
-                room_list = ", ".join(r.replace("_", " ") for r in saved)
+            if not saved:
                 ctx.feedback.speak(
-                    f"Navigation. Saved rooms: {room_list}. "
-                    "Say take me to a room to be guided there with vibration and "
-                    "voice. Say save, then a name, to add a room. " + voice_status
-                )
-            else:
-                ctx.feedback.speak(
-                    "Navigation. No rooms saved yet, so there is nowhere to go. "
+                    "Navigation. No maps saved yet, so there is nowhere to go. "
                     "Walk around and say save, then a name, to map a room first. "
                     + voice_status
                 )
+            else:
+                room_list = ", ".join(r.replace("_", " ") for r in saved)
+                # Localise first: confirm the LiDAR recognises the current spot
+                # as one of the saved rooms before offering to navigate — you
+                # can only be guided from somewhere on the map.
+                ctx.feedback.speak(
+                    f"Navigation. {len(saved)} maps saved: {room_list}. "
+                    "Hold still while I work out where you are. " + voice_status
+                )
+                here = self._localize(ctx, slam, scan_q, timeout=8.0)
+                if here:
+                    ctx.feedback.speak(
+                        f"You are in the {here.replace('_',' ')}. "
+                        "Say take me to a room, and I will guide you there with "
+                        "vibration and voice."
+                    )
+                else:
+                    ctx.feedback.speak(
+                        "I could not recognise this spot as one of your saved "
+                        "maps. Stand inside a room you have mapped, or say take "
+                        "me to a room to try anyway."
+                    )
         else:  # mapping
             ctx.feedback.speak(
                 f"Mapping. {len(saved)} room{'s' if len(saved) != 1 else ''} saved. "
@@ -859,11 +903,16 @@ class LidarObstacleTest(Feature):
         voice = _LidarVoice(voice_q, ctx.link)
         voice.start()
 
-        ctx.feedback.speak("Obstacle test. Walk around. Say stop to finish.")
+        ctx.feedback.speak(
+            "Obstacle detection. I will vibrate and tell you where obstacles are "
+            "and how close. Walk around. Say stop to finish."
+        )
         session_id  = time.strftime("%Y%m%d_%H%M%S")
         t0          = time.time()
-        last_haptic = last_radar_up = 0.0
+        last_haptic = last_radar_up = last_voice = 0.0
         events: list = []
+        OBSTACLE_SPEAK_S = 2.5    # min gap between spoken obstacle warnings
+        OBSTACLE_SPEAK_M = 2.0    # only speak about obstacles within this range
 
         try:
             while not ctx.abort.is_set():
@@ -896,6 +945,14 @@ class LidarObstacleTest(Feature):
                         ctx.feedback._pulse(3, left_ms);  motor = ("MT3", left_ms);  last_haptic = now
                     elif right_ms:
                         ctx.feedback._pulse(2, right_ms); motor = ("MT2", right_ms); last_haptic = now
+
+                # ── spoken guidance: nearest obstacle, its side and distance ───
+                if now - last_voice >= OBSTACLE_SPEAK_S:
+                    dist, side = min((front_m, "ahead"), (left_m, "on your left"),
+                                     (right_m, "on your right"))
+                    if dist <= OBSTACLE_SPEAK_M:
+                        ctx.feedback.speak(f"Obstacle {side}, {_dist_phrase(dist)}.")
+                        last_voice = now
 
                 events.append({
                     "t"        : round(now - t0, 2),
