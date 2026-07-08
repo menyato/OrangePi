@@ -84,6 +84,11 @@ SCENE_THRESHOLD   = 0.30    # Bhattacharyya histogram distance for a scene cut
 JPEG_QUALITY      = 75      # lower = smaller payload, faster API round-trip
 MAX_IMG_WIDTH     = 1024    # resize frames wider than this before encoding
 GEMINI_MODEL      = "gemini-2.5-flash"
+# Prefer running the Gemini call on the laptop server (stable internet) instead
+# of on the Pi (flaky phone-hotspot DNS). The Pi still keeps a local client as
+# an automatic fallback if the server can't reach Gemini. Set False to force
+# the Pi to always call Gemini itself.
+USE_SERVER_GEMINI = True
 MAX_HISTORY_TURNS = 16      # keep last N conversation turns in session context
 IDLE_REMIND_S     = 60
 _KEY_ENV          = "GEMINI_API_KEY"
@@ -408,21 +413,24 @@ def _load_keyframes(paths: list) -> list:
 
 
 def _send_scan_to_server(link, session: str, user: str, reply: str,
-                         jpegs: list, keyframes: int) -> None:
-    """Archive the scan (key frames + Gemini reply) on the laptop server so it
-    can be reviewed later. Best-effort: never blocks or breaks the feature."""
+                         jpegs: list, keyframes: int,
+                         save_images: bool = True) -> None:
+    """Archive a scan (key frames + Gemini reply) on the laptop server so it can
+    be reviewed later. Used only when the Pi answered locally (server-produced
+    replies are archived server-side already). Best-effort; never blocks."""
     if link is None:
         return
     import base64
     try:
         frames_b64 = [base64.b64encode(j).decode("ascii") for j in jpegs]
         link.send("env", {
-            "action":     "scan",
-            "session":    session,
-            "user":       user,
-            "reply":      reply,
-            "keyframes":  keyframes,
-            "frames_b64": frames_b64,
+            "action":      "scan",
+            "session":     session,
+            "user":        user,
+            "reply":       reply,
+            "keyframes":   keyframes,
+            "frames_b64":  frames_b64,
+            "save_images": bool(save_images),
         })
     except Exception as e:
         print(f"[ENV] Server archive failed (non-fatal): {e}")
@@ -506,45 +514,34 @@ def _is_prompt_echo(text: str) -> bool:
     return hits / len(words) >= 0.8
 
 
-def _ask_gemini(client, history: list, user_text: str, frames: list) -> str:
+def _gemini_local(client, system: str, user_text: str, jpegs: list) -> str:
     """
-    Call Gemini with optional key frames and the latest user text.
-    `frames` is a list of BGR np.ndarray; pass [] for follow-up questions
-    that need no new images.
-    Returns the model's reply as a plain string.
+    Call Gemini directly from the Pi. `jpegs` is a list of JPEG byte strings
+    (already encoded). Returns the model's reply as plain text.
+
+    NOTE: this is the FALLBACK path. The Pi runs on a phone hotspot with flaky
+    DNS, so by default descriptions are requested from the laptop server (which
+    has stable internet) via _gemini_via_server(); this runs only if the server
+    can't do it.
     """
-    system   = _build_system(history)
     contents: list = []
-
-    for i, frame in enumerate(frames):
-        jpeg = _frame_to_jpeg(frame)
-        contents.append(f"[Frame {i + 1} of {len(frames)}]")
-        contents.append(
-            _gtypes.Part.from_bytes(data=jpeg, mime_type="image/jpeg")
-        )
-
+    for i, jpeg in enumerate(jpegs):
+        contents.append(f"[Frame {i + 1} of {len(jpegs)}]")
+        contents.append(_gtypes.Part.from_bytes(data=jpeg, mime_type="image/jpeg"))
     contents.append(f"User: {user_text}")
 
     # thinking_budget=0 is essential: gemini-2.5-flash spends "thinking" tokens
     # out of the SAME max_output_tokens budget before it writes a single visible
     # word. With thinking on and a 512 cap, a scan came back cut off mid-sentence
-    # ("...living room, with") — the model had burned the budget thinking. Turn
-    # thinking off and give a generous cap so a full detailed paragraph fits.
-    cfg_kwargs = dict(
-        system_instruction=system,
-        max_output_tokens=1200,
-        temperature=0.4,
-    )
+    # ("...living room, with"). Turn thinking off; give a generous cap.
+    cfg_kwargs = dict(system_instruction=system, max_output_tokens=1200,
+                      temperature=0.4)
     try:
         cfg_kwargs["thinking_config"] = _gtypes.ThinkingConfig(thinking_budget=0)
     except (AttributeError, TypeError):
         pass  # older google-genai without ThinkingConfig — cap alone still helps
     config = _gtypes.GenerateContentConfig(**cfg_kwargs)
 
-    # Retry transient network/DNS failures. The Pi runs on a phone hotspot whose
-    # DNS drops out intermittently ("Name or service not known" — errno -2), so
-    # one query fails while the next succeeds. A couple of quick retries lets a
-    # blip self-heal instead of surfacing as "Gemini did not respond".
     last_err = None
     for attempt in range(1, 4):
         try:
@@ -555,11 +552,62 @@ def _ask_gemini(client, history: list, user_text: str, frames: list) -> str:
         except Exception as e:
             last_err = e
             if attempt < 3 and _is_transient_net_err(e):
-                print(f"[ENV] Gemini network blip (attempt {attempt}/3): {e} — retrying")
+                print(f"[ENV] Local Gemini blip (attempt {attempt}/3): {e} — retrying")
                 time.sleep(1.5)
                 continue
             raise
     raise last_err
+
+
+def _gemini_via_server(link, system: str, user_text: str, jpegs: list,
+                       session: str, save_images: bool) -> str:
+    """
+    Ask the laptop server to run the Gemini call (stable internet) and archive
+    the frames + reply for review. Returns the reply text.
+
+    Raises RuntimeError if the server is unreachable or reports it can't reach
+    Gemini, so the caller can fall back to _gemini_local().
+    """
+    import base64
+    frames_b64 = [base64.b64encode(j).decode("ascii") for j in jpegs]
+    resp = link.send("env", {
+        "action":      "ask",
+        "session":     session,
+        "system":      system,
+        "user":        user_text,
+        "frames_b64":  frames_b64,
+        "keyframes":   len(jpegs),
+        "save_images": bool(save_images),
+    })
+    if resp is None:
+        raise RuntimeError("no response from server")
+    if not resp.get("ok"):
+        raise RuntimeError(resp.get("error") or "server could not reach Gemini")
+    reply = (resp.get("reply") or "").strip()
+    if not reply:
+        raise RuntimeError("server returned an empty reply")
+    return reply
+
+
+def _describe(link, client, history: list, user_text: str, jpegs: list,
+              session: str, save_images: bool) -> "tuple[str, str]":
+    """
+    Get a description/answer, preferring the laptop server (stable internet)
+    and falling back to on-Pi Gemini. Returns (reply, source) where source is
+    "server" or "local". Raises if neither path works.
+    """
+    system = _build_system(history)
+    errors = []
+    if link is not None and USE_SERVER_GEMINI:
+        try:
+            return _gemini_via_server(link, system, user_text, jpegs,
+                                      session, save_images), "server"
+        except Exception as e:
+            errors.append(f"server: {e}")
+            print(f"[ENV] Server description failed, trying Pi: {e}")
+    if client is not None:
+        return _gemini_local(client, system, user_text, jpegs), "local"
+    raise RuntimeError("; ".join(errors) or "no Gemini path available")
 
 
 # ── mc initialisation ─────────────────────────────────────────────────────────
@@ -706,75 +754,77 @@ class EnvAwareness(Feature):
         last_image_paths: list = []   # disk paths of last_keyframes (for save/load)
         idle_t = time.time() + IDLE_REMIND_S
 
-        # ── dependency checks ─────────────────────────────────────────────────
-        if not _GENAI_OK:
+        # ── Gemini path selection: laptop server first, Pi as fallback ─────────
+        # The Pi's phone-hotspot DNS is unreliable, so by default we ask the
+        # laptop server (stable internet) to run the Gemini call. Check whether
+        # the server can reach Gemini; if so we skip the flaky on-Pi self-test
+        # that used to crash startup on a hotspot DNS blip.
+        server_ready = False
+        if USE_SERVER_GEMINI:
+            try:
+                sresp = ctx.link.send("env", {"action": "selftest"})
+                server_ready = bool(sresp and sresp.get("gemini_ready"))
+                print(f"[ENV] Server Gemini ready: {server_ready}")
+            except Exception as e:
+                print(f"[ENV] Server selftest failed: {e}")
+
+        # Build an on-Pi Gemini client as a FALLBACK. Best-effort and non-fatal:
+        # if google-genai isn't installed or no key is present, rely on the
+        # server (no longer a hard error the way it used to be).
+        client = None
+        if _GENAI_OK:
+            api_key = _load_api_key()
+            if api_key:
+                t0 = time.time()
+                try:
+                    client = genai.Client(api_key=api_key)
+                    metrics.report_load(ctx.link, "env",
+                                        (time.time() - t0) * 1000,
+                                        component="genai_client")
+                except Exception as e:
+                    print(f"[ENV] Local Gemini init error (non-fatal): {e}")
+                    client = None
+            else:
+                print("[ENV] No on-Pi Gemini key — relying on the server.")
+        else:
+            print("[ENV] google-genai not installed on the Pi — relying on the server.")
+
+        if server_ready:
+            print("[ENV] Descriptions will run on the laptop server.")
+        elif client is None:
             fb.speak(
-                "Environmental awareness requires the google-genai package. "
-                "Run: pip install google-genai"
+                "I can't reach Gemini from the glove or the laptop server. "
+                "Check the laptop's internet and Gemini key. I'll stay open so "
+                "you can try describe once it's ready, or say close to exit."
             )
-            return
+            fb.wait(timeout=8)
 
-        api_key = _load_api_key()
-        if not api_key:
-            fb.speak(
-                "No Gemini API key found. "
-                "Either paste it into GEMINI_API_KEY_HARDCODED at the top of "
-                "env_awareness dot py, or add GEMINI_API_KEY equals your key "
-                "to the file dot env in your home folder."
-            )
-            print("[ENV] No API key: checked GEMINI_API_KEY_HARDCODED, "
-                  "$GEMINI_API_KEY, ~/.env, ~/keys.env — all empty.")
-            return
-
-        t0 = time.time()
-        try:
-            client = genai.Client(api_key=api_key)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            fb.speak(f"Gemini init error. {e}")
-            return
-        metrics.report_load(ctx.link, "env", (time.time() - t0) * 1000, component="genai_client")
-
-        # One-time connectivity self-test (once per process, not every
-        # activation — a real Gemini call has latency and uses quota) so a
-        # bad key / no internet / wrong model name is caught early.
-        #
-        # NON-FATAL and retried: the phone-hotspot the Pi runs on has brief DNS
-        # blips ("Name or service not known"), and a single one at exactly this
-        # moment used to kill the whole feature and force a full relaunch even
-        # though the network recovered a second later. Now we retry a few times,
-        # and if it still fails we warn but STILL open the feature — the user
-        # can just say "describe" again once the connection is back, no restart.
+        # Only self-test the on-Pi path when the server can't do it — the Pi's
+        # hotspot DNS is the unreliable side, so there's no point poking it when
+        # the laptop is handling requests. Non-fatal either way.
         global _gemini_tested
-        if not _gemini_tested:
+        if not server_ready and client is not None and not _gemini_tested:
             last_err = None
             for attempt in range(1, 4):
                 try:
                     _probe = client.models.generate_content(
                         model=GEMINI_MODEL, contents="Reply with the single word OK.",
                     )
-                    print(f"[ENV] Gemini self-test OK: {(_probe.text or '').strip()!r}")
+                    print(f"[ENV] Local Gemini self-test OK: {(_probe.text or '').strip()!r}")
                     _gemini_tested = True
                     last_err = None
                     break
                 except Exception as e:
                     last_err = e
-                    print(f"[ENV] Gemini self-test attempt {attempt}/3 failed: {e}")
+                    print(f"[ENV] Local self-test attempt {attempt}/3 failed: {e}")
                     if attempt < 3 and not ctx.abort.is_set():
                         time.sleep(2.0)
             if last_err is not None:
-                import traceback
-                traceback.print_exception(type(last_err), last_err,
-                                          last_err.__traceback__)
                 fb.speak(
-                    "I can't reach Gemini right now — the internet connection "
-                    "seems down. I'll stay open; check the connection and say "
+                    "I can't reach Gemini right now. I'll stay open; say "
                     "describe to try again, or close to exit."
                 )
-                fb.wait(timeout=8)
-                # fall through: do NOT return. _gemini_tested stays False so the
-                # self-test runs again next time the feature is opened.
+                fb.wait(timeout=6)
 
         # Notify server that env feature is now active
         try:
@@ -1038,21 +1088,6 @@ class EnvAwareness(Feature):
                     fb.speak("Analyzing. Please wait.")
                     fb.wait(timeout=3)
 
-                    user_msg = ("Describe my surroundings in as much detail as "
-                                "possible. Tell me what kind of place this is and "
-                                "everything that is around me.")
-                    try:
-                        reply = _ask_gemini(client, history, user_msg, keyframes)
-                    except Exception as e:
-                        import traceback
-                        traceback.print_exc()
-                        fb.speak(
-                            f"Could not reach Gemini. {e}"
-                        )
-                        fb.wait(timeout=4)
-                        _voice_on()
-                        continue
-
                     # Keep this scan's frames in memory so follow-up questions
                     # (and a later LOAD) still have the images to reason over.
                     scan_count += 1
@@ -1066,18 +1101,37 @@ class EnvAwareness(Feature):
                         print(f"[ENV] Local keyframe save error: {e}")
                         last_image_paths = []
 
+                    user_msg = ("Describe my surroundings in as much detail as "
+                                "possible. Tell me what kind of place this is and "
+                                "everything that is around me.")
+                    try:
+                        # server first (stable internet), Pi as fallback; the
+                        # server also archives the frames + reply for review.
+                        reply, source = _describe(
+                            ctx.link, client, history, user_msg, jpegs,
+                            store_name, save_images=True)
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        fb.speak(f"Could not reach Gemini. {e}")
+                        fb.wait(timeout=4)
+                        _voice_on()
+                        continue
+                    print(f"[ENV] scan description via {source}")
+
                     _append("user", user_msg)
                     _append("assistant", reply)
                     _autosave()
 
-                    # Archive frames + reply on the laptop server for review,
-                    # off the interaction path so it never delays the user.
-                    threading.Thread(
-                        target=_send_scan_to_server,
-                        args=(ctx.link, store_name, user_msg, reply,
-                              jpegs, len(keyframes)),
-                        daemon=True, name="ENVArchive",
-                    ).start()
+                    # Only archive separately if the Pi answered locally — when
+                    # the server produced the reply it already saved everything.
+                    if source == "local":
+                        threading.Thread(
+                            target=_send_scan_to_server,
+                            args=(ctx.link, store_name, user_msg, reply,
+                                  jpegs, len(keyframes), True),
+                            daemon=True, name="ENVArchive",
+                        ).start()
                     try:
                         ctx.link.send("lidar", {
                             "action":       "feature_state",
@@ -1113,7 +1167,13 @@ class EnvAwareness(Feature):
                 try:
                     # Re-attach the last scan's frames so the answer is grounded
                     # in what the camera actually saw, not just the text history.
-                    reply = _ask_gemini(client, history, raw, last_keyframes)
+                    # save_images=False: the frames were already archived by the
+                    # scan that produced them — only log the follow-up reply.
+                    q_jpegs = [_frame_to_jpeg(f) for f in last_keyframes]
+                    reply, source = _describe(
+                        ctx.link, client, history, raw, q_jpegs,
+                        session_name or auto_name, save_images=False)
+                    print(f"[ENV] answer via {source}")
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
