@@ -673,25 +673,43 @@ class EnvAwareness(Feature):
 
         # One-time connectivity self-test (once per process, not every
         # activation — a real Gemini call has latency and uses quota) so a
-        # bad key / no internet / wrong model name is caught immediately with
-        # a clear spoken message, rather than silently failing on the user's
-        # first real scan.
+        # bad key / no internet / wrong model name is caught early.
+        #
+        # NON-FATAL and retried: the phone-hotspot the Pi runs on has brief DNS
+        # blips ("Name or service not known"), and a single one at exactly this
+        # moment used to kill the whole feature and force a full relaunch even
+        # though the network recovered a second later. Now we retry a few times,
+        # and if it still fails we warn but STILL open the feature — the user
+        # can just say "describe" again once the connection is back, no restart.
         global _gemini_tested
         if not _gemini_tested:
-            try:
-                _probe = client.models.generate_content(
-                    model=GEMINI_MODEL, contents="Reply with the single word OK.",
-                )
-                print(f"[ENV] Gemini self-test OK: {(_probe.text or '').strip()!r}")
-                _gemini_tested = True
-            except Exception as e:
+            last_err = None
+            for attempt in range(1, 4):
+                try:
+                    _probe = client.models.generate_content(
+                        model=GEMINI_MODEL, contents="Reply with the single word OK.",
+                    )
+                    print(f"[ENV] Gemini self-test OK: {(_probe.text or '').strip()!r}")
+                    _gemini_tested = True
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    print(f"[ENV] Gemini self-test attempt {attempt}/3 failed: {e}")
+                    if attempt < 3 and not ctx.abort.is_set():
+                        time.sleep(2.0)
+            if last_err is not None:
                 import traceback
-                traceback.print_exc()
+                traceback.print_exception(type(last_err), last_err,
+                                          last_err.__traceback__)
                 fb.speak(
-                    f"Could not reach Gemini: {e}. "
-                    "Check your internet connection and API key, then try again."
+                    "I can't reach Gemini right now — the internet connection "
+                    "seems down. I'll stay open; check the connection and say "
+                    "describe to try again, or close to exit."
                 )
-                return
+                fb.wait(timeout=8)
+                # fall through: do NOT return. _gemini_tested stays False so the
+                # self-test runs again next time the feature is opened.
 
         # Notify server that env feature is now active
         try:
