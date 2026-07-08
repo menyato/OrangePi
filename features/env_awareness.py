@@ -456,6 +456,33 @@ def _build_system(history: list) -> str:
     return "\n".join(lines)
 
 
+def _is_transient_net_err(e: Exception) -> bool:
+    """True for DNS/connection hiccups worth retrying (vs. a real API error)."""
+    s = f"{type(e).__name__}: {e}".lower()
+    return any(k in s for k in (
+        "connecterror", "connecttimeout", "connect timeout", "readtimeout",
+        "read timeout", "name or service not known", "temporary failure in name",
+        "getaddrinfo", "errno -2", "errno -3", "connection reset",
+        "connection aborted", "remoteprotocol", "timed out", "network is unreachable",
+    ))
+
+
+# Words that make up the Whisper priming prompt. On ~1s of silence/noise
+# faster-whisper sometimes regurgitates that prompt verbatim ("the user also
+# asks natural questions about the blind user") — a phantom "question" that
+# then gets sent to Gemini in a loop. Any transcript that is almost entirely
+# made of these words is treated as a hallucinated echo and ignored.
+_PROMPT_WORDS = set(re.findall(r"[a-z]+", ENV_INITIAL_PROMPT.lower()))
+
+
+def _is_prompt_echo(text: str) -> bool:
+    words = re.findall(r"[a-z]+", text.lower())
+    if len(words) < 5:
+        return False   # never suppress short real commands
+    hits = sum(1 for w in words if w in _PROMPT_WORDS)
+    return hits / len(words) >= 0.8
+
+
 def _ask_gemini(client, history: list, user_text: str, frames: list) -> str:
     """
     Call Gemini with optional key frames and the latest user text.
@@ -489,12 +516,27 @@ def _ask_gemini(client, history: list, user_text: str, frames: list) -> str:
         cfg_kwargs["thinking_config"] = _gtypes.ThinkingConfig(thinking_budget=0)
     except (AttributeError, TypeError):
         pass  # older google-genai without ThinkingConfig — cap alone still helps
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=_gtypes.GenerateContentConfig(**cfg_kwargs),
-    )
-    return (resp.text or "").strip()
+    config = _gtypes.GenerateContentConfig(**cfg_kwargs)
+
+    # Retry transient network/DNS failures. The Pi runs on a phone hotspot whose
+    # DNS drops out intermittently ("Name or service not known" — errno -2), so
+    # one query fails while the next succeeds. A couple of quick retries lets a
+    # blip self-heal instead of surfacing as "Gemini did not respond".
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL, contents=contents, config=config,
+            )
+            return (resp.text or "").strip()
+        except Exception as e:
+            last_err = e
+            if attempt < 3 and _is_transient_net_err(e):
+                print(f"[ENV] Gemini network blip (attempt {attempt}/3): {e} — retrying")
+                time.sleep(1.5)
+                continue
+            raise
+    raise last_err
 
 
 # ── mc initialisation ─────────────────────────────────────────────────────────
@@ -853,6 +895,13 @@ class EnvAwareness(Feature):
                         fb.wait(timeout=10)
                         _voice_on()
                         idle_t = time.time() + IDLE_REMIND_S
+                    continue
+
+                # Drop Whisper prompt-echo hallucinations (silence transcribed
+                # as the priming prompt) before they reach the classifier and
+                # get fired at Gemini as a phantom question.
+                if _is_prompt_echo(raw):
+                    print(f"[ENV] Ignored prompt-echo hallucination: {raw!r}")
                     continue
 
                 cmd = _classify_env(raw)
