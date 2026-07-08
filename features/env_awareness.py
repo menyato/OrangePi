@@ -98,13 +98,24 @@ _KEY_ENV          = "GEMINI_API_KEY"
 # biases Whisper AWAY from the words this feature actually uses — and
 # free-form questions to Gemini got "corrected" toward currency command
 # words by correct_transcript(). Chat input must arrive verbatim.
+# Kept as comma-separated KEYWORDS (not prose sentences): Whisper regurgitates
+# a coherent priming sentence when it hears near-silence, so a keyword list
+# makes any echo obviously non-conversational (and _is_prompt_echo catches it).
+# Includes the vocabulary of the questions the user actually asks — "how many
+# males/females", "what are they wearing" — so Whisper stops mangling "male"
+# into "maid/main/mail".
 ENV_INITIAL_PROMPT = (
-    "Environmental awareness assistant for a blind user. Commands: "
-    "describe, scan, look, capture, load, close, stop, exit, skip. "
-    "The user also asks natural questions about their surroundings: "
-    "objects, people, colors, distances, obstacles, doors, stairs, signs."
+    "Environmental awareness assistant for a blind user. "
+    "Command words: describe, scan, rescan, look, capture, photo, "
+    "load, save, session, close, stop, exit, skip. "
+    "Topic words: people, person, man, woman, male, female, men, women, "
+    "boy, girl, child, wearing, clothes, shirt, dress, hat, hair, beard, "
+    "glasses, color, colour, objects, furniture, door, window, table, chair, "
+    "stairs, sign, distance, near, far, left, right, front, behind, how, many, what."
 )
-ENV_HOTWORDS = "describe scan look capture load close stop exit skip"
+ENV_HOTWORDS = ("describe scan rescan look capture photo load save close stop "
+                "exit skip male female man woman men women people person wearing "
+                "clothes shirt hair beard glasses color how many what")
 
 # ── Hardcoded API key (optional) ──────────────────────────────────────────────
 # If you don't want to rely on GEMINI_API_KEY / ~/.env / ~/keys.env — e.g.
@@ -186,7 +197,16 @@ no poetry or meta-commentary.
 7. Multiple frames are sequential moments from one short clip (the user may have panned the \
 camera) — synthesise them into one coherent description of the whole scene, not a frame-by-frame list.
 8. Never comment on image quality, blur, or the capture process.
-9. Responses: a detailed paragraph (4-7 sentences) for a new scan; 1-2 sentences for a follow-up question.\
+
+FOLLOW-UP QUESTION RULES (when the user asks a question after a scan):
+- Answer ONLY the specific question asked. Do NOT re-describe the whole scene.
+- Be brief: usually ONE short sentence, at most two. No preamble.
+- Give just the new fact. If asked "how many people", answer with the count and \
+nothing else. If asked "what are they wearing", describe only the clothing.
+- If the images genuinely don't show the answer, say so in one short sentence.
+
+Response length: a detailed paragraph (4-7 sentences) for a NEW SCAN; \
+one short sentence for a follow-up question.\
 """
 
 
@@ -419,11 +439,12 @@ def _send_scan_to_server(link, session: str, user: str, reply: str,
     be reviewed later. Used only when the Pi answered locally (server-produced
     replies are archived server-side already). Best-effort; never blocks."""
     if link is None:
+        print("[ENV] Archive skipped: no server link.")
         return
     import base64
     try:
         frames_b64 = [base64.b64encode(j).decode("ascii") for j in jpegs]
-        link.send("env", {
+        resp = link.send("env", {
             "action":      "scan",
             "session":     session,
             "user":        user,
@@ -432,6 +453,12 @@ def _send_scan_to_server(link, session: str, user: str, reply: str,
             "frames_b64":  frames_b64,
             "save_images": bool(save_images),
         })
+        if resp is None:
+            print("[ENV] Archive send returned no response "
+                  "(server link dropped the message).")
+        else:
+            print(f"[ENV] Archived {len(frames_b64)} frame(s) + reply to server "
+                  f"for '{session}'.")
     except Exception as e:
         print(f"[ENV] Server archive failed (non-fatal): {e}")
 
@@ -498,20 +525,28 @@ def _is_transient_net_err(e: Exception) -> bool:
     ))
 
 
-# Words that make up the Whisper priming prompt. On ~1s of silence/noise
-# faster-whisper sometimes regurgitates that prompt verbatim ("the user also
-# asks natural questions about the blind user") — a phantom "question" that
-# then gets sent to Gemini in a loop. Any transcript that is almost entirely
-# made of these words is treated as a hallucinated echo and ignored.
-_PROMPT_WORDS = set(re.findall(r"[a-z]+", ENV_INITIAL_PROMPT.lower()))
+# On ~1s of silence/noise faster-whisper sometimes regurgitates its priming
+# prompt verbatim ("the user also asks natural questions...") — a phantom
+# "question" that then gets fired at Gemini in a loop. Detect this precisely by
+# contiguous n-gram overlap with the prompt: any run of _ECHO_N consecutive
+# words that appears in the prompt marks the transcript as a hallucinated echo.
+# (An earlier word-ratio check would wrongly flag real questions once the
+# prompt was enriched with words like "male"/"female"/"wearing"; a contiguous
+# 5-word run from a keyword list essentially never occurs in natural speech.)
+_ECHO_N = 5
+_PROMPT_TOKENS = re.findall(r"[a-z]+", ENV_INITIAL_PROMPT.lower())
+_PROMPT_NGRAMS = {tuple(_PROMPT_TOKENS[i:i + _ECHO_N])
+                  for i in range(len(_PROMPT_TOKENS) - _ECHO_N + 1)}
 
 
 def _is_prompt_echo(text: str) -> bool:
-    words = re.findall(r"[a-z]+", text.lower())
-    if len(words) < 5:
+    toks = re.findall(r"[a-z]+", text.lower())
+    if len(toks) < _ECHO_N:
         return False   # never suppress short real commands
-    hits = sum(1 for w in words if w in _PROMPT_WORDS)
-    return hits / len(words) >= 0.8
+    for i in range(len(toks) - _ECHO_N + 1):
+        if tuple(toks[i:i + _ECHO_N]) in _PROMPT_NGRAMS:
+            return True
+    return False
 
 
 def _gemini_local(client, system: str, user_text: str, jpegs: list) -> str:
@@ -855,10 +890,13 @@ class EnvAwareness(Feature):
                         _drain()
                         # correct=False: most input here is free-form chat for
                         # Gemini — vocabulary snapping corrupts questions
+                        # patient=True: the user asks longer, more deliberate
+                        # questions here ("is he ... male or female?"), so give
+                        # them room to pause mid-sentence without being cut off.
                         mc.voice_listen_loop(voice_q, ev, ctx.abort,
                                              initial_prompt=ENV_INITIAL_PROMPT,
                                              hotwords=ENV_HOTWORDS,
-                                             correct=False)
+                                             correct=False, patient=True)
             t = threading.Thread(target=_start, daemon=True, name="ENVVoice")
             _voice_thread[0] = t
             t.start()
@@ -995,7 +1033,7 @@ class EnvAwareness(Feature):
                         try:
                             vtxt, _ = mc.listen(
                                 initial_prompt=ENV_INITIAL_PROMPT,
-                                hotwords=ENV_HOTWORDS, correct=False)
+                                hotwords=ENV_HOTWORDS, correct=False, patient=True)
                             print(f"[ENV] voice(direct): {vtxt!r} — "
                                   "answering 'name this session'")
                             if vtxt:
@@ -1025,7 +1063,7 @@ class EnvAwareness(Feature):
                         try:
                             name_text, _ = mc.listen(
                                 initial_prompt=ENV_INITIAL_PROMPT,
-                                hotwords=ENV_HOTWORDS, correct=False)
+                                hotwords=ENV_HOTWORDS, correct=False, patient=True)
                         except Exception:
                             name_text = ""
                     print(f"[ENV] voice(direct): {name_text!r} — answering 'session name'")
@@ -1123,15 +1161,6 @@ class EnvAwareness(Feature):
                     _append("assistant", reply)
                     _autosave()
 
-                    # Only archive separately if the Pi answered locally — when
-                    # the server produced the reply it already saved everything.
-                    if source == "local":
-                        threading.Thread(
-                            target=_send_scan_to_server,
-                            args=(ctx.link, store_name, user_msg, reply,
-                                  jpegs, len(keyframes), True),
-                            daemon=True, name="ENVArchive",
-                        ).start()
                     try:
                         ctx.link.send("lidar", {
                             "action":       "feature_state",
@@ -1148,6 +1177,15 @@ class EnvAwareness(Feature):
                     # user keeps asking questions or scanning until they close.
                     fb.speak(reply)
                     fb.wait(timeout=max(4, len(reply.split()) // 2))
+
+                    # Archive the frames + reply on the laptop for review. Only
+                    # when the Pi answered locally — a server-produced reply is
+                    # already archived server-side. Done here synchronously
+                    # (fast on the LAN) AFTER speaking, so it reliably lands and
+                    # is logged, instead of vanishing in a daemon thread.
+                    if source == "local":
+                        _send_scan_to_server(ctx.link, store_name, user_msg,
+                                             reply, jpegs, len(keyframes), True)
                     _voice_on()
                     continue
 
@@ -1169,9 +1207,13 @@ class EnvAwareness(Feature):
                     # in what the camera actually saw, not just the text history.
                     # save_images=False: the frames were already archived by the
                     # scan that produced them — only log the follow-up reply.
+                    # The directive is sent to Gemini but NOT stored in history
+                    # (we keep the clean question there).
                     q_jpegs = [_frame_to_jpeg(f) for f in last_keyframes]
+                    q_text = (f"{raw}\n\n(Answer only this question in one short "
+                              "sentence. Do not repeat the earlier description.)")
                     reply, source = _describe(
-                        ctx.link, client, history, raw, q_jpegs,
+                        ctx.link, client, history, q_text, q_jpegs,
                         session_name or auto_name, save_images=False)
                     print(f"[ENV] answer via {source}")
                 except Exception as e:

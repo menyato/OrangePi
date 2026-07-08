@@ -631,13 +631,21 @@ def _to_pcm(frame: np.ndarray) -> bytes:
     return (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
 
-def record_with_vad(stop_ev=None) -> np.ndarray | None:
+# When patient=True, a phrase only ends after this much CONTINUOUS quiet, and a
+# single noisy/voiced blip resets the timer — so the speaker can pause to think
+# mid-sentence ("is he a ... male or female?") without being cut off. Used by
+# Environmental Awareness, where the user asks longer, more deliberate questions.
+PATIENT_END_MS = 1500
+
+
+def record_with_vad(stop_ev=None, patient: bool = False) -> np.ndarray | None:
     ring_buffer   = collections.deque(maxlen=RING_BUFFER_FRAMES)
     triggered     = False
     voiced_frames: list[np.ndarray] = []
     pre_roll:     list[np.ndarray]  = []
     xrun_count    = 0
     MAX_XRUNS     = 10
+    consec_silence = 0   # consecutive unvoiced frames (patient mode only)
 
     print("[MIC] Listening... speak now")
     play_cue(_CUE_LISTEN)   # tells the blind user: speak now
@@ -708,11 +716,20 @@ def record_with_vad(stop_ev=None) -> np.ndarray | None:
                     ring_buffer.clear()
             else:
                 voiced_frames.append(chunk.copy())
-                ring_buffer.append((chunk.copy(), is_speech))
-                unvoiced_ratio = sum(1 for _, s in ring_buffer if not s) / len(ring_buffer)
-                if unvoiced_ratio > UNVOICED_THRESHOLD:
-                    print("[MIC] Speech ended.")
-                    break
+                if patient:
+                    # End only after PATIENT_END_MS of CONTINUOUS quiet; any
+                    # voiced frame resets the timer, so mid-sentence pauses
+                    # don't cut the user off.
+                    consec_silence = 0 if is_speech else consec_silence + 1
+                    if consec_silence * FRAME_DURATION >= PATIENT_END_MS:
+                        print("[MIC] Speech ended.")
+                        break
+                else:
+                    ring_buffer.append((chunk.copy(), is_speech))
+                    unvoiced_ratio = sum(1 for _, s in ring_buffer if not s) / len(ring_buffer)
+                    if unvoiced_ratio > UNVOICED_THRESHOLD:
+                        print("[MIC] Speech ended.")
+                        break
 
     if not voiced_frames:
         return None
@@ -801,7 +818,8 @@ def transcribe(audio: np.ndarray | None, initial_prompt: str | None = None,
 
 def listen(retries: int = 5, initial_prompt: str | None = None,
            hotwords: str | None = None, stop_ev=None,
-           quiet: bool = False, correct: bool = True) -> tuple[str, dict]:
+           quiet: bool = False, correct: bool = True,
+           patient: bool = False) -> tuple[str, dict]:
     """
     Returns (corrected_text, audit). Skips the expensive Whisper call entirely
     when no speech was captured, beeps to mark each stage, and tells the user
@@ -834,7 +852,7 @@ def listen(retries: int = 5, initial_prompt: str | None = None,
             print("[STT] Stop requested — abandoning remaining retries.")
             break
         t0 = time.time()
-        audio = record_with_vad(stop_ev=stop_ev)   # plays the LISTEN cue inside
+        audio = record_with_vad(stop_ev=stop_ev, patient=patient)   # plays the LISTEN cue inside
         t_record = time.time() - t0
 
         # ── Nothing to transcribe → DON'T run Whisper; tell the user ────────
@@ -904,7 +922,8 @@ def listen(retries: int = 5, initial_prompt: str | None = None,
 
 
 def voice_listen_loop(voice_q, stop_ev, abort_ev, initial_prompt: str | None = None,
-                      hotwords: str | None = None, correct: bool = True) -> None:
+                      hotwords: str | None = None, correct: bool = True,
+                      patient: bool = False) -> None:
     """Shared blocking voice worker for features (OCR, Environmental Awareness, …).
 
     Loops calling listen() and puts the corrected transcript into voice_q.
@@ -924,7 +943,8 @@ def voice_listen_loop(voice_q, stop_ev, abort_ev, initial_prompt: str | None = N
     while not stop_ev.is_set() and not abort_ev.is_set():
         try:
             text, _ = listen(initial_prompt=initial_prompt, hotwords=hotwords,
-                             stop_ev=stop_ev, quiet=True, correct=correct)
+                             stop_ev=stop_ev, quiet=True, correct=correct,
+                             patient=patient)
         except Exception as e:
             print(f"[VOICE] listen error: {e}")
             import time as _t; _t.sleep(0.5)
