@@ -77,8 +77,8 @@ except ImportError:
 
 SESSIONS_DIR      = os.path.expanduser("~/env_sessions")
 CAMERA_INDICES    = [0, 1, 2]
-VIDEO_DURATION_S  = 3       # seconds to record per scan
-VIDEO_FPS         = 10      # Pi-friendly frame rate (30 frames per scan)
+VIDEO_DURATION_S  = 5       # seconds to record per scan (longer = wider pan coverage)
+VIDEO_FPS         = 10      # Pi-friendly frame rate (50 frames per scan)
 MAX_KEYFRAMES     = 5       # maximum images sent to Gemini per turn
 SCENE_THRESHOLD   = 0.30    # Bhattacharyya histogram distance for a scene cut
 JPEG_QUALITY      = 75      # lower = smaller payload, faster API round-trip
@@ -133,21 +133,29 @@ _SKIP_W  = {"skip", "none", "no", "cancel", "default"}
 
 _SYSTEM_PROMPT = """\
 You are an environmental awareness assistant for a blind person wearing a smart glove.
-When images are provided you describe what you see.
+When images are provided you describe the surroundings in as much detail as possible.
 When a follow-up question arrives without new images, you answer from earlier in this conversation.
 
+This is NOT a hazard or safety alert. Do not warn about danger, obstacles, or navigation
+risk unless the user explicitly asks. Your job is simply to paint a rich, vivid picture of
+the scene so the user can understand where they are and what is around them.
+
 DESCRIPTION RULES:
-1. Lead with safety first: obstacles, stairs, steps, traffic, people in close proximity.
-2. Describe near-to-far: floor or ground directly ahead, then 1-3 metres, then background.
-3. Use precise spatial language: "chair 1 metre ahead on your left", \
-"open door at arm's reach directly ahead", "step down at your feet".
-4. Name objects by their practical use: "door handle at waist height on the right", not just "door".
-5. Estimate distances in metres from the viewer.
-6. Mention lighting only when dim, dark, or affecting safe navigation.
-7. Be concise and direct — no filler phrases, no poetry, no meta-commentary.
-8. Multiple frames are sequential moments from one short clip — synthesise into one coherent description.
-9. Never comment on image quality, blur, or the capture process.
-10. Responses: 2-4 sentences for a new scan; 1-2 sentences for a follow-up question.\
+1. Give a complete picture: the type of place (room, street, kitchen, office...), then the \
+objects, furniture, people, and features that fill it.
+2. Describe spatial layout naturally: what is to the left, right, ahead, near and far, \
+above and below.
+3. Include rich detail: colours, materials, textures, sizes, shapes, text on signs or labels, \
+and the general mood or atmosphere of the space.
+4. Name people's approximate number, posture, and what they appear to be doing — never guess \
+identities.
+5. Note lighting, time-of-day cues, and whether the space feels indoor or outdoor, open or enclosed.
+6. Be descriptive and natural, but not padded — every sentence should add real information, \
+no poetry or meta-commentary.
+7. Multiple frames are sequential moments from one short clip (the user may have panned the \
+camera) — synthesise them into one coherent description of the whole scene, not a frame-by-frame list.
+8. Never comment on image quality, blur, or the capture process.
+9. Responses: a detailed paragraph (4-7 sentences) for a new scan; 1-2 sentences for a follow-up question.\
 """
 
 
@@ -465,7 +473,7 @@ class EnvAwareness(Feature):
 
     Commands
     ────────
-    "describe / scan / look" → record 3-second clip, extract key frames,
+    "describe / scan / look" → record 5-second clip, extract key frames,
                                ask Gemini to describe the environment.
     "load"                   → reload a saved session (restores history).
     "close / stop / quit"    → save session and exit.
@@ -738,8 +746,8 @@ class EnvAwareness(Feature):
                     _drain()
                     fb.confirm()
                     fb.speak(
-                        "Hold the camera steady and pan slowly "
-                        "if you want to cover a wider area. Recording now."
+                        "Recording for five seconds. Pan slowly "
+                        "to cover the whole area around you."
                     )
                     fb.wait(timeout=4)
 
@@ -760,7 +768,9 @@ class EnvAwareness(Feature):
                     fb.speak("Analyzing. Please wait.")
                     fb.wait(timeout=3)
 
-                    user_msg = "Please describe the environment."
+                    user_msg = ("Describe my surroundings in as much detail as "
+                                "possible. Tell me what kind of place this is and "
+                                "everything that is around me.")
                     try:
                         reply = _ask_gemini(client, history, user_msg, keyframes)
                     except Exception as e:
