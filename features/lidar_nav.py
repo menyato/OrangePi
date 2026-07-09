@@ -811,7 +811,10 @@ class LidarNavigation(Feature):
         mode, nav_target = "mapping", None
         change_requested = False
         last_change_prompt = time.time()
-        CHANGE_PROMPT_S    = 30.0     # remind the user they can switch modes
+        CHANGE_PROMPT_S    = 30.0     # remind (non-mapping modes) about "change"
+        last_save_prompt   = time.time()
+        SAVE_PROMPT_S      = 20.0     # mapping: offer to name+save this room
+        last_obs_key       = None     # (side, distance-band) last spoken — dedupe
         last_haptic = last_nav_spk = last_pose_send = last_obs_voice = 0.0
         t0 = time.time()
 
@@ -966,10 +969,10 @@ class LidarNavigation(Feature):
                 result = slam.update(pts, rpm=scan.rpm)
                 now    = time.time()
 
-                # Periodic reminder that the user can switch modes.
-                if now - last_change_prompt >= CHANGE_PROMPT_S:
-                    what = "navigating" if (mode == "navigation" and nav_target) else "mapping"
-                    ctx.feedback.speak(f"Still {what}. Say change to switch mode.")
+                # "change" reminder only in navigation — mapping has its own
+                # save prompt below, so it isn't double-nagged.
+                if mode == "navigation" and nav_target and now - last_change_prompt >= CHANGE_PROMPT_S:
+                    ctx.feedback.speak("Say change to switch mode.")
                     last_change_prompt = now
 
                 last_haptic = _obstacle_haptics(
@@ -978,14 +981,34 @@ class LidarNavigation(Feature):
                     slam=slam,
                 )
 
-                # Obstacle detection stays on while mapping: alongside the motor
-                # pulses above, speak the nearest obstacle's side + distance so
-                # the user is warned as they walk around building the map.
+                # Obstacle detection stays on while mapping. Only SPEAK when the
+                # nearest obstacle's side or distance-band CHANGES (or after a
+                # long quiet gap), so it stops repeating the same warning every
+                # couple of seconds. Motors (above) still pulse continuously.
                 if mode == "mapping" and now - last_obs_voice >= OBSTACLE_SPEAK_S:
                     dist, side = _nearest_obstacle(scan)
                     if side and dist <= OBSTACLE_SPEAK_M:
-                        ctx.feedback.speak(f"Obstacle {side}, {_dist_phrase(dist)}.")
-                        last_obs_voice = now
+                        key = (side, _dist_phrase(dist))
+                        if key != last_obs_key or now - last_obs_voice >= 8.0:
+                            ctx.feedback.speak(f"Obstacle {side}, {_dist_phrase(dist)}.")
+                            last_obs_voice = now
+                            last_obs_key   = key
+
+                # Every 20s while mapping, offer to name and save this room.
+                if mode == "mapping" and now - last_save_prompt >= SAVE_PROMPT_S:
+                    ctx.feedback.speak("Say a name to save this room, or say skip.")
+                    ctx.feedback.wait(timeout=4)
+                    nm = _capture_room_name(ctx, voice, voice_cmd_q, timeout=10.0)
+                    if nm and nm not in ("skip", "none", "no", "cancel", "later"):
+                        prev = _session_rooms[-1] if _session_rooms else None
+                        if _do_save(slam, ctx, nm, prev_room=prev):
+                            _session_rooms.append(nm)
+                            if len(_session_rooms) >= 2:
+                                ctx.feedback.speak(
+                                    f"{len(_session_rooms)} rooms saved. Say take me "
+                                    "to a room to navigate, or change to switch mode.")
+                    last_save_prompt = time.time()   # reset AFTER the slow prompt
+                    last_obs_key     = None          # let obstacles re-announce
 
                 if mode == "navigation" and nav_target and ctx.link and now - last_pose_send >= POSE_UPDATE_S:
                     ctx.link.send("lidar", {"action": "pose_update", "room_name": nav_target,

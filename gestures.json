@@ -55,12 +55,12 @@
   },
   "FEAT:Money recognition": {
     "name": "FEAT:Money recognition",
-    "flex_mask": 2,
+    "flex_mask": 3,
     "imu_mask": 0,
     "motion": "static",
     "hold_frames": 3,
     "flex_exact": true,
-    "_desc": "Index only, hold"
+    "_desc": "Thumb + Index (L shape), hold"
   },
   "FEAT:Book reader": {
     "name": "FEAT:Book reader",
@@ -82,21 +82,21 @@
   },
   "FEAT:Home automation": {
     "name": "FEAT:Home automation",
-    "flex_mask": 3,
-    "imu_mask": 0,
-    "motion": "static",
-    "hold_frames": 3,
-    "flex_exact": true,
-    "_desc": "Thumb + Index (L shape), hold"
-  },
-  "FEAT:Programmable Gestures": {
-    "name": "FEAT:Programmable Gestures",
     "flex_mask": 7,
     "imu_mask": 0,
     "motion": "static",
     "hold_frames": 3,
     "flex_exact": true,
     "_desc": "Thumb + Index + Middle, hold"
+  },
+  "FEAT:Programmable Gestures": {
+    "name": "FEAT:Programmable Gestures",
+    "flex_mask": 2,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Index only, hold"
   },
   "FEAT:Relay 1": {
     "name": "FEAT:Relay 1",

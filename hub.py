@@ -228,6 +228,17 @@ def main() -> None:
     if resp and "relay_count" in resp:
         relay_count = int(resp["relay_count"])
     relay_features = [RelaySwitch(i, f"Relay {i}") for i in range(1, relay_count + 1)]
+
+    # Auto-fetch the ESP relay board's LAN IP from the server at boot and cache
+    # it on the Pi, so relay gestures drive the board DIRECTLY (no server in the
+    # control loop) from the very first toggle.
+    try:
+        from features.home_automation import _refresh_relay_ip
+        _info = _refresh_relay_ip(link)
+        if _info and _info.get("ip"):
+            print(f"[HUB] Relay board IP cached from server: {_info['ip']}")
+    except Exception as _e:
+        print(f"[HUB] Relay IP prefetch skipped: {_e}")
     print(f"[HUB] Home automation: {relay_count} relay(s) — "
           f"{', '.join(f.title for f in relay_features)}")
 
