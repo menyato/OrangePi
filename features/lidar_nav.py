@@ -354,6 +354,16 @@ class _LidarVoice:
         self._t      = None
         self._ready  = threading.Event()   # set when voice is up (or has failed)
         self.failed  = False               # True if init error
+        # When set, the ASR worker queues ("name", <raw text>) for ANY speech
+        # instead of parsing it as a command — used to capture a spoken room
+        # name after the user says a bare "save".
+        self._raw_mode = threading.Event()
+
+    def raw_on(self) -> None:
+        self._raw_mode.set()
+
+    def raw_off(self) -> None:
+        self._raw_mode.clear()
 
     def start(self) -> None:
         self._stop.clear()
@@ -377,9 +387,13 @@ class _LidarVoice:
                 text = " ".join(s.text for s in segs).strip()
                 if text:
                     print(f"[LIDAR VOICE] heard: {text!r}")
-                    cmd = _parse_voice(text)
-                    if cmd:
-                        self._q.put(cmd)
+                    if self._raw_mode.is_set():
+                        # Capturing a room name — pass the words through verbatim.
+                        self._q.put(("name", text))
+                    else:
+                        cmd = _parse_voice(text)
+                        if cmd:
+                            self._q.put(cmd)
             except Exception as exc:
                 print(f"[LIDAR VOICE] ASR error: {exc}")
 
@@ -606,97 +620,123 @@ _MODE_NAMES = {
 _MODE_ORDER = ["obstacle", "mapping", "navigation"]
 
 
+def _lidar_mc():
+    """Load and return the shared voice stack (orangepi_client), or None. Reuses
+    the same models other features load (via the MoneyRecognition flag) so it's
+    instant if one already ran this process."""
+    try:
+        import orangepi_client as mc
+        from features.money_recognition import MoneyRecognition
+        if not MoneyRecognition._models_ready:
+            mc.init_cues()
+            mc.auto_detect_all()
+            mc.load_models()
+            MoneyRecognition._models_ready = True
+        return mc
+    except Exception as e:
+        print(f"[LIDAR] voice stack load failed: {e}")
+        return None
+
+
+def _capture_room_name(ctx: FeatureContext, voice, voice_q: queue.Queue,
+                       timeout: float = 12.0) -> "str | None":
+    """After a bare 'save', capture the next spoken words as the room name.
+    Flips the always-on listener into raw mode so the name isn't swallowed by
+    the command parser. Returns a sanitised room key, or None if nothing heard."""
+    fb = ctx.feedback
+    try:                     # drain stale entries so an old command isn't taken
+        while True:
+            voice_q.get_nowait()
+    except queue.Empty:
+        pass
+    fb.listen_cue()          # audible "speak now"
+    voice.raw_on()
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline and not ctx.abort.is_set():
+            try:
+                v = voice_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if v[0] == "abort":
+                return None
+            if v[0] == "name" and v[1].strip():
+                raw = v[1].strip().lower()
+                if raw in ("save", "save room", "stop", "cancel"):
+                    continue     # ignore a lingering 'save' echo; keep waiting
+                return re.sub(r"\s+", "_", re.sub(r"^(the|a|an)\s+", "", raw))
+        return None
+    finally:
+        voice.raw_off()
+
+
 def _ask_lidar_mode(ctx: FeatureContext) -> "str | None":
     """
     Speak the opening menu and return the chosen mode:
-    "obstacle" | "mapping" | "navigation", or None if the user aborted.
+    "obstacle" | "mapping" | "navigation", or None if the user cancelled.
 
-    Choice by voice ("obstacle" / "mapping" / "navigation") or by gesture
-    (NEXT flick cycles the options aloud, START/EDIT selects the current one).
-    Runs its own short-lived voice listener, stopped before returning so the
-    chosen mode can open the mic cleanly.
+    Uses the shared one-shot mc.listen() — the same reliable voice path the
+    other features use. It plays its own "speak now" beep and captures a single
+    utterance, so (unlike the always-on _LidarVoice) it isn't drowned out by the
+    gesture stream or repeated menu speech.
     """
-    fb      = ctx.feedback
-    gq      = ctx.gesture_queue
-    voice_q: queue.Queue = queue.Queue()
-    voice   = _LidarVoice(voice_q, ctx.link)
-    voice.start()
-    voice._ready.wait(timeout=12.0)
+    fb = ctx.feedback
 
-    def _menu() -> None:
-        fb.speak(
-            "Lidar. Choose a mode. "
-            "Say obstacle for obstacle detection only. "
-            "Say mapping to map and save rooms. "
-            "Say navigation to load a map and be guided with vibration and voice. "
-            "Or flick next to hear each option and hold to choose."
-        )
+    fb.speak("Loading lidar voice. One moment.")
+    mc = _lidar_mc()
 
-    def _drain(q: queue.Queue) -> None:
+    fb.speak(
+        "Lidar. Choose a mode. "
+        "Say obstacle for obstacle detection only. "
+        "Say mapping to map and save rooms. "
+        "Say navigation to load a map and be guided with vibration and voice."
+    )
+    fb.wait(timeout=12)
+
+    if mc is None:
+        fb.speak("Voice is unavailable. Starting obstacle detection.")
+        fb.wait(timeout=3)
+        return "obstacle"
+
+    HOTWORDS = "obstacle obstacles mapping map navigation navigate stop cancel"
+    PROMPT   = ("Lidar mode selection. Say one word: obstacle, mapping, or "
+                "navigation. Say stop to cancel.")
+
+    for _ in range(6):
+        if ctx.abort.is_set():
+            return None
+        text = ""
         try:
-            while True:
-                q.get_nowait()
-        except queue.Empty:
-            pass
+            # mc.listen plays the LISTEN beep and captures one utterance.
+            text, _ = mc.listen(initial_prompt=PROMPT, hotwords=HOTWORDS,
+                                 correct=False, stop_ev=ctx.abort)
+        except Exception as e:
+            print(f"[LIDAR] mode listen error: {e}")
+        low = (text or "").lower()
+        print(f"[LIDAR] mode heard: {text!r}")
+        if ctx.abort.is_set():
+            return None
+        if any(w in low for w in ("stop", "cancel", "exit", "quit", "never mind")):
+            fb.speak("Cancelled.")
+            return None
+        if "obstacle" in low or "avoid" in low:
+            fb.speak("Obstacle detection. Starting."); fb.wait(timeout=3)
+            return "obstacle"
+        if "map" in low:
+            fb.speak("Mapping. Starting."); fb.wait(timeout=3)
+            return "mapping"
+        if "navig" in low or "guide" in low:
+            fb.speak("Navigation. Starting."); fb.wait(timeout=3)
+            return "navigation"
+        # Not understood — re-prompt and listen again (mc.listen beeps each time).
+        if text:
+            fb.speak(f"I heard {text}. Please say obstacle, mapping, or navigation.")
+        else:
+            fb.speak("I didn't catch that. Say obstacle, mapping, or navigation.")
+        fb.wait(timeout=4)
 
-    try:
-        _menu()
-        fb.wait(timeout=14)
-        # Drain any bounce gesture/voice left over from launching the feature —
-        # otherwise a stray START/EDIT was read as an instant selection and the
-        # menu "defaulted" to obstacle without ever waiting for the user.
-        _drain(gq) if gq is not None else None
-        _drain(voice_q)
-        fb.listen_cue()   # audible "speak now" beep, like the other features
-
-        cursor      = -1        # nothing highlighted until the user scrolls
-        last_prompt = time.time()
-        # Wait INDEFINITELY for an explicit choice — never auto-pick a mode.
-        while not ctx.abort.is_set():
-            # ── voice (primary) ────────────────────────────────────────────
-            try:
-                cmd = voice_q.get(timeout=0.1)
-            except queue.Empty:
-                cmd = None
-            if cmd:
-                if cmd[0] == "abort":
-                    return None
-                if cmd[0] == "mode":
-                    fb.speak(f"{_MODE_NAMES[cmd[1]]}. Starting.")
-                    fb.wait(timeout=3)
-                    return cmd[1]
-            # ── gesture (NEXT cycles, EDIT selects the current one) ─────────
-            if gq is not None:
-                try:
-                    g = gq.get_nowait()
-                    if g == "NEXT":
-                        cursor = (cursor + 1) % len(_MODE_ORDER)
-                        fb.speak(_MODE_NAMES[_MODE_ORDER[cursor]])
-                        last_prompt = time.time()
-                    elif g == "EDIT":
-                        if cursor < 0:
-                            fb.speak("Flick next to hear a mode first, then hold "
-                                     "to choose. Or just say obstacle, mapping, "
-                                     "or navigation.")
-                            last_prompt = time.time()
-                        else:
-                            choice = _MODE_ORDER[cursor]
-                            fb.speak(f"{_MODE_NAMES[choice]}. Starting.")
-                            fb.wait(timeout=3)
-                            return choice
-                except queue.Empty:
-                    pass
-            # Gentle re-prompt so the user knows it's still waiting; no auto-pick.
-            if time.time() - last_prompt > 25.0:
-                fb.speak("Still waiting. Say obstacle, mapping, or navigation. "
-                         "Say stop to cancel.")
-                fb.wait(timeout=6)
-                fb.listen_cue()
-                last_prompt = time.time()
-        return None
-    finally:
-        voice.stop()
-        time.sleep(0.4)   # let the mic fully release before the mode reopens it
+    fb.speak("No choice heard. Cancelling lidar.")
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -838,10 +878,22 @@ class LidarNavigation(Feature):
                         )
 
                     elif tag == "save":
-                        name = vcmd[1] if len(vcmd)>1 and vcmd[1] else f"room_{len(slam.list_rooms())+1}"
-                        prev = _session_rooms[-1] if _session_rooms else None
-                        if _do_save(slam, ctx, name, prev_room=prev):
-                            _session_rooms.append(name)
+                        # "save kitchen" carries the name; a bare "save" prompts
+                        # for it and captures the next thing the user says.
+                        name = vcmd[1] if len(vcmd) > 1 and vcmd[1] else None
+                        if not name:
+                            ctx.feedback.speak(
+                                "What should I call this room? "
+                                "Say the name after the beep.")
+                            ctx.feedback.wait(timeout=5)
+                            name = _capture_room_name(ctx, voice, voice_cmd_q)
+                        if not name:
+                            ctx.feedback.speak(
+                                "No name heard. Room not saved. Say save to try again.")
+                        else:
+                            prev = _session_rooms[-1] if _session_rooms else None
+                            if _do_save(slam, ctx, name, prev_room=prev):
+                                _session_rooms.append(name)
 
                     elif tag == "navigate":
                         spoken = vcmd[1] if len(vcmd)>1 else ""
