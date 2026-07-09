@@ -2,7 +2,7 @@
   "START": {
     "name": "START",
     "flex_mask": 17,
-    "imu_mask": 1,
+    "imu_mask": 2,
     "motion": "static",
     "hold_frames": 3,
     "flex_exact": true,
@@ -11,11 +11,11 @@
   "NEXT": {
     "name": "NEXT",
     "flex_mask": 16,
-    "imu_mask": 1,
+    "imu_mask": 2,
     "motion": "flick",
     "hold_frames": 2,
     "flex_exact": true,
-    "_desc": "Pinky only, flick right — scroll / next"
+    "_desc": "Pinky, flick right - scroll / next"
   },
   "EDIT": {
     "name": "EDIT",
@@ -24,33 +24,105 @@
     "motion": "static",
     "hold_frames": 3,
     "flex_exact": true,
-    "_desc": "Thumb + Middle only, hold any position — edit / change gesture"
+    "_desc": "Thumb + Middle, hold - edit / record"
   },
   "OCR_PAUSE": {
     "name": "OCR_PAUSE",
     "flex_mask": 25,
-    "imu_mask": 8,
+    "imu_mask": 4,
     "motion": "static",
     "hold_frames": 3,
     "flex_exact": true,
-    "_desc": "Thumb + Ring + Pinky, hold tilt backward — pause / resume reading"
+    "_desc": "Thumb + Ring + Pinky, hold tilt back - pause / resume"
   },
   "OCR_FWD": {
     "name": "OCR_FWD",
-    "flex_mask": 1,
-    "imu_mask": 1,
-    "motion": "flick",
-    "hold_frames": 2,
-    "flex_exact": true,
-    "_desc": "Thumb only, flick right — skip forward"
-  },
-  "OCR_BWD": {
-    "name": "OCR_BWD",
     "flex_mask": 1,
     "imu_mask": 2,
     "motion": "flick",
     "hold_frames": 2,
     "flex_exact": true,
-    "_desc": "Thumb only, flick left — skip backward / rewind"
+    "_desc": "Thumb, flick right - skip forward"
+  },
+  "OCR_BWD": {
+    "name": "OCR_BWD",
+    "flex_mask": 1,
+    "imu_mask": 1,
+    "motion": "flick",
+    "hold_frames": 2,
+    "flex_exact": true,
+    "_desc": "Thumb, flick left - skip backward"
+  },
+  "FEAT:Money recognition": {
+    "name": "FEAT:Money recognition",
+    "flex_mask": 2,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Index only, hold"
+  },
+  "FEAT:Book reader": {
+    "name": "FEAT:Book reader",
+    "flex_mask": 6,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Index + Middle (peace sign), hold"
+  },
+  "FEAT:Environmental awareness": {
+    "name": "FEAT:Environmental awareness",
+    "flex_mask": 14,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Index + Middle + Ring (three fingers), hold"
+  },
+  "FEAT:Home automation": {
+    "name": "FEAT:Home automation",
+    "flex_mask": 3,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Thumb + Index (L shape), hold"
+  },
+  "FEAT:Programmable Gestures": {
+    "name": "FEAT:Programmable Gestures",
+    "flex_mask": 7,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Thumb + Index + Middle, hold"
+  },
+  "FEAT:Relay 1": {
+    "name": "FEAT:Relay 1",
+    "flex_mask": 24,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Ring + Pinky, hold"
+  },
+  "FEAT:Relay 2": {
+    "name": "FEAT:Relay 2",
+    "flex_mask": 28,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "Middle + Ring + Pinky, hold"
+  },
+  "FEAT:Lidar Navigation": {
+    "name": "FEAT:Lidar Navigation",
+    "flex_mask": 31,
+    "imu_mask": 0,
+    "motion": "static",
+    "hold_frames": 3,
+    "flex_exact": true,
+    "_desc": "All five fingers (fist), hold"
   }
 }
