@@ -128,11 +128,21 @@ def _auto_alsa() -> "str | None":
         ordered  = list(reversed(non_hdmi)) + hdmi
 
         for card, name, dev in ordered:
-            alsa_dev = f"plughw:{card},{dev}"
-            print(f"[AUDIO] Testing {alsa_dev} ({name}) ...")
-            if _test_device(alsa_dev, wav):
-                print(f"[AUDIO] Selected: {alsa_dev} ({name})")
-                return alsa_dev
+            # Prefer the CARD=name form over the numeric index: USB audio card
+            # numbers on the Pi are not stable, and a stale index makes ALSA
+            # fail mid-session with "Cannot get card index for N". The name
+            # (e.g. plughw:CARD=Headset,DEV=0) resolves to whatever index the
+            # card currently has, so it keeps working after re-enumeration.
+            name_dev = f"plughw:CARD={name},DEV={dev}"
+            num_dev  = f"plughw:{card},{dev}"
+            print(f"[AUDIO] Testing {name_dev} ({name}) ...")
+            if _test_device(name_dev, wav):
+                print(f"[AUDIO] Selected: {name_dev} ({name})")
+                return name_dev
+            if _test_device(num_dev, wav):
+                print(f"[AUDIO] Selected: {num_dev} ({name}) — name form "
+                      "unavailable, using index (may drop if it re-enumerates)")
+                return num_dev
     finally:
         try:
             os.unlink(wav)
