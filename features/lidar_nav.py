@@ -69,6 +69,8 @@ SLAM_SIZE_M       = 30.0
 
 SECTOR_HALF_DEG   = 45.0
 _DIST_LEVELS      = [(0.30, 420), (0.60, 300), (1.00, 160), (1.50, 70)]
+OBSTACLE_SPEAK_S  = 2.5       # min gap between spoken obstacle warnings
+OBSTACLE_SPEAK_M  = 2.0       # only speak about obstacles within this range
 HAPTIC_INTERVAL   = 0.22
 # LiDAR is inside a stabilizer — ignore returns closer than this (own housing)
 MIN_OBSTACLE_M    = 0.10      # 10 cm; raise if motors still fire on housing
@@ -160,6 +162,28 @@ def _dist_phrase(m: float) -> str:
     return f"{n} metres"
 
 
+# Full 360° coverage for spoken obstacle guidance — four ±45° sectors so an
+# obstacle BEHIND the user is reported as "behind you" instead of leaking into
+# the right sector (or falling in a gap) as before.
+_OBSTACLE_SECTORS = [
+    (0.0,   "ahead"),
+    (90.0,  "on your left"),
+    (180.0, "behind you"),
+    (270.0, "on your right"),
+]
+
+
+def _nearest_obstacle(scan, min_m: float = MIN_OBSTACLE_M) -> "tuple[float, str | None]":
+    """Return (distance_m, side_phrase) of the closest obstacle across all four
+    sectors, or (inf, None) if nothing is in range."""
+    best_d, best_side = float("inf"), None
+    for center, phrase in _OBSTACLE_SECTORS:
+        d = _sector_min(scan, center, min_m=min_m)
+        if d < best_d:
+            best_d, best_side = d, phrase
+    return best_d, best_side
+
+
 # ─── haptics ──────────────────────────────────────────────────────────────────
 
 def _obstacle_haptics(scan, ctx, last_haptic: float,
@@ -204,6 +228,14 @@ def _obstacle_haptics(scan, ctx, last_haptic: float,
 
 def _map_to_png(slam) -> Optional[bytes]:
     img = slam.occ_map.to_image()
+    # The saved/streamed map renders 180° rotated from the user's real
+    # orientation. The LiDAR and obstacle sectors are correctly oriented — only
+    # this occupancy-grid image is flipped — so rotate it 180° (reverse both
+    # axes) before sending it to the server dashboard.
+    try:
+        img = img[::-1, ::-1].copy()
+    except Exception:
+        pass
     try:
         import cv2
         ok, buf = cv2.imencode(".png", img)
@@ -587,13 +619,27 @@ def _ask_lidar_mode(ctx: FeatureContext) -> "str | None":
             "Or flick next to hear each option and hold to choose."
         )
 
+    def _drain(q: queue.Queue) -> None:
+        try:
+            while True:
+                q.get_nowait()
+        except queue.Empty:
+            pass
+
     try:
         _menu()
         fb.wait(timeout=14)
-        cursor   = 0
-        deadline = time.time() + 60.0
-        while not ctx.abort.is_set() and time.time() < deadline:
-            # ── voice ──────────────────────────────────────────────────────
+        # Drain any bounce gesture/voice left over from launching the feature —
+        # otherwise a stray START/EDIT was read as an instant selection and the
+        # menu "defaulted" to obstacle without ever waiting for the user.
+        _drain(gq) if gq is not None else None
+        _drain(voice_q)
+
+        cursor      = -1        # nothing highlighted until the user scrolls
+        last_prompt = time.time()
+        # Wait INDEFINITELY for an explicit choice — never auto-pick a mode.
+        while not ctx.abort.is_set():
+            # ── voice (primary) ────────────────────────────────────────────
             try:
                 cmd = voice_q.get(timeout=0.1)
             except queue.Empty:
@@ -605,25 +651,33 @@ def _ask_lidar_mode(ctx: FeatureContext) -> "str | None":
                     fb.speak(f"{_MODE_NAMES[cmd[1]]}. Starting.")
                     fb.wait(timeout=3)
                     return cmd[1]
-            # ── gesture ────────────────────────────────────────────────────
+            # ── gesture (NEXT cycles, EDIT selects the current one) ─────────
             if gq is not None:
                 try:
                     g = gq.get_nowait()
                     if g == "NEXT":
                         cursor = (cursor + 1) % len(_MODE_ORDER)
                         fb.speak(_MODE_NAMES[_MODE_ORDER[cursor]])
-                        deadline = time.time() + 60.0
-                    elif g in ("START", "EDIT"):
-                        choice = _MODE_ORDER[cursor]
-                        fb.speak(f"{_MODE_NAMES[choice]}. Starting.")
-                        fb.wait(timeout=3)
-                        return choice
+                        last_prompt = time.time()
+                    elif g == "EDIT":
+                        if cursor < 0:
+                            fb.speak("Flick next to hear a mode first, then hold "
+                                     "to choose. Or just say obstacle, mapping, "
+                                     "or navigation.")
+                            last_prompt = time.time()
+                        else:
+                            choice = _MODE_ORDER[cursor]
+                            fb.speak(f"{_MODE_NAMES[choice]}. Starting.")
+                            fb.wait(timeout=3)
+                            return choice
                 except queue.Empty:
                     pass
-        # Timed out with no choice → obstacle detection (safest, no SLAM).
-        fb.speak("No choice heard. Starting obstacle detection.")
-        fb.wait(timeout=3)
-        return "obstacle"
+            # Gentle re-prompt so the user knows it's still waiting; no auto-pick.
+            if time.time() - last_prompt > 25.0:
+                fb.speak("Still waiting. Say obstacle, mapping, or navigation. "
+                         "Say stop to cancel.")
+                last_prompt = time.time()
+        return None
     finally:
         voice.stop()
         time.sleep(0.4)   # let the mic fully release before the mode reopens it
@@ -686,8 +740,10 @@ class LidarNavigation(Feature):
 
         slam = _new_slam()
 
+        # Both mapping and navigation start in "mapping"; navigation switches to
+        # "navigation" once the user picks a destination ("take me to <room>").
         mode, nav_target = "mapping", None
-        last_haptic = last_nav_spk = last_pose_send = 0.0
+        last_haptic = last_nav_spk = last_pose_send = last_obs_voice = 0.0
         t0 = time.time()
 
         scan_q     : queue.Queue = queue.Queue(maxsize=2)
@@ -738,7 +794,8 @@ class LidarNavigation(Feature):
         else:  # mapping
             ctx.feedback.speak(
                 f"Mapping. {len(saved)} room{'s' if len(saved) != 1 else ''} saved. "
-                "Walk around and say save, then a room name, to save this room. "
+                "Obstacle detection is on, so I will warn you as you walk. "
+                "Say save, then a room name, to save this room. "
                 "Say take me to a room to navigate. " + voice_status
             )
 
@@ -824,6 +881,15 @@ class LidarNavigation(Feature):
                     nav_target=(nav_target if mode=="navigation" else None),
                     slam=slam,
                 )
+
+                # Obstacle detection stays on while mapping: alongside the motor
+                # pulses above, speak the nearest obstacle's side + distance so
+                # the user is warned as they walk around building the map.
+                if mode == "mapping" and now - last_obs_voice >= OBSTACLE_SPEAK_S:
+                    dist, side = _nearest_obstacle(scan)
+                    if side and dist <= OBSTACLE_SPEAK_M:
+                        ctx.feedback.speak(f"Obstacle {side}, {_dist_phrase(dist)}.")
+                        last_obs_voice = now
 
                 if mode == "navigation" and nav_target and ctx.link and now - last_pose_send >= POSE_UPDATE_S:
                     ctx.link.send("lidar", {"action": "pose_update", "room_name": nav_target,
@@ -911,8 +977,6 @@ class LidarObstacleTest(Feature):
         t0          = time.time()
         last_haptic = last_radar_up = last_voice = 0.0
         events: list = []
-        OBSTACLE_SPEAK_S = 2.5    # min gap between spoken obstacle warnings
-        OBSTACLE_SPEAK_M = 2.0    # only speak about obstacles within this range
 
         try:
             while not ctx.abort.is_set():
@@ -932,10 +996,12 @@ class LidarObstacleTest(Feature):
                 now     = time.time()
                 front_m = _sector_min(scan,   0, min_m=MIN_OBSTACLE_M)
                 left_m  = _sector_min(scan,  90, min_m=MIN_OBSTACLE_M)
+                back_m  = _sector_min(scan, 180, min_m=MIN_OBSTACLE_M)
                 right_m = _sector_min(scan, 270, min_m=MIN_OBSTACLE_M)
                 front_ms = _dist_ms(front_m)
                 left_ms  = _dist_ms(left_m)
                 right_ms = _dist_ms(right_m)
+                back_ms  = _dist_ms(back_m)
 
                 motor = None
                 if now - last_haptic >= HAPTIC_INTERVAL:
@@ -945,12 +1011,14 @@ class LidarObstacleTest(Feature):
                         ctx.feedback._pulse(3, left_ms);  motor = ("MT3", left_ms);  last_haptic = now
                     elif right_ms:
                         ctx.feedback._pulse(2, right_ms); motor = ("MT2", right_ms); last_haptic = now
+                    elif back_ms:
+                        # no dedicated rear motor — buzz the bottom one to flag it
+                        ctx.feedback._pulse(1, back_ms);  motor = ("MT1", back_ms);  last_haptic = now
 
                 # ── spoken guidance: nearest obstacle, its side and distance ───
                 if now - last_voice >= OBSTACLE_SPEAK_S:
-                    dist, side = min((front_m, "ahead"), (left_m, "on your left"),
-                                     (right_m, "on your right"))
-                    if dist <= OBSTACLE_SPEAK_M:
+                    dist, side = _nearest_obstacle(scan)
+                    if side and dist <= OBSTACLE_SPEAK_M:
                         ctx.feedback.speak(f"Obstacle {side}, {_dist_phrase(dist)}.")
                         last_voice = now
 
@@ -959,6 +1027,7 @@ class LidarObstacleTest(Feature):
                     "front_m"  : round(front_m, 3) if front_m < 99 else None,
                     "left_m"   : round(left_m,  3) if left_m  < 99 else None,
                     "right_m"  : round(right_m, 3) if right_m < 99 else None,
+                    "back_m"   : round(back_m,  3) if back_m  < 99 else None,
                     "motor"    : motor[0] if motor else None,
                     "motor_ms" : motor[1] if motor else None,
                 })
