@@ -162,14 +162,23 @@ def _dist_phrase(m: float) -> str:
     return f"{n} metres"
 
 
+# Physical direction → LiDAR sensor angle. This is the SAME mapping the radar
+# uses (see _make_radar_png: sensor 90° = physical FRONT at the top), which is
+# the proven-correct one. The spoken guidance and haptics were previously
+# rotated 90° off this, so an obstacle physically BEHIND (sensor 270°) was
+# announced "on your right". Everything now derives from these constants.
+SECTOR_FRONT_DEG = 90.0
+SECTOR_LEFT_DEG  = 0.0
+SECTOR_RIGHT_DEG = 180.0
+SECTOR_BACK_DEG  = 270.0
+
 # Full 360° coverage for spoken obstacle guidance — four ±45° sectors so an
-# obstacle BEHIND the user is reported as "behind you" instead of leaking into
-# the right sector (or falling in a gap) as before.
+# obstacle behind the user is reported as "behind you", correctly oriented.
 _OBSTACLE_SECTORS = [
-    (0.0,   "ahead"),
-    (90.0,  "on your left"),
-    (180.0, "behind you"),
-    (270.0, "on your right"),
+    (SECTOR_FRONT_DEG, "ahead"),
+    (SECTOR_LEFT_DEG,  "on your left"),
+    (SECTOR_BACK_DEG,  "behind you"),
+    (SECTOR_RIGHT_DEG, "on your right"),
 ]
 
 
@@ -196,9 +205,10 @@ def _obstacle_haptics(scan, ctx, last_haptic: float,
     if now - last_haptic < HAPTIC_INTERVAL:
         return last_haptic
 
-    front_ms = _dist_ms(_sector_min(scan,   0, min_m=MIN_OBSTACLE_M))
-    left_ms  = _dist_ms(_sector_min(scan,  90, min_m=MIN_OBSTACLE_M))
-    right_ms = _dist_ms(_sector_min(scan, 270, min_m=MIN_OBSTACLE_M))
+    front_ms = _dist_ms(_sector_min(scan, SECTOR_FRONT_DEG, min_m=MIN_OBSTACLE_M))
+    left_ms  = _dist_ms(_sector_min(scan, SECTOR_LEFT_DEG,  min_m=MIN_OBSTACLE_M))
+    right_ms = _dist_ms(_sector_min(scan, SECTOR_RIGHT_DEG, min_m=MIN_OBSTACLE_M))
+    back_ms  = _dist_ms(_sector_min(scan, SECTOR_BACK_DEG,  min_m=MIN_OBSTACLE_M))
 
     if front_ms:
         ctx.feedback._pulse(1, front_ms)
@@ -208,6 +218,9 @@ def _obstacle_haptics(scan, ctx, last_haptic: float,
         return now
     if right_ms:
         ctx.feedback._pulse(2, right_ms)
+        return now
+    if back_ms:
+        ctx.feedback._pulse(1, back_ms)   # no rear motor — bottom buzz flags it
         return now
 
     if nav_target and slam:
@@ -528,10 +541,10 @@ def _make_radar_png(scan) -> Optional[bytes]:
 
     # sector minimums for text (corrected physical mapping, housing filtered)
     def _d(v): return f"{v:.2f}m" if v < 9.9 else u"—"
-    front_m = _sector_min(scan,  90, min_m=MIN_OBSTACLE_M)
-    back_m  = _sector_min(scan, 270, min_m=MIN_OBSTACLE_M)
-    left_m  = _sector_min(scan,   0, min_m=MIN_OBSTACLE_M)
-    right_m = _sector_min(scan, 180, min_m=MIN_OBSTACLE_M)
+    front_m = _sector_min(scan, SECTOR_FRONT_DEG, min_m=MIN_OBSTACLE_M)
+    back_m  = _sector_min(scan, SECTOR_BACK_DEG,  min_m=MIN_OBSTACLE_M)
+    left_m  = _sector_min(scan, SECTOR_LEFT_DEG,  min_m=MIN_OBSTACLE_M)
+    right_m = _sector_min(scan, SECTOR_RIGHT_DEG, min_m=MIN_OBSTACLE_M)
 
     cv2.putText(img, "FRONT",     (CX - 30,  14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,200,200), 1)
     cv2.putText(img, _d(front_m), (CX - 24,  30), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,100), 1)
@@ -997,10 +1010,10 @@ class LidarObstacleTest(Feature):
                     continue
 
                 now     = time.time()
-                front_m = _sector_min(scan,   0, min_m=MIN_OBSTACLE_M)
-                left_m  = _sector_min(scan,  90, min_m=MIN_OBSTACLE_M)
-                back_m  = _sector_min(scan, 180, min_m=MIN_OBSTACLE_M)
-                right_m = _sector_min(scan, 270, min_m=MIN_OBSTACLE_M)
+                front_m = _sector_min(scan, SECTOR_FRONT_DEG, min_m=MIN_OBSTACLE_M)
+                left_m  = _sector_min(scan, SECTOR_LEFT_DEG,  min_m=MIN_OBSTACLE_M)
+                back_m  = _sector_min(scan, SECTOR_BACK_DEG,  min_m=MIN_OBSTACLE_M)
+                right_m = _sector_min(scan, SECTOR_RIGHT_DEG, min_m=MIN_OBSTACLE_M)
                 front_ms = _dist_ms(front_m)
                 left_ms  = _dist_ms(left_m)
                 right_ms = _dist_ms(right_m)
