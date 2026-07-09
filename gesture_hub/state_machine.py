@@ -123,16 +123,39 @@ class HubStateMachine:
     # Main loop  (main thread)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def run(self) -> None:
-        start_spec = self.store.gestures.get("START")
-        desc = f" — {start_spec.describe()}" if start_spec else ""
-        self.feedback.speak(f"Ready.{desc} to activate.")
+    def run(self, program: bool = False) -> None:
+        if program:
+            # hub --program: jump straight into the Programmable panel so the
+            # user can register/re-bind every feature's gesture (including Home
+            # and each relay) without first doing START.
+            self.enter_programmable_direct()
+        else:
+            start_spec = self.store.gestures.get("START")
+            desc = f" — {start_spec.describe()}" if start_spec else ""
+            self.feedback.speak(f"Ready.{desc} to activate.")
         while not self._shutdown.is_set():
             try:
                 name = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             self._handle(name)
+
+    def enter_programmable_direct(self) -> None:
+        """Open the Programmable panel directly (used by hub --program). Scroll
+        with NEXT, record with EDIT (perform the gesture, then do it twice to
+        confirm). Close with the Programmable gesture or START."""
+        from features.programmable import ProgrammableGestures
+        prog = next((f for f in self.registry.features
+                     if isinstance(f, ProgrammableGestures)), None)
+        self._active_feature = prog
+        self._active_key     = self.registry.gesture_key(prog) if prog else ""
+        self.state           = State.PROGRAMMABLE
+        self.feedback.select()
+        self.feedback.speak(
+            "Programming mode. Flick next to scroll features, hold edit to "
+            "record a gesture, then do the new gesture twice to confirm."
+        )
+        self._announce_prog_feature(self.registry.current, opening=True)
 
     def stop(self) -> None:
         self._shutdown.set()

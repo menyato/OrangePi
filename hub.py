@@ -189,6 +189,11 @@ def main() -> None:
     ap.add_argument("--reset-gestures", action="store_true",
                     help="Clear all user-assigned feature gestures and exit. "
                          "Forces full re-enrollment on the next boot.")
+    ap.add_argument("--program", action="store_true",
+                    help="Jump straight into the Programmable panel to register/"
+                         "re-bind every feature's gesture (Home and each relay "
+                         "included), without doing START. Combine with "
+                         "--calibrate to calibrate first, then program.")
 
     # ── book reader shelf ─────────────────────────────────────────────────────
     ap.add_argument("--sample-books", action="store_true",
@@ -459,7 +464,7 @@ def main() -> None:
 
     print("[HUB] Running. Ctrl-C to quit.")
     try:
-        sm.run()
+        sm.run(program=args.program)
     except KeyboardInterrupt:
         print("\n[HUB] Shutting down...")
     finally:
