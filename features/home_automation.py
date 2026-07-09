@@ -16,6 +16,7 @@ only two jobs here are:
 """
 
 import json
+import os
 import subprocess
 import time
 import urllib.parse
@@ -25,6 +26,75 @@ import orangepi_client as mc            # reused unchanged, exactly like money_r
 from features.base import Feature, FeatureContext
 from features.money_recognition import MoneyRecognition
 import metrics
+
+# ── Direct relay control (OrangePi → ESP relay board over the LAN) ────────────
+# The ESP exposes  GET http://<ip>/relay?ch=N&state=on|off|toggle  and
+# GET http://<ip>/status. We cache the board's IP here so the Pi can drive the
+# relays DIRECTLY, without the laptop server in the control loop. The IP is
+# learned from the server once (action "get_relays") and/or set by hand in this
+# file. Delete the file to force a refresh.
+RELAY_CACHE_PATH   = os.path.expanduser("~/.relay_board.json")
+RELAY_HTTP_TIMEOUT = 3.0
+
+
+def _load_relay_cache() -> dict:
+    try:
+        with open(RELAY_CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_relay_cache(info: dict) -> None:
+    try:
+        with open(RELAY_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+    except OSError as e:
+        print(f"[HOME] relay cache write failed: {e}")
+
+
+def _refresh_relay_ip(link) -> "dict | None":
+    """Ask the server for the paired board's IP and cache it. Returns the
+    cached info dict {ip, device_id, relay_count} or None."""
+    if link is None:
+        return None
+    try:
+        resp = link.send("home", {"action": "get_relays"})
+    except Exception as e:
+        print(f"[HOME] get_relays failed: {e}")
+        return None
+    devices = (resp or {}).get("devices") or []
+    if not devices:
+        return None
+    d = devices[0]                       # most-recently-seen board
+    if not d.get("ip"):
+        return None
+    info = {"ip": d["ip"], "device_id": d.get("device_id"),
+            "relay_count": d.get("relay_count", 2)}
+    _save_relay_cache(info)
+    return info
+
+
+def _relay_board_ip(link, refresh: bool = False) -> "str | None":
+    """Best-known relay board IP: cache first, else fetch from the server."""
+    if not refresh:
+        ip = _load_relay_cache().get("ip")
+        if ip:
+            return ip
+    info = _refresh_relay_ip(link)
+    return info.get("ip") if info else _load_relay_cache().get("ip")
+
+
+def _relay_direct(ip: str, ch: int, state: str) -> "dict | None":
+    """GET http://<ip>/relay?ch=<ch>&state=<state>. Returns the ESP's JSON
+    ({"ok":true,"state":"on"}) or None on any failure."""
+    url = f"http://{ip}/relay?ch={ch}&state={urllib.parse.quote(state)}"
+    try:
+        with urllib.request.urlopen(url, timeout=RELAY_HTTP_TIMEOUT) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[HOME] direct relay call failed ({url}): {e}")
+        return None
 
 try:
     import cv2
@@ -263,7 +333,27 @@ class RelaySwitch(Feature):
 
     def run(self, ctx: FeatureContext) -> None:
         t0 = time.time()
-        resp = ctx.link.send("home", {"action": "toggle", "relay": self.relay_id, "state": "toggle"})
+
+        # ── PRIMARY: talk to the relay board DIRECTLY over the LAN ────────────
+        ip = _relay_board_ip(ctx.link)
+        if ip:
+            resp = _relay_direct(ip, self.relay_id, "toggle")
+            if resp is None:
+                # Cached IP may be stale (board got a new DHCP lease) — refresh
+                # from the server once and retry directly.
+                ip = _relay_board_ip(ctx.link, refresh=True)
+                if ip:
+                    resp = _relay_direct(ip, self.relay_id, "toggle")
+            if resp is not None and resp.get("ok"):
+                state = resp.get("state", "?")
+                ctx.feedback.speak(f"Relay {self.relay_id} turned {state}.")
+                metrics.report_action(ctx.link, self.name, "toggle",
+                                      (time.time() - t0) * 1000, ok=True)
+                return
+
+        # ── FALLBACK: let the server relay the command ────────────────────────
+        resp = ctx.link.send("home", {"action": "toggle",
+                                      "relay": self.relay_id, "state": "toggle"})
         if resp is None:
             # Do NOT also try to report this over the link: ServerLink just
             # reset the socket after a failed/blocking connect attempt, and a
@@ -271,7 +361,7 @@ class RelaySwitch(Feature):
             # second blocking reconnect attempt on an already-unreachable
             # server — doubling the delay on what's meant to be an instant
             # light-switch gesture, for a metric that isn't worth that cost.
-            ctx.feedback.speak("Server not reachable.")
+            ctx.feedback.speak("Relay not reachable.")
             return
         metrics.report_action(ctx.link, self.name, "toggle",
                               (time.time() - t0) * 1000, ok=True)
