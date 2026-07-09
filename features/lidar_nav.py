@@ -75,6 +75,7 @@ HAPTIC_INTERVAL   = 0.22
 # LiDAR is inside a stabilizer — ignore returns closer than this (own housing)
 MIN_OBSTACLE_M    = 0.10      # 10 cm; raise if motors still fire on housing
 NAV_SPEAK_S       = 6.0
+ARRIVE_M          = 0.8       # within this of the target → announce arrival
 MIN_KF_TO_SAVE    = 5
 POSE_UPDATE_S     = 2.0
 MAP_LIVE_UPDATE_S = 15.0       # mapping test: live map upload interval
@@ -288,6 +289,10 @@ def _parse_voice(text: str):
 
     if words & {"stop", "abort", "quit", "exit"}:
         return ("abort",)
+
+    if words & {"change", "switch", "menu"} or "change mode" in t \
+            or "different mode" in t or "another mode" in t:
+        return ("change",)
 
     if "list" in words or ("what" in words and "room" in words):
         return ("list",)
@@ -750,17 +755,22 @@ class LidarNavigation(Feature):
 
     def run(self, ctx: FeatureContext) -> None:
         """Ask which mode, then route to it. Obstacle uses the no-SLAM loop;
-        mapping and navigation share the SLAM loop (started in that mode)."""
+        mapping and navigation share the SLAM loop. If a mode returns because
+        the user said "change", loop back to the menu to pick another one."""
         if not _LIDAR_OK:
             ctx.feedback.speak("Lidar libraries not installed.")
             return
-        mode = _ask_lidar_mode(ctx)
-        if mode is None or ctx.abort.is_set():
-            return
-        if mode == "obstacle":
-            LidarObstacleTest().run(ctx)
-        else:
-            self._run_slam(ctx, start_mode=mode)
+        while not ctx.abort.is_set():
+            mode = _ask_lidar_mode(ctx)
+            if mode is None or ctx.abort.is_set():
+                return
+            if mode == "obstacle":
+                change = LidarObstacleTest().run(ctx)
+            else:
+                change = self._run_slam(ctx, start_mode=mode)
+            if not change or ctx.abort.is_set():
+                return
+            # user asked to switch — re-open the menu
 
     def _localize(self, ctx: FeatureContext, slam, scan_q,
                   timeout: float = 8.0) -> "str | None":
@@ -799,14 +809,21 @@ class LidarNavigation(Feature):
         # Both mapping and navigation start in "mapping"; navigation switches to
         # "navigation" once the user picks a destination ("take me to <room>").
         mode, nav_target = "mapping", None
+        change_requested = False
+        last_change_prompt = time.time()
+        CHANGE_PROMPT_S    = 30.0     # remind the user they can switch modes
         last_haptic = last_nav_spk = last_pose_send = last_obs_voice = 0.0
         t0 = time.time()
 
         scan_q     : queue.Queue = queue.Queue(maxsize=2)
         voice_cmd_q: queue.Queue = queue.Queue()
 
+        # Local stop for the worker threads so a "change mode" can end THIS mode
+        # without tripping ctx.abort (which would exit the whole lidar feature
+        # instead of returning to the menu).
+        loop_stop = threading.Event()
         scan_t = threading.Thread(target=_scan_worker,
-                                  args=(adapter, scan_q, ctx.abort), daemon=True)
+                                  args=(adapter, scan_q, loop_stop), daemon=True)
         scan_t.start()
         voice = _LidarVoice(voice_cmd_q, ctx.link)
         voice.start()
@@ -869,6 +886,11 @@ class LidarNavigation(Feature):
                     if tag == "abort":
                         ctx.feedback.speak("Stopping lidar.")
                         ctx.abort.set(); break
+
+                    elif tag == "change":
+                        ctx.feedback.speak("Changing mode.")
+                        change_requested = True
+                        break
 
                     elif tag == "list":
                         rooms = slam.list_rooms()
@@ -944,6 +966,12 @@ class LidarNavigation(Feature):
                 result = slam.update(pts, rpm=scan.rpm)
                 now    = time.time()
 
+                # Periodic reminder that the user can switch modes.
+                if now - last_change_prompt >= CHANGE_PROMPT_S:
+                    what = "navigating" if (mode == "navigation" and nav_target) else "mapping"
+                    ctx.feedback.speak(f"Still {what}. Say change to switch mode.")
+                    last_change_prompt = now
+
                 last_haptic = _obstacle_haptics(
                     scan, ctx, last_haptic,
                     nav_target=(nav_target if mode=="navigation" else None),
@@ -968,9 +996,15 @@ class LidarNavigation(Feature):
                     d = slam.direction_to_room(nav_target)
                     if d:
                         _, _, dist_m, bearing = d
-                        ctx.feedback.speak(
-                            f"{nav_target.replace('_',' ')}: {dist_m:.1f} m, {_bearing_str(bearing)}."
-                        )
+                        if dist_m < ARRIVE_M:
+                            ctx.feedback.speak(
+                                f"You have arrived at {nav_target.replace('_',' ')}.")
+                            mode, nav_target = "mapping", None
+                        else:
+                            ctx.feedback.speak(
+                                f"{nav_target.replace('_',' ')}: {dist_m:.1f} metres, "
+                                f"{_bearing_str(bearing)}."
+                            )
                     last_nav_spk = now
 
                 if mode == "mapping" and result.room_match:
@@ -979,7 +1013,10 @@ class LidarNavigation(Feature):
         except KeyboardInterrupt:
             ctx.abort.set()
         finally:
-            ctx.abort.set()
+            # Stop the worker threads via the LOCAL event — do NOT set ctx.abort
+            # here, or a "change mode" would abort the whole feature instead of
+            # returning to the menu. (A real panic sets ctx.abort itself.)
+            loop_stop.set()
             voice.stop()
             scan_t.join(timeout=2.0)
             adapter.stop()
@@ -998,6 +1035,7 @@ class LidarNavigation(Feature):
                     "duration_s":    round(time.time() - t0, 1),
                     "session_rooms": _session_rooms,
                 })
+        return change_requested
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1014,36 +1052,42 @@ class LidarObstacleTest(Feature):
     title = "Lidar Obstacle Test"
     port: str = DEFAULT_PORT
 
-    def run(self, ctx: FeatureContext) -> None:
+    def run(self, ctx: FeatureContext) -> bool:
+        """Returns True if the user asked to change mode (so the unified feature
+        re-opens the menu), else False."""
         if not _LIDAR_OK:
             ctx.feedback.speak("Lidar not installed.")
-            return
+            return False
 
         port = _resolve_port(self.port, ctx.feedback)
         if not port:
-            return
+            return False
 
         try:
             adapter = _new_adapter(port)
         except Exception as e:
             ctx.feedback.speak(f"Lidar error: {e}")
-            return
+            return False
 
         scan_q  = queue.Queue(maxsize=2)
         voice_q = queue.Queue()
+        # Local stop so "change mode" ends this loop without aborting the feature.
+        loop_stop = threading.Event()
         scan_t  = threading.Thread(target=_scan_worker,
-                                   args=(adapter, scan_q, ctx.abort), daemon=True)
+                                   args=(adapter, scan_q, loop_stop), daemon=True)
         scan_t.start()
         voice = _LidarVoice(voice_q, ctx.link)
         voice.start()
 
         ctx.feedback.speak(
             "Obstacle detection. I will vibrate and tell you where obstacles are "
-            "and how close. Walk around. Say stop to finish."
+            "and how close. Walk around. Say change to switch mode, or stop to finish."
         )
         session_id  = time.strftime("%Y%m%d_%H%M%S")
         t0          = time.time()
         last_haptic = last_radar_up = last_voice = 0.0
+        last_change_prompt = time.time()
+        change_requested   = False
         events: list = []
 
         try:
@@ -1053,6 +1097,9 @@ class LidarObstacleTest(Feature):
                     if vcmd and vcmd[0] == "abort":
                         ctx.feedback.speak("Stopping obstacle test.")
                         ctx.abort.set(); break
+                    if vcmd and vcmd[0] == "change":
+                        ctx.feedback.speak("Changing mode.")
+                        change_requested = True; break
                 except queue.Empty:
                     pass
 
@@ -1062,6 +1109,9 @@ class LidarObstacleTest(Feature):
                     continue
 
                 now     = time.time()
+                if now - last_change_prompt >= 30.0:
+                    ctx.feedback.speak("Still on obstacle detection. Say change to switch mode.")
+                    last_change_prompt = now
                 front_m = _sector_min(scan, SECTOR_FRONT_DEG, min_m=MIN_OBSTACLE_M)
                 left_m  = _sector_min(scan, SECTOR_LEFT_DEG,  min_m=MIN_OBSTACLE_M)
                 back_m  = _sector_min(scan, SECTOR_BACK_DEG,  min_m=MIN_OBSTACLE_M)
@@ -1113,16 +1163,19 @@ class LidarObstacleTest(Feature):
         except KeyboardInterrupt:
             ctx.abort.set()
         finally:
+            loop_stop.set()
             voice.stop()
             scan_t.join(timeout=2.0)
             adapter.stop()
 
         duration = round(time.time() - t0, 1)
-        ctx.feedback.speak(
-            f"Obstacle test complete. {len(events)} samples, {int(duration)} seconds."
-        )
+        if not change_requested:
+            ctx.feedback.speak(
+                f"Obstacle test complete. {len(events)} samples, {int(duration)} seconds."
+            )
         report = _build_obstacle_report(session_id, duration, events)
         _send_report(ctx, "obstacles", session_id, report)
+        return change_requested
 
 
 def _build_obstacle_report(session_id: str, duration: float, events: list) -> dict:
