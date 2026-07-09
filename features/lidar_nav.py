@@ -634,6 +634,7 @@ def _ask_lidar_mode(ctx: FeatureContext) -> "str | None":
         # menu "defaulted" to obstacle without ever waiting for the user.
         _drain(gq) if gq is not None else None
         _drain(voice_q)
+        fb.listen_cue()   # audible "speak now" beep, like the other features
 
         cursor      = -1        # nothing highlighted until the user scrolls
         last_prompt = time.time()
@@ -676,6 +677,8 @@ def _ask_lidar_mode(ctx: FeatureContext) -> "str | None":
             if time.time() - last_prompt > 25.0:
                 fb.speak("Still waiting. Say obstacle, mapping, or navigation. "
                          "Say stop to cancel.")
+                fb.wait(timeout=6)
+                fb.listen_cue()
                 last_prompt = time.time()
         return None
     finally:

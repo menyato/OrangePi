@@ -78,6 +78,35 @@ def _make_test_wav() -> str:
     return path
 
 
+_CUE_WAV_PATH: "str | None" = None
+
+
+def _cue_wav_path() -> str:
+    """A short, soft 'speak now' beep (880 Hz, ~130 ms, faded) rendered once to
+    a temp WAV — the audible listen cue for features whose own always-on voice
+    listener (e.g. lidar) otherwise gives no signal that it's the user's turn."""
+    global _CUE_WAV_PATH
+    if _CUE_WAV_PATH and os.path.exists(_CUE_WAV_PATH):
+        return _CUE_WAV_PATH
+    rate = 22050
+    n    = int(rate * 0.13)
+    fade = max(1, int(rate * 0.01))
+    samples = array.array("h", [
+        int(20000 * min(1.0, i / fade) * min(1.0, (n - i) / fade)
+            * math.sin(2 * math.pi * 880 * i / rate))
+        for i in range(n)
+    ])
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    with wave.open(path, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(samples.tobytes())
+    _CUE_WAV_PATH = path
+    return path
+
+
 def _test_device(alsa_dev: str, wav_path: str) -> bool:
     try:
         r = subprocess.run(
@@ -199,6 +228,20 @@ class Feedback:
 
     def beep(self) -> None:
         self._pulse(2, 150)   # right — "go" cue
+
+    def listen_cue(self) -> None:
+        """Audible 'speak now' beep on the selected ALSA device — the same
+        signal mc.listen gives before each mic window, for features (lidar)
+        whose own always-on listener otherwise gives no cue. Non-blocking;
+        call it only after any current speech has finished so they don't
+        fight over the audio device."""
+        try:
+            path = _cue_wav_path()
+            cmd = ["aplay", "-q"] + (["-D", self.alsa] if self.alsa else []) + [path]
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
     # ── audio control ────────────────────────────────────────────────────────
     def silence(self) -> None:
