@@ -987,13 +987,15 @@ class LidarNavigation(Feature):
                     slam=slam,
                 )
 
-                # Live lidar radar → web dashboard feed (~1/s).
+                # Live SLAM map → web dashboard feed (~1/s). The occupancy map
+                # (same image as live_map.png) is the useful view while
+                # mapping/navigating; radar is only for the no-SLAM obstacle mode.
                 if now - last_feed_push >= 1.0:
                     try:
                         from net import monitor
-                        _rp = _make_radar_png(scan)
-                        if _rp:
-                            monitor.frame(_rp, f"lidar-{mode}")
+                        _mp = _map_to_png(slam)
+                        if _mp:
+                            monitor.frame(_mp, f"lidar-{mode}")
                     except Exception:
                         pass
                     last_feed_push = now
@@ -1356,13 +1358,13 @@ class LidarMappingTest(Feature):
                 # obstacle detection always on
                 last_haptic = _obstacle_haptics(scan, ctx, last_haptic)
 
-                # live radar → web dashboard feed (~1/s)
+                # live SLAM map → web dashboard feed (~1/s)
                 if now - last_feed_push >= 1.0:
                     try:
                         from net import monitor
-                        _rp = _make_radar_png(scan)
-                        if _rp:
-                            monitor.frame(_rp, "lidar-mapping")
+                        _mp = _map_to_png(slam)
+                        if _mp:
+                            monitor.frame(_mp, "lidar-mapping")
                     except Exception:
                         pass
                     last_feed_push = now
@@ -1505,13 +1507,13 @@ class LidarNavigateTest(Feature):
                 now    = time.time()
                 elapsed = round(now - t0, 1)
 
-                # live radar → web dashboard feed (~1/s)
+                # live SLAM map → web dashboard feed (~1/s)
                 if now - last_feed_push >= 1.0:
                     try:
                         from net import monitor
-                        _rp = _make_radar_png(scan)
-                        if _rp:
-                            monitor.frame(_rp, "lidar-navigate")
+                        _mp = _map_to_png(slam)
+                        if _mp:
+                            monitor.frame(_mp, "lidar-navigate")
                     except Exception:
                         pass
                     last_feed_push = now
