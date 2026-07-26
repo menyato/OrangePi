@@ -1286,7 +1286,7 @@ class LidarMappingTest(Feature):
 
         session_id  = time.strftime("%Y%m%d_%H%M%S")
         t0          = time.time()
-        last_haptic = last_map_up = 0.0
+        last_haptic = last_map_up = last_feed_push = 0.0
         loop_closures = 0
         _report_sent = False
 
@@ -1355,6 +1355,17 @@ class LidarMappingTest(Feature):
 
                 # obstacle detection always on
                 last_haptic = _obstacle_haptics(scan, ctx, last_haptic)
+
+                # live radar → web dashboard feed (~1/s)
+                if now - last_feed_push >= 1.0:
+                    try:
+                        from net import monitor
+                        _rp = _make_radar_png(scan)
+                        if _rp:
+                            monitor.frame(_rp, "lidar-mapping")
+                    except Exception:
+                        pass
+                    last_feed_push = now
 
         except KeyboardInterrupt:
             ctx.abort.set()
@@ -1462,7 +1473,7 @@ class LidarNavigateTest(Feature):
 
         session_id  = time.strftime("%Y%m%d_%H%M%S")
         t0          = time.time()
-        last_haptic = last_nav_spk = last_pose_send = 0.0
+        last_haptic = last_nav_spk = last_pose_send = last_feed_push = 0.0
         pose_log: list = []
         arrived = False
 
@@ -1493,6 +1504,17 @@ class LidarNavigateTest(Feature):
                 result = slam.update(pts, rpm=scan.rpm)
                 now    = time.time()
                 elapsed = round(now - t0, 1)
+
+                # live radar → web dashboard feed (~1/s)
+                if now - last_feed_push >= 1.0:
+                    try:
+                        from net import monitor
+                        _rp = _make_radar_png(scan)
+                        if _rp:
+                            monitor.frame(_rp, "lidar-navigate")
+                    except Exception:
+                        pass
+                    last_feed_push = now
 
                 d       = slam.direction_to_room(matched)
                 dist_m  = d[2] if d else None
