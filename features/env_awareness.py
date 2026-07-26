@@ -1123,6 +1123,12 @@ class EnvAwareness(Feature):
                     last_keyframes = keyframes
                     jpegs      = [_frame_to_jpeg(f) for f in keyframes]
                     store_name = session_name or auto_name
+                    try:                         # show on the live web dashboard
+                        from net import monitor
+                        for _jp in jpegs:
+                            monitor.frame(_jp, "env")
+                    except Exception:
+                        pass
                     try:
                         last_image_paths = _save_keyframes_local(
                             store_name, scan_count, jpegs)

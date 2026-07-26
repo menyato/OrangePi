@@ -392,6 +392,11 @@ class _LidarVoice:
                 text = " ".join(s.text for s in segs).strip()
                 if text:
                     print(f"[LIDAR VOICE] heard: {text!r}")
+                    try:
+                        from net import monitor
+                        monitor.stt(text)
+                    except Exception:
+                        pass
                     if self._raw_mode.is_set():
                         # Capturing a room name — pass the words through verbatim.
                         self._q.put(("name", text))

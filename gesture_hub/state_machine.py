@@ -394,6 +394,11 @@ class HubStateMachine:
             return
 
         self.feedback.select()
+        try:
+            from net import monitor
+            monitor.feature(feat.title)
+        except Exception:
+            pass
         self.feedback.speak(f"Opening {feat.title}. Same gesture to close.")
         self._abort = threading.Event()
         self.state  = State.RUNNING
@@ -427,6 +432,11 @@ class HubStateMachine:
             if not deactivated:
                 self.state = State.ACTIVE
             self._drain_queue()
+            try:
+                from net import monitor
+                monitor.feature("idle")
+            except Exception:
+                pass
             if not deactivated and not crashed:
                 self.feedback.confirm()
                 self.feedback.speak(f"{feat.title} closed. Gesture to open.")

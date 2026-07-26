@@ -282,6 +282,11 @@ class Feedback:
         one immediately — the user never waits for speech to finish.
         """
         print(f"[HUB] {text}")
+        try:                                   # mirror to the live web dashboard
+            from net import monitor
+            monitor.tts(text)
+        except Exception:
+            pass
         self._stop_audio()   # gesture priority — kill old speech first
 
         # Synthesise WAV synchronously (fast, < 1 s even for long text)

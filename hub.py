@@ -205,6 +205,15 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    # Stream the whole session (terminal + TTS + STT + camera) to the laptop's
+    # live web dashboard at http://<host>:8100/. Installed first so every print
+    # below is captured. Best-effort — never blocks the hub if the laptop's down.
+    try:
+        from net import monitor as _monitor
+        _monitor.install(args.host)
+    except Exception as _e:
+        print(f"[HUB] monitor init skipped: {_e}")
+
     if args.sample_books or args.fresh_books:
         import glob as _glob
         from features.ocr_reader import SESSIONS_DIR, _install_sample_books
@@ -415,6 +424,10 @@ def main() -> None:
         if not args.no_voice and bypass_name not in MIC_OWNING_FEATURE_NAMES:
             voice.start()
 
+        try:
+            _monitor.feature(feat.title)
+        except Exception:
+            pass
         feedback.speak(
             f"Test mode: {feat.title}. Say stop or press Ctrl-C to quit."
         )

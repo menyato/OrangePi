@@ -907,6 +907,11 @@ def listen(retries: int = 5, initial_prompt: str | None = None,
                 print(f"  confidence (avg_logprob) = {conf}")
             print(f"  timing: record {audit['t_record']}s  transcribe {audit['t_transcribe']}s")
             print("─" * 50 + "\n")
+            try:                                   # mirror to the live dashboard
+                from net import monitor
+                monitor.stt(corrected)
+            except Exception:
+                pass
             return corrected, audit
 
         # Heard sound but no words came out
