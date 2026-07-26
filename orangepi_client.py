@@ -537,6 +537,11 @@ def speak(text: str, wav_bytes: bytes | None = None) -> None:
     global _aplay_proc, LAST_TTS_ENGINE
     clean = _preprocess_tts(text)
     print(f"\n[TTS] >> {clean}\n")
+    try:                                       # mirror to the live web dashboard
+        from net import monitor
+        monitor.tts(clean)
+    except Exception:
+        pass
     with _tts_lock:
         if _aplay_proc and _aplay_proc.poll() is None:
             _aplay_proc.terminate()
