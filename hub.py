@@ -424,8 +424,15 @@ def main() -> None:
         if not args.no_voice and bypass_name not in MIC_OWNING_FEATURE_NAMES:
             voice.start()
 
+        # Show the feature + its assigned gesture (loaded from gestures.json) on
+        # the dashboard, so even when launched from an argument you can see how
+        # it would be opened by hand.
+        _spec = store.gestures.get(active_key)
+        _gtxt = _spec.describe() if _spec else "no gesture assigned"
+        print(f"[HUB] {feat.title} — gesture: {_gtxt}")
         try:
             _monitor.feature(feat.title)
+            _monitor.event("result", f"Gesture to open {feat.title}: {_gtxt}")
         except Exception:
             pass
         feedback.speak(

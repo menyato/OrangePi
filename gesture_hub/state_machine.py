@@ -397,6 +397,9 @@ class HubStateMachine:
         try:
             from net import monitor
             monitor.feature(feat.title)
+            spec = self.store.gestures.get(key)
+            if spec:
+                monitor.event("result", f"Gesture: {spec.describe()}")
         except Exception:
             pass
         self.feedback.speak(f"Opening {feat.title}. Same gesture to close.")

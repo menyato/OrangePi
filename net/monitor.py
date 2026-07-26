@@ -26,6 +26,7 @@ _port = 8100
 _evq: "queue.Queue" = queue.Queue(maxsize=5000)
 _frame_lock = threading.Lock()
 _pending_frame: "tuple[bytes, str] | None" = None
+_pending_glove: "dict | None" = None
 _started = False
 _real_stdout = None
 
@@ -55,6 +56,16 @@ def frame(jpeg: bytes, feature: str = "") -> None:
         return
     with _frame_lock:
         _pending_frame = (jpeg, feature)
+
+
+def glove(fingers, tilt: str = "flat") -> None:
+    """Push the live glove state (5 finger-bent bools + tilt) for the dashboard's
+    glove model. Only the newest is kept."""
+    global _pending_glove
+    if _host is None:
+        return
+    with _frame_lock:
+        _pending_glove = {"fingers": [bool(x) for x in fingers], "tilt": tilt}
 
 
 # ── stdout/stderr tee ──────────────────────────────────────────────────────────
@@ -128,6 +139,17 @@ def _sender():
         if fr is not None:
             try:
                 _post("/frame", fr[0], "image/jpeg", {"X-Feature": fr[1]})
+            except Exception:
+                pass
+        # ── glove state ───────────────────────────────────────────────────
+        gl = None
+        with _frame_lock:
+            if _pending_glove is not None:
+                gl = _pending_glove
+                _pending_glove = None
+        if gl is not None:
+            try:
+                _post("/glove", json.dumps(gl).encode("utf-8"), "application/json")
             except Exception:
                 pass
 

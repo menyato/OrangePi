@@ -40,6 +40,29 @@ LOG_LEVEL  = logging.INFO
 
 FINGER_NAMES = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
 
+# ── live glove-state push to the web dashboard (throttled ~8 Hz) ──────────────
+_last_glove_push = 0.0
+
+
+def _monitor_glove(frame) -> None:
+    """Stream the current finger-bend + tilt state to the monitor dashboard so
+    it can draw a live glove model next to the camera feed. Best-effort."""
+    global _last_glove_push
+    now = time.time()
+    if now - _last_glove_push < 0.12:
+        return
+    _last_glove_push = now
+    try:
+        from net import monitor
+        f = frame.imu_flags
+        tilt = ("left" if f["tilt_left"] else "right" if f["tilt_right"] else
+                "forward" if f["tilt_forward"] else "backward" if f["tilt_backward"]
+                else "flat")
+        monitor.glove([bool(v) for v in frame.finger_bent], tilt)
+    except Exception:
+        pass
+
+
 # ── DATA CLASSES ──────────────────────────────────────────────────────────────
 @dataclass
 class IMUData:
@@ -271,6 +294,7 @@ class GloveController:
                 self.last_frame = frame
                 if self.on_frame:
                     self.on_frame(frame)
+                _monitor_glove(frame)
             else:
                 self.log.warning(f"Bad V frame: {line!r}")
             return
