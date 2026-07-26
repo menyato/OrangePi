@@ -925,6 +925,11 @@ class OCRReader(Feature):
                 fb.wait(timeout=4)
                 return False
 
+            try:                                 # show on the live web dashboard
+                from net import monitor
+                monitor.frame(jpeg, "ocr")
+            except Exception:
+                pass
             _srvspeak(ctx, fb, "Scanning complete. Processing text.")
             resp = ctx.link.send("ocr", {"type": "scan", "frame": jpeg})
 

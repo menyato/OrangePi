@@ -63,6 +63,11 @@ class MoneyRecognition(Feature):
                 mc.speak("Captured. Analyzing now.")
                 mc.wait_speaking()
                 payload["frame"] = jpeg
+                try:                             # show on the live web dashboard
+                    from net import monitor
+                    monitor.frame(jpeg, "money")
+                except Exception:
+                    pass
 
             resp = link.send(self.name, payload)
             if resp is None:

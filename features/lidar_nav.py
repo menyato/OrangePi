@@ -820,6 +820,7 @@ class LidarNavigation(Feature):
         last_save_prompt   = time.time()
         SAVE_PROMPT_S      = 20.0     # mapping: offer to name+save this room
         last_obs_key       = None     # (side, distance-band) last spoken — dedupe
+        last_feed_push     = 0.0      # live radar → web dashboard
         last_haptic = last_nav_spk = last_pose_send = last_obs_voice = 0.0
         t0 = time.time()
 
@@ -985,6 +986,17 @@ class LidarNavigation(Feature):
                     nav_target=(nav_target if mode=="navigation" else None),
                     slam=slam,
                 )
+
+                # Live lidar radar → web dashboard feed (~1/s).
+                if now - last_feed_push >= 1.0:
+                    try:
+                        from net import monitor
+                        _rp = _make_radar_png(scan)
+                        if _rp:
+                            monitor.frame(_rp, f"lidar-{mode}")
+                    except Exception:
+                        pass
+                    last_feed_push = now
 
                 # Obstacle detection stays on while mapping. Only SPEAK when the
                 # nearest obstacle's side or distance-band CHANGES (or after a
@@ -1186,6 +1198,11 @@ class LidarObstacleTest(Feature):
                             "action": "map_update", "room_name": "live_obstacles",
                             "frame": radar,
                         })
+                        try:                     # show the radar on the live feed
+                            from net import monitor
+                            monitor.frame(radar, "lidar")
+                        except Exception:
+                            pass
                     last_radar_up = now
 
         except KeyboardInterrupt:
