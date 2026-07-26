@@ -114,7 +114,7 @@ def _post(path: str, data: bytes, ctype: str, extra_headers=None) -> None:
 
 
 def _sender():
-    global _pending_frame
+    global _pending_frame, _pending_glove
     while True:
         time.sleep(0.6)
         # ── events ────────────────────────────────────────────────────────
